@@ -919,3 +919,39 @@ class WhatsAppFavoriteSticker(db.Model):
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
+
+class WhatsAppUsageEvent(db.Model):
+    """Durable usage events for billing and analytics."""
+
+    __tablename__ = "whatsapp_usage_events"
+    __table_args__ = (
+        UniqueConstraint("event_key", name="uq_whatsapp_usage_events_event_key"),
+        Index("ix_whatsapp_usage_events_type", "event_type"),
+        Index("ix_whatsapp_usage_events_account", "account_id"),
+        Index("ix_whatsapp_usage_events_created", "created_at"),
+        {"extend_existing": True},
+    )
+
+    id = db.Column(db.BigInteger, primary_key=True)
+    event_type = db.Column(db.String(64), nullable=False)
+    event_key = db.Column(db.String(191), nullable=False)
+    account_id = db.Column(db.Integer, db.ForeignKey("whatsapp_accounts.id"), nullable=False, index=True)
+    message_id = db.Column(db.Integer, db.ForeignKey("whatsapp_messages.id"), nullable=True, index=True)
+    wamid = db.Column(db.String(128), nullable=True, index=True)
+    occurred_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    payload = db.Column(JSON, nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "event_type": self.event_type,
+            "event_key": self.event_key,
+            "account_id": self.account_id,
+            "message_id": self.message_id,
+            "wamid": self.wamid,
+            "occurred_at": self.occurred_at.isoformat() if self.occurred_at else None,
+            "payload": self.payload,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+

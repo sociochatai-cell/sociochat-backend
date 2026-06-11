@@ -20,8 +20,10 @@ def init_scheduler(app):
     if scheduler and scheduler.running:
         return scheduler
 
+    from models import db
+
     jobstores = {
-        'default': SQLAlchemyJobStore(engine=app.db.engine, tablename='whatsapp_jobs')
+        'default': SQLAlchemyJobStore(engine=db.engine, tablename='whatsapp_jobs')
     }
     executors = {
         'default': ThreadPoolExecutor(20)

@@ -121,6 +121,73 @@ def normalize_phone_number(phone_value) -> str:
     return result if result else ""
 
 
+def _get_crm_models():
+    from flask import current_app
+    return getattr(current_app, "crm_models", None)
+
+
+def _crm_workspace_id_for_account(account: WhatsAppAccount):
+    ws = account.workspace_id
+    if ws is None or ws == "":
+        return None
+    try:
+        return int(ws)
+    except (TypeError, ValueError):
+        return ws
+
+
+def _enrolled_phones_for_campaign(campaign_id: int) -> set:
+    phones = set()
+    enrollments = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id).all()
+    for enrollment in enrollments:
+        norm = normalize_phone_number(enrollment.phone_number or "")
+        if norm:
+            phones.add(norm)
+    return phones
+
+
+def _serialize_crm_record(record, enrolled_phones: set, include_without_phone: bool = False):
+    raw_phone = record.phone or ""
+    norm_phone = normalize_phone_number(raw_phone) if raw_phone else ""
+    if not include_without_phone and not raw_phone.strip():
+        return None
+    return {
+        "id": str(record.id),
+        "name": record.name,
+        "phone": raw_phone,
+        "phone_normalized": norm_phone or None,
+        "email": getattr(record, "email", None),
+        "company": getattr(record, "company", None),
+        "status": getattr(record, "status", None),
+        "whatsapp_ready": bool(norm_phone),
+        "already_enrolled": norm_phone in enrolled_phones if norm_phone else False,
+        "created_at": record.created_at.isoformat() if getattr(record, "created_at", None) else None,
+    }
+
+
+def _crm_audience_stats(leads, contacts, enrolled_phones: set):
+    leads_with_phone = sum(1 for r in leads if (r.phone or "").strip())
+    contacts_with_phone = sum(1 for r in contacts if (r.phone or "").strip())
+
+    available_phones = set()
+    for record in leads + contacts:
+        norm = normalize_phone_number(record.phone or "")
+        if norm:
+            available_phones.add(norm)
+
+    already_enrolled = len(available_phones & enrolled_phones)
+    estimated_enrollable = len(available_phones - enrolled_phones)
+
+    return {
+        "leads_with_phone": leads_with_phone,
+        "contacts_with_phone": contacts_with_phone,
+        "total_available": leads_with_phone + contacts_with_phone,
+        "suppressed": 0,
+        "already_enrolled": already_enrolled,
+        "estimated_enrollable": estimated_enrollable,
+    }
+
+
 # ============================================================
 # Campaign Management
 # ============================================================
@@ -375,14 +442,23 @@ def list_datasets():
     if not workspace_id:
         return jsonify({"datasets": [], "error": "Workspace not found"}), 404
         
-    # Fetch datasets for this workspace
-    datasets = WhatsAppDataset.query.filter_by(
-        workspace_id=workspace_id
-    ).order_by(WhatsAppDataset.updated_at.desc()).all()
-    
+    # Use canonical datasets table (same as /dashboard/datasets)
+    from .dataset_models import Dataset
+
+    try:
+        ws_id = int(workspace_id)
+    except (TypeError, ValueError):
+        return jsonify({"datasets": [], "error": "Invalid workspace_id"}), 400
+
+    datasets = (
+        Dataset.query.filter_by(workspace_id=ws_id)
+        .order_by(Dataset.updated_at.desc())
+        .all()
+    )
+
     return jsonify({
         "datasets": [d.to_dict() for d in datasets],
-        "count": len(datasets)
+        "count": len(datasets),
     })
 
 
@@ -1302,6 +1378,7 @@ def get_campaign_variables(account_id: int, campaign_id: int, account: WhatsAppA
         # 3. Default to 0 (safest)
         
         variable_count = 0
+        template_def = None
         if step.template_name:
             # Try to find the template definition
             template_def = WhatsAppTemplate.query.filter_by(
@@ -2192,19 +2269,22 @@ def import_contacts_csv(account_id: int, campaign_id: int, account: WhatsAppAcco
         skipped = 0
         now_utc = datetime.now(timezone.utc)
         
+        phone_col = column_mapping.get("phone") or request.form.get("phone_column")
+
         for row in reader:
-            # Find phone
+            # Find phone from mapping, explicit column, or common header names
             phone_val = None
-            # Check implicit 'phone' or 'mobile' keys first
-            for k in row.keys():
-                if k.lower() in ('phone', 'mobile', 'whatsapp'):
-                    phone_val = row[k]
-                    break
-            
-            # Or use mapping if 'phone' is mapped
-            phone_col = request.form.get("phone_column")
             if phone_col and phone_col in row:
                 phone_val = row[phone_col]
+            else:
+                for k in row.keys():
+                    key_lower = str(k).lower().strip()
+                    if key_lower in ("phone", "mobile", "whatsapp", "phone_number", "phonenumber", "contact"):
+                        phone_val = row[k]
+                        break
+                    if "phone" in key_lower or key_lower == "msisdn":
+                        phone_val = row[k]
+                        break
             
             # If still no phone, skip
             if not phone_val:
@@ -2530,21 +2610,28 @@ def enroll_dataset(account_id: int, campaign_id: int, account: WhatsAppAccount, 
             account_id=account_id
         ).first_or_404()
         
-        dataset = WhatsAppDataset.query.filter_by(
+        from .dataset_models import Dataset, DatasetRow
+
+        try:
+            ws_id = int(workspace_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid workspace_id"}), 400
+
+        dataset = Dataset.query.filter_by(
             id=dataset_id,
-            workspace_id=workspace_id
+            workspace_id=ws_id,
         ).first_or_404()
-        
+
         first_step = WhatsAppDripStep.query.filter_by(
-            campaign_id=campaign_id, 
-            step_order=1
+            campaign_id=campaign_id,
+            step_order=1,
         ).first()
-        
+
         enrolled = 0
         skipped = 0
         now_utc = datetime.now(timezone.utc)
-        
-        rows = WhatsAppDatasetRow.query.filter_by(dataset_id=dataset_id).all()
+
+        rows = DatasetRow.query.filter_by(dataset_id=dataset_id).all()
         
         for row_obj in rows:
             row_data = _clean_row_data(row_obj.data or {})
@@ -2650,3 +2737,337 @@ def enroll_dataset(account_id: int, campaign_id: int, account: WhatsAppAccount, 
         db.session.rollback()
         logger.exception(f"Error enrolling from dataset: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+# ============================================================
+# Drip Analytics
+# ============================================================
+
+
+def _drip_campaign_query(workspace_id=None):
+    q = WhatsAppDripCampaign.query.filter(WhatsAppDripCampaign.trigger_type != "manual")
+    if workspace_id:
+        q = q.filter_by(workspace_id=str(workspace_id))
+    return q
+
+
+def _message_stats_for_campaign(campaign_id: int):
+    from sqlalchemy import func
+    from .models import WhatsAppMessage
+
+    rows = (
+        db.session.query(WhatsAppMessage.status, func.count(WhatsAppMessage.id))
+        .filter(WhatsAppMessage.campaign_id == campaign_id, WhatsAppMessage.direction == "outgoing")
+        .group_by(WhatsAppMessage.status)
+        .all()
+    )
+    counts = {status: cnt for status, cnt in rows}
+    sent = sum(counts.values())
+    delivered = counts.get("delivered", 0) + counts.get("read", 0)
+    read = counts.get("read", 0)
+    failed = counts.get("failed", 0)
+    return {"sent": sent, "delivered": delivered, "read": read, "failed": failed, "replied": 0}
+
+
+@drip_bp.route("/drip-campaigns/analytics/overview", methods=["GET"])
+def drip_analytics_overview():
+    workspace_id = request.args.get("workspace_id")
+    if not workspace_id:
+        return jsonify({"error": "workspace_id required"}), 400
+
+    campaigns = _drip_campaign_query(workspace_id).all()
+    total_enrollments = 0
+    total_sent = total_delivered = total_read = total_replied = 0
+    campaign_rows = []
+
+    for c in campaigns:
+        stats = _message_stats_for_campaign(c.id)
+        total_enrollments += int(c.enrolled_count or 0)
+        total_sent += stats["sent"]
+        total_delivered += stats["delivered"]
+        total_read += stats["read"]
+        total_replied += stats["replied"]
+        campaign_rows.append({
+            "id": c.id,
+            "name": c.name,
+            "status": c.status,
+            "enrolled_count": int(c.enrolled_count or 0),
+            "sent_count": stats["sent"],
+            "delivered_count": stats["delivered"],
+            "read_count": stats["read"],
+            "replied_count": stats["replied"],
+        })
+
+    now = datetime.now(timezone.utc)
+    daily_trends = []
+    from sqlalchemy import func, case
+    from .models import WhatsAppMessage, WhatsAppConversation, WhatsAppAccount
+
+    account_ids = [a.id for a in WhatsAppAccount.query.filter_by(workspace_id=str(workspace_id), is_active=True).all()]
+    if account_ids:
+        start = now - timedelta(days=29)
+        msg_rows = (
+            db.session.query(
+                func.date(WhatsAppMessage.created_at).label("day"),
+                func.count(WhatsAppMessage.id).label("sent"),
+                func.sum(case((WhatsAppMessage.status.in_(["delivered", "read"]), 1), else_=0)).label("delivered"),
+                func.sum(case((WhatsAppMessage.status == "read", 1), else_=0)).label("read"),
+            )
+            .join(WhatsAppConversation, WhatsAppMessage.conversation_id == WhatsAppConversation.id)
+            .filter(
+                WhatsAppMessage.created_at >= start,
+                WhatsAppMessage.direction == "outgoing",
+                WhatsAppConversation.account_id.in_(account_ids),
+            )
+            .group_by(func.date(WhatsAppMessage.created_at))
+            .all()
+        )
+        by_day = {str(r.day): r for r in msg_rows}
+        for offset in range(29, -1, -1):
+            day = (now - timedelta(days=offset)).date()
+            key = str(day)
+            row = by_day.get(key)
+            daily_trends.append({
+                "date": key,
+                "sent": int(row.sent or 0) if row else 0,
+                "delivered": int(row.delivered or 0) if row else 0,
+                "read": int(row.read or 0) if row else 0,
+            })
+
+    active = sum(1 for c in campaigns if c.status in ("active", "running", "scheduled"))
+    return jsonify({
+        "summary": {
+            "total_campaigns": len(campaigns),
+            "active_campaigns": active,
+            "total_enrollments": total_enrollments,
+            "total_sent": total_sent,
+            "total_delivered": total_delivered,
+            "total_read": total_read,
+            "total_replied": total_replied,
+        },
+        "campaigns": campaign_rows,
+        "daily_trends": daily_trends,
+    })
+
+
+@drip_bp.route("/drip-campaigns/<int:campaign_id>/analytics/summary", methods=["GET"])
+def drip_campaign_analytics_summary(campaign_id: int):
+    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
+    enrollments = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id).all()
+    enrollment_stats = {
+        "total": len(enrollments),
+        "active": sum(1 for e in enrollments if e.status == "active"),
+        "completed": sum(1 for e in enrollments if e.status == "completed"),
+        "paused": sum(1 for e in enrollments if e.status == "paused"),
+        "failed": sum(1 for e in enrollments if e.status in ("failed", "blocked_missing_data")),
+    }
+    msg_stats = _message_stats_for_campaign(campaign_id)
+    return jsonify({
+        "enrollment": enrollment_stats,
+        "messages": msg_stats,
+        "campaign": {"id": campaign.id, "name": campaign.name, "status": campaign.status},
+    })
+
+
+@drip_bp.route("/drip-campaigns/<int:campaign_id>/analytics/daily", methods=["GET"])
+def drip_campaign_analytics_daily(campaign_id: int):
+    from sqlalchemy import func, case
+    from .models import WhatsAppMessage
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=29)
+    rows = (
+        db.session.query(
+            func.date(WhatsAppMessage.created_at).label("day"),
+            func.count(WhatsAppMessage.id).label("sent"),
+            func.sum(case((WhatsAppMessage.status == "read", 1), else_=0)).label("read"),
+        )
+        .filter(
+            WhatsAppMessage.campaign_id == campaign_id,
+            WhatsAppMessage.direction == "outgoing",
+            WhatsAppMessage.created_at >= start,
+        )
+        .group_by(func.date(WhatsAppMessage.created_at))
+        .order_by(func.date(WhatsAppMessage.created_at))
+        .all()
+    )
+    by_day = {str(r.day): r for r in rows}
+    daily = []
+    for offset in range(29, -1, -1):
+        day = (now - timedelta(days=offset)).date()
+        key = str(day)
+        row = by_day.get(key)
+        daily.append({
+            "date": key,
+            "sent": int(row.sent or 0) if row else 0,
+            "read": int(row.read or 0) if row else 0,
+        })
+    return jsonify(daily)
+
+
+@drip_bp.route("/drip-campaigns/<int:campaign_id>/analytics/funnel", methods=["GET"])
+def drip_campaign_analytics_funnel(campaign_id: int):
+    steps = (
+        WhatsAppDripStep.query.filter_by(campaign_id=campaign_id)
+        .order_by(WhatsAppDripStep.step_order.asc())
+        .all()
+    )
+    funnel = []
+    for step in steps:
+        active_at_step = WhatsAppDripEnrollment.query.filter(
+            WhatsAppDripEnrollment.campaign_id == campaign_id,
+            WhatsAppDripEnrollment.current_step_order >= step.step_order,
+        ).count()
+        completed_past = WhatsAppDripEnrollment.query.filter(
+            WhatsAppDripEnrollment.campaign_id == campaign_id,
+            WhatsAppDripEnrollment.current_step_order > step.step_order,
+        ).count()
+        funnel.append({
+            "step_order": step.step_order,
+            "step_name": f"Step {step.step_order}",
+            "template_name": step.template_name,
+            "sent": active_at_step + completed_past,
+            "read": completed_past,
+        })
+    return jsonify(funnel)
+
+
+@drip_bp.route("/drip-campaigns/<int:campaign_id>/analytics/enrollments", methods=["GET"])
+def drip_campaign_analytics_enrollments(campaign_id: int):
+    per_page = min(max(int(request.args.get("per_page", 10)), 1), 100)
+    rows = (
+        WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id)
+        .order_by(WhatsAppDripEnrollment.created_at.desc())
+        .limit(per_page)
+        .all()
+    )
+    enrollments = []
+    for e in rows:
+        variables = e.variables if isinstance(e.variables, dict) else {}
+        name = variables.get("name") or variables.get("full_name") or variables.get("customer_name")
+        enrollments.append({
+            "id": e.id,
+            "contact_name": name or e.phone_number,
+            "phone_number": e.phone_number,
+            "status": e.status,
+            "current_step": e.current_step_order or 0,
+            "joined_at": e.created_at.isoformat() if e.created_at else None,
+            "next_run_at": e.next_run_at.isoformat() if e.next_run_at else None,
+        })
+    return jsonify({"enrollments": enrollments})
+
+
+# ============================================================
+# CRM Audience (drip enrollment from CRM leads/contacts)
+# ============================================================
+
+@drip_bp.route("/accounts/<int:account_id>/crm-audience/summary", methods=["GET"])
+@require_account_access
+def crm_audience_summary(account_id: int, account: WhatsAppAccount, workspace_id: str):
+    campaign_id = request.args.get("campaign_id", type=int)
+    if not campaign_id:
+        return jsonify({"error": "campaign_id required"}), 400
+
+    campaign = WhatsAppDripCampaign.query.filter_by(
+        id=campaign_id,
+        account_id=account_id,
+    ).first()
+    if not campaign:
+        return jsonify({"error": "Campaign not found"}), 404
+
+    crm_models = _get_crm_models()
+    if not crm_models:
+        return jsonify({"error": "CRM not initialized"}), 503
+
+    crm_ws_id = _crm_workspace_id_for_account(account)
+    if crm_ws_id is None:
+        return jsonify({"error": "Account has no workspace"}), 400
+
+    Lead = crm_models["Lead"]
+    Contact = crm_models["Contact"]
+    leads = Lead.query.filter_by(workspace_id=crm_ws_id).all()
+    contacts = Contact.query.filter_by(workspace_id=crm_ws_id).all()
+    enrolled_phones = _enrolled_phones_for_campaign(campaign_id)
+
+    return jsonify(_crm_audience_stats(leads, contacts, enrolled_phones))
+
+
+@drip_bp.route("/accounts/<int:account_id>/crm-audience/leads", methods=["GET"])
+@require_account_access
+def crm_audience_leads(account_id: int, account: WhatsAppAccount, workspace_id: str):
+    campaign_id = request.args.get("campaign_id", type=int)
+    if not campaign_id:
+        return jsonify({"error": "campaign_id required"}), 400
+
+    campaign = WhatsAppDripCampaign.query.filter_by(
+        id=campaign_id,
+        account_id=account_id,
+    ).first()
+    if not campaign:
+        return jsonify({"error": "Campaign not found"}), 404
+
+    crm_models = _get_crm_models()
+    if not crm_models:
+        return jsonify({"error": "CRM not initialized"}), 503
+
+    crm_ws_id = _crm_workspace_id_for_account(account)
+    if crm_ws_id is None:
+        return jsonify({"error": "Account has no workspace"}), 400
+
+    limit = min(request.args.get("limit", 100, type=int), 500)
+    include_all = request.args.get("include_all", "false").lower() in ("1", "true", "yes")
+    enrolled_phones = _enrolled_phones_for_campaign(campaign_id)
+
+    Lead = crm_models["Lead"]
+    query = Lead.query.filter_by(workspace_id=crm_ws_id).order_by(Lead.created_at.desc())
+    records = query.limit(limit).all()
+
+    leads = []
+    for record in records:
+        item = _serialize_crm_record(record, enrolled_phones, include_without_phone=include_all)
+        if item:
+            leads.append(item)
+
+    return jsonify({"success": True, "leads": leads, "total": len(leads)})
+
+
+@drip_bp.route("/accounts/<int:account_id>/crm-audience/contacts", methods=["GET"])
+@require_account_access
+def crm_audience_contacts(account_id: int, account: WhatsAppAccount, workspace_id: str):
+    campaign_id = request.args.get("campaign_id", type=int)
+    if not campaign_id:
+        return jsonify({"error": "campaign_id required"}), 400
+
+    campaign = WhatsAppDripCampaign.query.filter_by(
+        id=campaign_id,
+        account_id=account_id,
+    ).first()
+    if not campaign:
+        return jsonify({"error": "Campaign not found"}), 404
+
+    crm_models = _get_crm_models()
+    if not crm_models:
+        return jsonify({"error": "CRM not initialized"}), 503
+
+    crm_ws_id = _crm_workspace_id_for_account(account)
+    if crm_ws_id is None:
+        return jsonify({"error": "Account has no workspace"}), 400
+
+    limit = min(request.args.get("limit", 100, type=int), 500)
+    enrolled_phones = _enrolled_phones_for_campaign(campaign_id)
+
+    Contact = crm_models["Contact"]
+    records = (
+        Contact.query.filter_by(workspace_id=crm_ws_id)
+        .order_by(Contact.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    contacts = []
+    for record in records:
+        item = _serialize_crm_record(record, enrolled_phones, include_without_phone=False)
+        if item:
+            contacts.append(item)
+
+    return jsonify({"success": True, "contacts": contacts, "total": len(contacts)})

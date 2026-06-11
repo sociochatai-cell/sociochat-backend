@@ -8,7 +8,7 @@ class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-in-production")
     SQLALCHEMY_DATABASE_URI = os.getenv(
         "SQLALCHEMY_DATABASE_URI",
-        "sqlite:///sociochat.db"  # SQLite default for local dev
+          # SQLite default for local dev
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 

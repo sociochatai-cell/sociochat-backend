@@ -215,6 +215,7 @@ def detect_whatsapp_connection_path(workspace_id: str) -> Dict[str, Any]:
             "quality_rating": account.quality_score,
             "is_test_number": False,
             "is_active": account.is_active,
+            "is_coexistence": account.is_coexistence,
             "token_type": account.token_type,
         }
         return {

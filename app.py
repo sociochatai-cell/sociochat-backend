@@ -30,6 +30,22 @@ app.config.from_object(Config)
 app.secret_key = os.environ.get("SESSION_SECRET", app.config['SECRET_KEY'])
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 # ---------- CORS ----------
+# Set CORS_ALLOW_ALL=0 to restore origin whitelist (production-safe default after debugging).
+CORS_ALLOW_ALL = os.getenv("CORS_ALLOW_ALL", "1").strip().lower() in ("1", "true", "yes", "on")
+
+_CORS_ALLOW_HEADERS = [
+    "Content-Type",
+    "Authorization",
+    "X-Requested-With",
+    "X-User-Id",
+    "X-User-Email",
+    "X-Admin-Id",
+    "X-Workspace-ID",
+]
+_CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+_CORS_HEADERS_VALUE = "Content-Type, Authorization, X-Requested-With, X-User-Id, X-User-Email, X-Admin-Id, X-Workspace-ID"
+_CORS_METHODS_VALUE = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+
 _extra_origins = [o.strip().rstrip("/") for o in os.getenv("EXTRA_CORS_ORIGINS", "").split(",") if o.strip()]
 FRONTEND_ORIGINS = [
     os.getenv("FRONTEND_ORIGIN", "http://localhost:5173").rstrip("/"),
@@ -55,24 +71,42 @@ def _is_allowed_origin(origin):
             pass
     return False
 
-CORS(
-    app,
-    origins=FRONTEND_ORIGINS,
-    supports_credentials=True,
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-User-Id", "X-User-Email", "X-Admin-Id", "X-Workspace-ID"],
-    expose_headers=["Content-Type"],
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-)
+if CORS_ALLOW_ALL:
+    logger.warning("[CORS] DEBUG MODE: allowing all origins (*). Set CORS_ALLOW_ALL=0 to disable.")
+    CORS(
+        app,
+        resources={r"/*": {"origins": "*"}},
+        supports_credentials=False,
+        allow_headers=_CORS_ALLOW_HEADERS,
+        expose_headers=["Content-Type"],
+        methods=_CORS_ALLOW_METHODS,
+    )
+else:
+    CORS(
+        app,
+        origins=FRONTEND_ORIGINS,
+        supports_credentials=True,
+        allow_headers=_CORS_ALLOW_HEADERS,
+        expose_headers=["Content-Type"],
+        methods=_CORS_ALLOW_METHODS,
+    )
 
 @app.after_request
 def add_cors_headers(resp):
     origin = request.headers.get("Origin")
+    if CORS_ALLOW_ALL:
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = _CORS_HEADERS_VALUE
+        resp.headers["Access-Control-Allow-Methods"] = _CORS_METHODS_VALUE
+        resp.headers["Vary"] = "Origin"
+        return resp
+
     logger.debug(f"[CORS] Origin header: {origin!r}, allowed: {_is_allowed_origin(origin) if origin else 'N/A'}")
     if origin and _is_allowed_origin(origin):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, X-User-Id, X-User-Email, X-Admin-Id, X-Workspace-ID"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = _CORS_HEADERS_VALUE
+        resp.headers["Access-Control-Allow-Methods"] = _CORS_METHODS_VALUE
     resp.headers["Vary"] = "Origin"
     return resp
 
@@ -128,8 +162,10 @@ from whatsapp import (
     template_bp, trigger_bp, drip_bp, interactive_automation_bp,
     bulk_bp, production_trigger_bp,
     flow_bp, flow_testing_bp, flow_endpoint_bp,
-    dataset_bp, coexistence_bp
+    dataset_bp, coexistence_bp,
+    catalog_bp, tracking_bp, tracking_redirect_bp, scheduler_bp,
 )
+from whatsapp.usage_events_routes import usage_events_internal_bp
 app.register_blueprint(whatsapp_bp, url_prefix="/api/whatsapp")
 app.register_blueprint(automation_bp, url_prefix="/api/whatsapp")
 app.register_blueprint(ai_bp)
@@ -145,7 +181,16 @@ app.register_blueprint(flow_bp)
 app.register_blueprint(flow_testing_bp)
 app.register_blueprint(flow_endpoint_bp)
 app.register_blueprint(dataset_bp, url_prefix="/api/whatsapp")
-app.register_blueprint(coexistence_bp, url_prefix="/api/whatsapp")
+app.register_blueprint(coexistence_bp)
+app.register_blueprint(catalog_bp, url_prefix="/api/whatsapp")
+app.register_blueprint(tracking_bp)
+app.register_blueprint(tracking_redirect_bp)
+app.register_blueprint(scheduler_bp, url_prefix="/api/internal/scheduler")
+app.register_blueprint(usage_events_internal_bp, url_prefix="/api/internal/whatsapp")
+
+# Subscription / billing
+from subscription.routes import subscription_bp
+app.register_blueprint(subscription_bp)
 
 # Register Agent Blueprint
 from agent_backend import agent_bp
@@ -153,7 +198,29 @@ app.register_blueprint(agent_bp)
 
 
 with app.app_context():
+    # Ensure link tracking + subscription tables exist
+    import shared_models  # noqa: F401
+    import subscription.models  # noqa: F401
+    from whatsapp import dataset_models  # noqa: F401
+
     db.create_all()
+
+    # CRM models (leads/contacts) used by drip/bulk audience import
+    try:
+        app.db = db
+        from SocioviaCrm.models import init_models as init_crm_models
+        init_crm_models()
+        logger.info("CRM models initialized")
+    except Exception as e:
+        logger.warning(f"CRM models init skipped: {e}")
+
+    # Start APScheduler for drip/bulk campaign jobs
+    try:
+        from whatsapp.scheduler import init_scheduler
+        init_scheduler(app)
+        logger.info("WhatsApp APScheduler initialized")
+    except Exception as e:
+        logger.warning(f"APScheduler init skipped: {e}")
 
     # Initialize notification engine
     try:
@@ -332,8 +399,8 @@ def notification_stream():
     if request.method == "OPTIONS":
         response = Response()
         response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Methods"] = _CORS_METHODS_VALUE
+        response.headers["Access-Control-Allow-Headers"] = _CORS_HEADERS_VALUE
         return response
 
     workspace_id = request.args.get("workspace_id")
@@ -351,6 +418,9 @@ def notification_stream():
 
     return Response(stream_with_context(event_stream()), mimetype="text/event-stream")
 
+@app.route("/get_test",methods=["GET"])
+def hello():
+     return "hello"
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

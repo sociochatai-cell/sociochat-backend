@@ -8,6 +8,7 @@ Stores blog posts with block-based content as JSONB.
 
 from datetime import datetime
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import JSON as SAJSON
 from models import db, User, Workspace
 
 
@@ -82,11 +83,11 @@ class BlogPost(db.Model):
     render_version = db.Column(db.Integer, nullable=False, default=1)  # For future-proofing rendering
     
     # Content storage
-    content_json = db.Column(JSONB, nullable=False, default=list)  # Draft content (current edits)
-    published_content_json = db.Column(JSONB, nullable=True)  # Frozen snapshot for live site
+    content_json = db.Column(SAJSON().with_variant(JSONB, "postgresql"), nullable=False, default=list)  # Draft content (current edits)
+    published_content_json = db.Column(SAJSON().with_variant(JSONB, "postgresql"), nullable=True)  # Frozen snapshot for live site
     
     # SEO metadata
-    seo_meta = db.Column(JSONB, nullable=True, default=dict)
+    seo_meta = db.Column(SAJSON().with_variant(JSONB, "postgresql"), nullable=True, default=dict)
     
     # Timestamps
     published_at = db.Column(db.DateTime, nullable=True)

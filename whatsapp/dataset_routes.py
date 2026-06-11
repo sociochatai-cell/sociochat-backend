@@ -13,10 +13,12 @@ import csv
 import json
 import logging
 from datetime import datetime
+from urllib.parse import unquote
 
 import requests as http_requests
 from flask import Blueprint, request, jsonify, current_app
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm.attributes import flag_modified
 
 from .dataset_models import Dataset, DatasetRow
 from models import db
@@ -147,6 +149,7 @@ def add_row(dataset_id):
     new_cols = [k for k in row_data.keys() if k not in existing_cols]
     if new_cols:
         ds.columns = list(existing_cols | set(new_cols))
+        flag_modified(ds, "columns")
 
     row = DatasetRow(dataset_id=dataset_id, data=row_data)
     db.session.add(row)
@@ -197,27 +200,31 @@ def add_column(dataset_id):
     if col_name not in cols:
         cols.append(col_name)
         ds.columns = cols
+        flag_modified(ds, "columns")
         db.session.commit()
 
     return _success(ds.to_dict())
 
 
-@dataset_bp.route("/datasets/<int:dataset_id>/columns/<col_name>", methods=["DELETE"])
+@dataset_bp.route("/datasets/<int:dataset_id>/columns/<path:col_name>", methods=["DELETE"])
 def remove_column(dataset_id, col_name):
     ds = Dataset.query.get(dataset_id)
     if not ds:
         return _error("Dataset not found", 404)
 
+    col_name = unquote(col_name).strip()
     cols = list(ds.columns or [])
     if col_name in cols:
         cols.remove(col_name)
         ds.columns = cols
+        flag_modified(ds, "columns")
 
         # Remove column data from all rows
         for row in DatasetRow.query.filter_by(dataset_id=dataset_id).all():
             data = dict(row.data or {})
             data.pop(col_name, None)
             row.data = data
+            flag_modified(row, "data")
 
         db.session.commit()
 

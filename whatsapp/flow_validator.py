@@ -85,6 +85,91 @@ class FlowValidationResult:
         }
 
 
+def _alpha_suffix(index: int) -> str:
+    suffix = ""
+    n = max(0, int(index))
+    while True:
+        remainder = n % 26
+        suffix = chr(65 + remainder) + suffix
+        n = n // 26
+        if n == 0:
+            break
+        n -= 1
+    return suffix
+
+
+def _to_meta_safe_screen_id(source: str, fallback: str) -> str:
+    candidate = re.sub(r"[^A-Za-z_]+", "_", (source or fallback or "SCREEN"))
+    candidate = re.sub(r"_+", "_", candidate).strip("_") or "SCREEN"
+    if candidate.upper() == "SUCCESS":
+        candidate = "SCREEN_SUCCESS"
+    return candidate[:64]
+
+
+def sanitize_flow_json(
+    flow_json: Dict[str, Any],
+    entry_screen_id: str,
+) -> tuple[Dict[str, Any], str]:
+    """
+    Remap screen IDs to Meta-safe format (letters and underscores only).
+    Fixes flows saved with internal builder IDs that contain numbers.
+    """
+    import copy
+
+    flow_json = copy.deepcopy(flow_json)
+    screens = flow_json.get("screens") or []
+    if not screens:
+        return flow_json, entry_screen_id
+
+    id_map: Dict[str, str] = {}
+    used: set[str] = set()
+    base_counts: Dict[str, int] = {}
+
+    for i, screen in enumerate(screens):
+        old_id = screen.get("id") or f"screen_{i}"
+        base = _to_meta_safe_screen_id(old_id, screen.get("title") or f"STEP_{i + 1}")
+        attempt = base_counts.get(base, 0)
+        new_id = base
+        while new_id in used:
+            new_id = f"{base}_{_alpha_suffix(attempt)}"
+            attempt += 1
+        base_counts[base] = attempt
+        used.add(new_id)
+        id_map[old_id] = new_id
+        screen["id"] = new_id
+
+    routing = flow_json.get("routing_model") or {}
+    new_routing: Dict[str, list] = {}
+    for old_key, targets in routing.items():
+        new_key = id_map.get(old_key, _to_meta_safe_screen_id(old_key, old_key))
+        new_targets = [id_map.get(t, t) for t in (targets or [])]
+        new_routing[new_key] = new_targets
+    flow_json["routing_model"] = new_routing
+
+    for screen in screens:
+        children = screen.get("layout", {}).get("children", [])
+        for child in children:
+            action = child.get("on-click-action") or {}
+            next_obj = action.get("next") or {}
+            if next_obj.get("type") == "screen" and next_obj.get("name"):
+                old_next = next_obj["name"]
+                if old_next in id_map:
+                    next_obj["name"] = id_map[old_next]
+
+    screen_ids = [s.get("id") for s in screens]
+    new_entry = id_map.get(entry_screen_id, entry_screen_id)
+    if new_entry not in screen_ids:
+        new_entry = screen_ids[0]
+
+    version = str(flow_json.get("version") or "")
+    if version in ("", "5.0", "6.0", "6.1"):
+        flow_json["version"] = "7.3"
+    if "data_api_version" in flow_json and not flow_json.get("endpoint_uri"):
+        flow_json.pop("data_api_version", None)
+
+    return flow_json, new_entry
+
+
 def validate_flow_json(flow_json: Dict[str, Any], entry_screen_id: str) -> FlowValidationResult:
     """
     Validate Flow JSON strictly before publishing.

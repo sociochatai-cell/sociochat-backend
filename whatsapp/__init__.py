@@ -69,6 +69,9 @@ from .health_check import (
 
 from .bulk_routes import bulk_bp
 from .coexistence_routes import coexistence_bp
+from .catalog_routes import catalog_bp
+from .tracking_routes import tracking_bp, tracking_redirect_bp
+from .scheduler_routes import scheduler_bp
 
 __all__ = [
     "whatsapp_bp",
@@ -87,6 +90,10 @@ __all__ = [
     "flow_endpoint_bp",
     "dataset_bp",
     "coexistence_bp",
+    "catalog_bp",
+    "tracking_bp",
+    "tracking_redirect_bp",
+    "scheduler_bp",
     "WhatsAppAccount",
     "WhatsAppConversation",
     "WhatsAppMessage",

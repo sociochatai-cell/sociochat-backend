@@ -114,6 +114,12 @@ class WhatsAppDripEnrollment(db.Model):
     
     # Template params sent (for auditing what was actually sent)
     last_sent_params = db.Column(db.JSON, default=dict)  # Snapshot of params sent
+
+    # Link click tracking (bulk / drip with tracked URLs)
+    tracking_id = db.Column(db.String(64), nullable=True, index=True)
+    clicked = db.Column(db.Boolean, default=False)
+    click_count = db.Column(db.Integer, default=0)
+    clicked_at = db.Column(db.DateTime(timezone=True), nullable=True)
     
     created_at = db.Column(db.DateTime(timezone=True), default=func.now())
     updated_at = db.Column(db.DateTime(timezone=True), onupdate=func.now())

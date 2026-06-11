@@ -769,6 +769,20 @@ class WhatsAppService:
         conversation.last_outbound_at = datetime.now(timezone.utc)
         
         self.db_session.commit()
+
+        if status == "sent":
+            try:
+                from .usage_events import emit_message_sent_usage_event, broadcast_usage_event
+                event = emit_message_sent_usage_event(
+                    db_session=self.db_session,
+                    account_id=conversation.account_id,
+                    message=message,
+                    conversation=conversation,
+                )
+                broadcast_usage_event(event)
+            except Exception as exc:
+                logger.warning("Usage event emit failed (non-fatal): %s", exc)
+
         return message
     
     @staticmethod

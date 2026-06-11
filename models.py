@@ -326,6 +326,7 @@ class AIUsageDailySummary(db.Model):
 
 # --- Workflow & WorkflowRun ---
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import JSON as SAJSON
 
 class Workflow(db.Model):
     __tablename__ = "workflows"
@@ -336,7 +337,7 @@ class Workflow(db.Model):
 
     name = db.Column(db.String(255), nullable=False)
     template_id = db.Column(db.String(100), nullable=True)
-    json = db.Column(JSONB, nullable=False)
+    json = db.Column(SAJSON().with_variant(JSONB, "postgresql"), nullable=False)
     schedule_cron = db.Column(db.String(64), nullable=True)
     is_active = db.Column(db.Boolean, default=True)
 
@@ -356,7 +357,7 @@ class WorkflowRun(db.Model):
     finished_at = db.Column(db.DateTime, nullable=True)
     status = db.Column(db.String(50), default="success")
 
-    report_json = db.Column(JSONB, nullable=False)
+    report_json = db.Column(SAJSON().with_variant(JSONB, "postgresql"), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class AdAccount(db.Model):

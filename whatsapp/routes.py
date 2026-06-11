@@ -70,6 +70,22 @@ def get_db():
     return db.session
 
 
+def _parse_analytics_days(default: int = 7) -> int:
+    days_param = request.args.get("days") or request.args.get("period", str(default))
+    try:
+        return int(days_param)
+    except (TypeError, ValueError):
+        return default
+
+
+def _account_ids_for_workspace(workspace_id) -> list:
+    if not workspace_id:
+        return []
+    ws = str(workspace_id)
+    accs = WhatsAppAccount.query.filter_by(workspace_id=ws, is_active=True).all()
+    return [a.id for a in accs]
+
+
 def get_access_token():
     """
     Get access token from request header, database, or environment.
@@ -1766,12 +1782,7 @@ def get_analytics_summary():
     # 1. Parse params
     workspace_id = request.args.get("workspace_id")
     account_id = request.args.get("account_id")
-    days_param = request.args.get("days", "7")
-    
-    try:
-        days = int(days_param)
-    except:
-        days = 7
+    days = _parse_analytics_days(7)
         
     db_session = get_db()
     now = datetime.now(timezone.utc)
@@ -1796,9 +1807,7 @@ def get_analytics_summary():
         if account_id:
             q = q.join(WhatsAppConversation).filter(WhatsAppConversation.account_id == int(account_id))
         elif workspace_id:
-            # Get accounts
-            accs = WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).all()
-            ids = [a.id for a in accs]
+            ids = _account_ids_for_workspace(workspace_id)
             if ids:
                 q = q.join(WhatsAppConversation).filter(WhatsAppConversation.account_id.in_(ids))
             else:
@@ -1846,8 +1855,7 @@ def get_analytics_summary():
     if account_id:
         active_q = active_q.filter(WhatsAppConversation.account_id == int(account_id))
     elif workspace_id:
-        accs = WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).all()
-        ids = [a.id for a in accs]
+        ids = _account_ids_for_workspace(workspace_id)
         if ids:
             active_q = active_q.filter(WhatsAppConversation.account_id.in_(ids))
             
@@ -1862,8 +1870,7 @@ def get_analytics_summary():
         if account_id:
             conv_filter = WhatsAppConversation.account_id == int(account_id)
         elif workspace_id:
-            accs = WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).all()
-            ids = [a.id for a in accs]
+            ids = _account_ids_for_workspace(workspace_id)
             if ids:
                 conv_filter = WhatsAppConversation.account_id.in_(ids)
         
@@ -1873,6 +1880,7 @@ def get_analytics_summary():
         ).filter(
             conv_filter,
             WhatsAppMessage.created_at >= current_start,
+         
             WhatsAppMessage.created_at < current_end
         ).order_by(
             WhatsAppMessage.conversation_id,
@@ -1940,19 +1948,29 @@ def get_analytics_trends():
     
     workspace_id = request.args.get("workspace_id")
     account_id = request.args.get("account_id")
-    days_param = request.args.get("days", "7")
-    try:
-        days = int(days_param)
-    except:
-        days = 7
+    days = _parse_analytics_days(7)
         
     db_session = get_db()
     now = datetime.now(timezone.utc)
     start_date = now - timedelta(days=days)
-    
-    # Query grouped by date
-    # Note: func.date() works in Postgres. For SQLite/others might need strftime.
-    
+
+    def _zero_daily_series():
+        today = now.date()
+        series = []
+        for offset in range(days - 1, -1, -1):
+            day = today - timedelta(days=offset)
+            key = str(day)
+            series.append({"date": key, "sent": 0, "delivered": 0, "read": 0})
+        return series
+
+    account_ids = None
+    if account_id:
+        account_ids = [int(account_id)]
+    elif workspace_id:
+        account_ids = _account_ids_for_workspace(workspace_id)
+        if not account_ids:
+            return jsonify({"success": True, "daily": _zero_daily_series()})
+
     q = db_session.query(
         func.date(WhatsAppMessage.created_at).label("date"),
         func.count(WhatsAppMessage.id).label("sent"),
@@ -1962,26 +1980,33 @@ def get_analytics_trends():
         WhatsAppMessage.created_at >= start_date,
         WhatsAppMessage.direction == "outgoing"
     )
-    
-    if account_id:
-        q = q.join(WhatsAppConversation).filter(WhatsAppConversation.account_id == int(account_id))
-    elif workspace_id:
-        accs = WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).all()
-        ids = [a.id for a in accs]
-        if ids:
-            q = q.join(WhatsAppConversation).filter(WhatsAppConversation.account_id.in_(ids))
+
+    if account_ids is not None:
+        q = q.join(WhatsAppConversation).filter(WhatsAppConversation.account_id.in_(account_ids))
             
     results = q.group_by(func.date(WhatsAppMessage.created_at)).order_by(func.date(WhatsAppMessage.created_at)).all()
-    
-    daily = []
+
+    by_date = {}
     for r in results:
-        daily.append({
+        by_date[str(r.date)] = {
             "date": str(r.date),
-            "sent": r.sent,
-            "delivered": r.delivered or 0,
-            "read": r.read or 0
-        })
-        
+            "sent": int(r.sent or 0),
+            "delivered": int(r.delivered or 0),
+            "read": int(r.read or 0),
+        }
+
+    daily = []
+    today = now.date()
+    for offset in range(days - 1, -1, -1):
+        day = today - timedelta(days=offset)
+        key = str(day)
+        daily.append(
+            by_date.get(
+                key,
+                {"date": key, "sent": 0, "delivered": 0, "read": 0},
+            )
+        )
+
     return jsonify({
         "success": True,
         "daily": daily
@@ -3155,18 +3180,7 @@ def rewrite_template_for_category():
                 })
         
         # ===========================================
-        # STEP 4: Initialize Vertex AI client (NOT free-tier)
-        # ===========================================
-        from google import genai
-        from google.genai import types
-        
-        # Use Vertex AI with project-based auth (not API key)
-        # Fallback chain: GCP_PROJECT -> PROJECT_ID -> hardcoded default
-        gcp_project = os.environ.get("GCP_PROJECT") or os.environ.get("PROJECT_ID") or "angular-sorter-473216-k8"
-        gcp_location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
-        
-        # ===========================================
-        # STEP 5: Build placeholder-safe prompts
+        # STEP 4: Build placeholder-safe prompts
         # ===========================================
         placeholder_warning = ""
         if unique_placeholders:
@@ -3242,21 +3256,22 @@ Return ONLY the cleaned template text. No explanations.
 """
 
         # ===========================================
-        # STEP 6: Call Gemini API
+        # STEP 5: Call Gemini API (API key locally, Vertex in prod)
         # ===========================================
         try:
-            from google.genai.types import HttpOptions
-            
+            from .ai_chatbot import get_genai_client
+
             text_model = os.environ.get("TEXT_MODEL", "gemini-2.0-flash")
-            
-            # Initialize Vertex AI client (NOT free-tier API key)
-            client = genai.Client(
-                http_options=HttpOptions(api_version="v1"),
-                project=gcp_project,
-                location=gcp_location,
-                vertexai=True,
-            )
-            
+            client = get_genai_client()
+            if not client:
+                return jsonify({
+                    "success": False,
+                    "rewritten_text": None,
+                    "confidence": "LOW",
+                    "notes": "AI service not configured. Set GEMINI_API_KEY in your environment.",
+                    "cannot_rewrite": True,
+                })
+
             response = client.models.generate_content(
                 model=text_model,
                 contents=prompt
@@ -4786,6 +4801,11 @@ def connect_exchange():
     data = request.get_json(silent=True) or {}
     code = data.get("code")
     workspace_id = data.get("workspace_id")
+    # Embedded Signup session hints from the WA_EMBEDDED_SIGNUP postMessage —
+    # tokens from Embedded Signup often lack business_management, so /me
+    # discovery fails and these hints are the reliable source.
+    waba_id_hint = str(data.get("waba_id") or "").strip() or None
+    phone_number_id_hint = str(data.get("phone_number_id") or "").strip() or None
     
     if not code:
         return jsonify({"success": False, "error": "Authorization code is required"}), 400
@@ -4836,43 +4856,45 @@ def connect_exchange():
         except Exception as e:
             logger.warning(f"Failed to get long-lived token: {e}")
         
-        # Get WABA and phone number info using debug_token
-        waba_id = None
-        phone_number_id = None
+        # Get WABA and phone number info
+        # Priority 1: session hints from the Embedded Signup postMessage (most reliable)
+        waba_id = waba_id_hint
+        phone_number_id = phone_number_id_hint
         display_phone_number = None
         verified_name = None
         
-        # Get businesses and WhatsApp accounts
-        try:
-            me_resp = http_requests.get(
-                f"https://graph.facebook.com/{api_version}/me",
-                params={
-                    "access_token": access_token,
-                    "fields": "id,name,businesses{id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number,verified_name,quality_rating}}}"
-                },
-                timeout=15,
-            ).json()
-            
-            logger.info(f"Me response: {me_resp}")
-            
-            businesses = me_resp.get("businesses", {}).get("data", [])
-            for business in businesses:
-                wabas = business.get("owned_whatsapp_business_accounts", {}).get("data", [])
-                for waba in wabas:
-                    waba_id = waba.get("id")
-                    phones = waba.get("phone_numbers", {}).get("data", [])
-                    if phones:
-                        phone = phones[0]
-                        phone_number_id = phone.get("id")
-                        display_phone_number = phone.get("display_phone_number")
-                        verified_name = phone.get("verified_name")
-                    break
-                if waba_id:
-                    break
-        except Exception as e:
-            logger.warning(f"Failed to get WABA from /me: {e}")
+        # Priority 2: /me businesses discovery (requires business_management permission)
+        if not waba_id or not phone_number_id:
+            try:
+                me_resp = http_requests.get(
+                    f"https://graph.facebook.com/{api_version}/me",
+                    params={
+                        "access_token": access_token,
+                        "fields": "id,name,businesses{id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number,verified_name,quality_rating}}}"
+                    },
+                    timeout=15,
+                ).json()
+                
+                logger.info(f"Me response: {me_resp}")
+                
+                businesses = me_resp.get("businesses", {}).get("data", [])
+                for business in businesses:
+                    wabas = business.get("owned_whatsapp_business_accounts", {}).get("data", [])
+                    for waba in wabas:
+                        waba_id = waba.get("id")
+                        phones = waba.get("phone_numbers", {}).get("data", [])
+                        if phones:
+                            phone = phones[0]
+                            phone_number_id = phone.get("id")
+                            display_phone_number = phone.get("display_phone_number")
+                            verified_name = phone.get("verified_name")
+                        break
+                    if waba_id:
+                        break
+            except Exception as e:
+                logger.warning(f"Failed to get WABA from /me: {e}")
         
-        # Try debug_token if no WABA found
+        # Priority 3: debug_token granular_scopes (works with Embedded Signup tokens)
         if not waba_id:
             try:
                 debug_resp = http_requests.get(
@@ -4884,9 +4906,11 @@ def connect_exchange():
                     timeout=15,
                 ).json()
                 
+                logger.info(f"debug_token response: {debug_resp}")
+                
                 granular_scopes = debug_resp.get("data", {}).get("granular_scopes", [])
                 for scope in granular_scopes:
-                    if scope.get("scope") == "whatsapp_business_management":
+                    if scope.get("scope") in ("whatsapp_business_management", "whatsapp_business_messaging"):
                         target_ids = scope.get("target_ids", [])
                         if target_ids:
                             waba_id = target_ids[0]
@@ -4910,6 +4934,22 @@ def connect_exchange():
                     verified_name = phone.get("verified_name")
             except Exception as e:
                 logger.warning(f"Failed to fetch phone numbers: {e}")
+        
+        # Fetch display details when the phone id came from session hints
+        if phone_number_id and not display_phone_number:
+            try:
+                phone_resp = http_requests.get(
+                    f"https://graph.facebook.com/{api_version}/{phone_number_id}",
+                    params={
+                        "access_token": access_token,
+                        "fields": "display_phone_number,verified_name,quality_rating",
+                    },
+                    timeout=15,
+                ).json()
+                display_phone_number = phone_resp.get("display_phone_number") or display_phone_number
+                verified_name = phone_resp.get("verified_name") or verified_name
+            except Exception as e:
+                logger.warning(f"Failed to fetch phone details: {e}")
         
         if not waba_id or not phone_number_id:
             raise ValueError("Could not retrieve WhatsApp Business Account. Make sure you completed the Embedded Signup flow and shared your WhatsApp Business Account.")
@@ -4946,6 +4986,25 @@ def connect_exchange():
         
         logger.info(f"WhatsApp account connected via Embedded Signup: {phone_number_id}")
         
+        # Auto-subscribe the app to this WABA's webhooks (messages, template
+        # updates, message_echoes) — without this Meta sends no webhook events.
+        webhook_subscribed = False
+        webhook_error = None
+        try:
+            from .utils import subscribe_waba_to_app
+            for attempt in (1, 2):
+                sub_result = subscribe_waba_to_app(waba_id, access_token)
+                if sub_result.get("success"):
+                    webhook_subscribed = True
+                    webhook_error = None
+                    logger.info(f"✅ Webhook auto-subscribe for WABA {waba_id} succeeded (attempt {attempt})")
+                    break
+                webhook_error = sub_result.get("error")
+                logger.warning(f"⚠️ Webhook auto-subscribe failed for WABA {waba_id} (attempt {attempt}): {webhook_error}")
+        except Exception as e:
+            webhook_error = str(e)
+            logger.warning(f"Webhook auto-subscribe error for WABA {waba_id}: {e}")
+        
         # Auto-register phone number
         try:
             register_resp = http_requests.post(
@@ -4966,6 +5025,8 @@ def connect_exchange():
         
         return jsonify({
             "success": True,
+            "webhook_subscribed": webhook_subscribed,
+            "webhook_error": webhook_error,
             "account": {
                 "id": account.id,
                 "waba_id": account.waba_id,
@@ -5959,7 +6020,6 @@ def upload_chat_media():
         "mime_type": "image/jpeg"
     }
     """
-    import boto3
     import uuid
     import time
     from werkzeug.utils import secure_filename
@@ -5970,6 +6030,133 @@ def upload_chat_media():
         response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
         return response
+
+    def _resolve_meta_media_handle(file_bytes, content_type, ext, account_id):
+        """Upload bytes to Meta Resumable Upload API and return media handle (h)."""
+        if not account_id or not file_bytes:
+            return None
+        try:
+            account = WhatsAppAccount.query.get(int(account_id))
+            access_token = account.get_access_token() if account else None
+        except Exception:
+            access_token = None
+        if not access_token:
+            access_token = os.getenv("WHATSAPP_ACCESS_TOKEN")
+        if not access_token:
+            return None
+
+        import tempfile
+        from .services import WhatsAppService
+
+        suffix = ext if ext.startswith(".") else f".{ext}" if ext else ".bin"
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(file_bytes)
+                temp_path = tmp.name
+            return WhatsAppService().resumable_media_upload(
+                temp_path, content_type, access_token=access_token
+            )
+        except Exception as meta_err:
+            logger.warning("Meta resumable upload failed: %s", meta_err)
+            return None
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def _build_media_upload_response(
+        public_url,
+        media_type,
+        original_filename,
+        file_size,
+        content_type,
+        key,
+        media_handle=None,
+    ):
+        payload = {
+            "success": True,
+            "public_url": public_url,
+            "url": public_url,
+            "media_type": media_type,
+            "filename": original_filename,
+            "size": file_size,
+            "mime_type": content_type,
+            "key": key,
+        }
+        if media_handle:
+            payload["media_handle"] = media_handle
+            payload["handle"] = media_handle
+        return jsonify(payload)
+
+    # URL-based upload (template header / remote image)
+    if request.path.rstrip("/").endswith("/media/upload/url"):
+        try:
+            body = request.get_json(silent=True) or {}
+            image_url = (body.get("url") or "").strip()
+            account_id = body.get("account_id")
+            if not image_url:
+                return jsonify({"success": False, "error": "url_required"}), 400
+            if not image_url.startswith("https://"):
+                return jsonify({"success": False, "error": "https_url_required"}), 400
+
+            import mimetypes
+            import requests as http_requests
+            from io import BytesIO
+
+            resp = http_requests.get(image_url, timeout=30)
+            if resp.status_code != 200:
+                return jsonify({
+                    "success": False,
+                    "error": "url_fetch_failed",
+                    "message": f"Could not download image (HTTP {resp.status_code})",
+                }), 400
+
+            content_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+            if not content_type.startswith("image/"):
+                return jsonify({"success": False, "error": "invalid_file_type", "message": "URL must point to an image"}), 400
+
+            file_bytes = resp.content
+            file_size = len(file_bytes)
+            if file_size > 5 * 1024 * 1024:
+                return jsonify({"success": False, "error": "file_too_large"}), 400
+
+            from core.spaces_storage import (
+                build_object_key,
+                build_public_url,
+                get_s3_client,
+                is_spaces_configured,
+            )
+            if not is_spaces_configured():
+                return jsonify({"success": False, "error": "storage_not_configured"}), 500
+
+            ext = mimetypes.guess_extension(content_type) or ".jpg"
+            original_filename = f"remote{ext}"
+            ts = int(time.time())
+            unique_id = uuid.uuid4().hex[:12]
+            key = build_object_key("uploads", "chat", "image", f"{ts}_{unique_id}{ext}")
+
+            s3_client, space_name = get_s3_client()
+            s3_client.upload_fileobj(
+                BytesIO(file_bytes),
+                space_name,
+                key,
+                ExtraArgs={"ACL": "public-read", "ContentType": content_type},
+            )
+            public_url = build_public_url(key)
+            media_handle = _resolve_meta_media_handle(file_bytes, content_type, ext, account_id)
+
+            logger.info(
+                "Uploaded media from URL: %s (handle=%s, %s bytes)",
+                public_url,
+                bool(media_handle),
+                file_size,
+            )
+            return _build_media_upload_response(
+                public_url, "image", original_filename, file_size, content_type, key, media_handle
+            )
+        except Exception as url_err:
+            logger.exception("URL media upload failed: %s", url_err)
+            return jsonify({"success": False, "error": "upload_failed", "details": str(url_err)}), 500
     
     try:
         # Check for file
@@ -6083,37 +6270,42 @@ def upload_chat_media():
                 file_data = file.stream
         else:
             file_data = file.stream
+
+        from io import BytesIO
+
+        if isinstance(file_data, BytesIO):
+            file_bytes = file_data.getvalue()
+        elif hasattr(file_data, "read"):
+            file_bytes = file_data.read()
+        else:
+            file_bytes = bytes(file_data)
+        upload_stream = BytesIO(file_bytes)
         
-        # Get S3/Spaces config
-        SPACE_NAME = os.environ.get("SPACE_NAME") or os.environ.get("DO_SPACES_BUCKET")
-        SPACE_REGION = os.environ.get("SPACE_REGION") or os.environ.get("DO_SPACES_REGION")
-        ACCESS_KEY = os.environ.get("ACCESS_KEY") or os.environ.get("DO_ACCESS_KEY_ID")
-        SECRET_KEY = os.environ.get("SECRET_KEY") or os.environ.get("DO_SECRET_ACCESS_KEY")
-        
-        if not all([SPACE_NAME, SPACE_REGION, ACCESS_KEY, SECRET_KEY]):
-            logger.error("S3/Spaces configuration not complete")
-            return jsonify({"success": False, "error": "storage_not_configured"}), 500
-        
-        # Initialize S3 client
-        SPACE_ENDPOINT = f'https://{SPACE_REGION}.digitaloceanspaces.com'
-        s3_client = boto3.client(
-            's3',
-            aws_access_key_id=ACCESS_KEY,
-            aws_secret_access_key=SECRET_KEY,
-            endpoint_url=SPACE_ENDPOINT
+        from core.spaces_storage import (
+            build_object_key,
+            build_public_url,
+            get_s3_client,
+            is_spaces_configured,
         )
-        
-        # Generate unique key
+
+        if not is_spaces_configured():
+            logger.error("DigitalOcean Spaces configuration not complete (check DO_SPACES_SECRET_KEY)")
+            return jsonify({"success": False, "error": "storage_not_configured"}), 500
+
+        s3_client, space_name = get_s3_client()
+
+        # Generate unique key under sociochat/ prefix in the sociovia bucket
         ts = int(time.time())
         unique_id = uuid.uuid4().hex[:12]
         ext = os.path.splitext(original_filename)[1].lower() or '.bin'
-        key = f"uploads/chat/{media_type}/{ts}_{unique_id}{ext}"
-        
+        key = build_object_key("uploads", "chat", media_type, f"{ts}_{unique_id}{ext}")
+        account_id = request.form.get("account_id")
+
         # Upload to Spaces
         try:
             s3_client.upload_fileobj(
-                file_data,
-                SPACE_NAME,
+                upload_stream,
+                space_name,
                 key,
                 ExtraArgs={
                     "ACL": "public-read",
@@ -6121,20 +6313,26 @@ def upload_chat_media():
                 }
             )
             
-            public_url = f"https://{SPACE_NAME}.{SPACE_REGION}.digitaloceanspaces.com/{key}"
+            public_url = build_public_url(key)
+            media_handle = _resolve_meta_media_handle(file_bytes, content_type, ext, account_id)
             
-            logger.info(f"Uploaded chat media: {public_url} ({media_type}, {file_size} bytes)")
+            logger.info(
+                "Uploaded chat media: %s (%s, %s bytes, handle=%s)",
+                public_url,
+                media_type,
+                file_size,
+                bool(media_handle),
+            )
             
-            return jsonify({
-                "success": True,
-                "public_url": public_url,
-                "url": public_url,  # Alias for compatibility
-                "media_type": media_type,
-                "filename": original_filename,
-                "size": file_size,
-                "mime_type": content_type,
-                "key": key
-            })
+            return _build_media_upload_response(
+                public_url,
+                media_type,
+                original_filename,
+                file_size,
+                content_type,
+                key,
+                media_handle,
+            )
             
         except Exception as upload_err:
             logger.exception(f"Failed to upload to DigitalOcean Spaces: {upload_err}")

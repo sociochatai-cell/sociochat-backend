@@ -21,7 +21,7 @@ import requests as http_requests
 
 from models import db
 from .models import WhatsAppFlow, WhatsAppAccount
-from .flow_validator import validate_flow_json, generate_sample_flow
+from .flow_validator import validate_flow_json, generate_sample_flow, sanitize_flow_json
 from .flow_access import require_flow_access, require_account_access, validate_flow_account_match
 from .token_helper import get_account_with_token
 from subscription.service import check_flow_limit
@@ -94,11 +94,12 @@ def create_flow():
         # Generate sample flow based on category
         flow_json = generate_sample_flow(category)
     
-    # Determine entry screen
+    # Determine entry screen and sanitize IDs for Meta compatibility
     entry_screen_id = data.get("entry_screen_id")
     if not entry_screen_id:
         screens = flow_json.get("screens", [])
         entry_screen_id = screens[0].get("id") if screens else "WELCOME"
+    flow_json, entry_screen_id = sanitize_flow_json(flow_json, entry_screen_id)
     
     # Check for duplicate name (same account, same version)
     existing = WhatsAppFlow.query.filter_by(
@@ -218,8 +219,9 @@ def update_flow(flow_id: int):
     if "category" in data:
         flow.category = data["category"].upper()
     if "flow_json" in data:
-        flow.flow_json = data["flow_json"]
-    if "entry_screen_id" in data:
+        entry = data.get("entry_screen_id", flow.entry_screen_id)
+        flow.flow_json, flow.entry_screen_id = sanitize_flow_json(data["flow_json"], entry)
+    elif "entry_screen_id" in data:
         flow.entry_screen_id = data["entry_screen_id"]
     
     flow.updated_at = datetime.now(timezone.utc)
@@ -310,7 +312,13 @@ def publish_flow(flow_id: int):
             "status": flow.status
         }), 400
     
-    # === Step 1: Validate flow JSON (v7.3 schema) ===
+    # === Step 1: Sanitize + validate flow JSON (v7.3 schema) ===
+    flow.flow_json, flow.entry_screen_id = sanitize_flow_json(
+        flow.flow_json,
+        flow.entry_screen_id,
+    )
+    db.session.commit()
+
     validation = validate_flow_json(flow.flow_json, flow.entry_screen_id)
     if not validation.valid:
         return jsonify({
@@ -318,7 +326,7 @@ def publish_flow(flow_id: int):
             "error": "validation_failed",
             "message": "Flow validation failed",
             "validation": validation.to_dict(),
-            "errors": [{"message": e.get("message", str(e))} for e in validation.errors] if hasattr(validation, 'errors') else []
+            "errors": validation.to_dict().get("errors", [])
         }), 400
     
     # === Step 2: Get access token (already validated by helper) ===

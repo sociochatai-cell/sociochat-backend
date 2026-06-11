@@ -17,6 +17,7 @@ Usage:
 """
 
 import logging
+import os
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List, Tuple
@@ -578,15 +579,21 @@ def send_automation_response(
         
         elif response_type == "ai":
             # AI-powered response using Gemini with RAG integration
-            from .ai_chatbot import create_ai_chatbot, AIConfig
+            from .ai_chatbot import create_ai_chatbot, DEFAULT_HANDOFF_MESSAGE
+            
+            business_name = account.custom_name or account.verified_name or "our business"
             
             # Get AI configuration from response_config, including workspace_id for RAG
             ai_config_dict = {
                 "enabled": True,
+                "business_name": business_name,
                 "system_prompt": response_config.get("system_prompt", ""),
-                "fallback_message": response_config.get("fallback_message", "I'm sorry, I couldn't process your request. A team member will assist you soon."),
-                "max_tokens": response_config.get("max_tokens", 256),
-                "temperature": response_config.get("temperature", 0.7),
+                "fallback_message": response_config.get(
+                    "fallback_message", DEFAULT_HANDOFF_MESSAGE
+                ),
+                "model": response_config.get("model") or os.getenv("TEXT_MODEL", "gemini-2.0-flash"),
+                "max_tokens": response_config.get("max_tokens", 1024),
+                "temperature": response_config.get("temperature", 0.3),
                 "context_messages": response_config.get("context_messages", 5),
                 # RAG configuration - enable knowledge base retrieval
                 "use_rag": response_config.get("use_rag", True),

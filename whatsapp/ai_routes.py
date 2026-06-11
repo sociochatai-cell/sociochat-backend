@@ -20,7 +20,13 @@ from rate_limit.decorator import rate_limit
 from models import db
 from .automation_models import WhatsAppAutomationRule
 from .models import WhatsAppAccount
-from .ai_chatbot import generate_ai_response, DEFAULT_SYSTEM_PROMPT
+from .ai_chatbot import (
+    generate_ai_response,
+    DEFAULT_SYSTEM_PROMPT,
+    DEFAULT_HANDOFF_MESSAGE,
+    build_business_system_prompt,
+    normalize_fallback_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +96,7 @@ def get_ai_config(account_id: int, account: WhatsAppAccount, workspace_id: str):
                 "enabled": False,
                 "system_prompt": DEFAULT_SYSTEM_PROMPT,
                 "fallback_message": "I'm sorry, I couldn't process your request. A team member will assist you soon.",
-                "max_tokens": 256,
+                "max_tokens": 1024,
                 "temperature": 0.7,
                 "context_messages": 5,
                 "priority": 999,  # Low priority (AI is usually fallback)
@@ -104,7 +110,7 @@ def get_ai_config(account_id: int, account: WhatsAppAccount, workspace_id: str):
             "rule_id": ai_rule.id,
             "system_prompt": response_config.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
             "fallback_message": response_config.get("fallback_message", "I'm sorry, I couldn't process your request."),
-            "max_tokens": response_config.get("max_tokens", 256),
+            "max_tokens": response_config.get("max_tokens", 1024),
             "temperature": response_config.get("temperature", 0.7),
             "context_messages": response_config.get("context_messages", 5),
             "priority": ai_rule.priority,
@@ -128,7 +134,7 @@ def update_ai_config(account_id: int, account: WhatsAppAccount, workspace_id: st
             "enabled": true,
             "system_prompt": "...",
             "fallback_message": "...",
-            "max_tokens": 256,
+            "max_tokens": 1024,
             "temperature": 0.7,
             "context_messages": 5
         }
@@ -158,7 +164,7 @@ def update_ai_config(account_id: int, account: WhatsAppAccount, workspace_id: st
                 response_config={
                     "system_prompt": data.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
                     "fallback_message": data.get("fallback_message", "I'm sorry, I couldn't process your request."),
-                    "max_tokens": data.get("max_tokens", 256),
+                    "max_tokens": data.get("max_tokens", 1024),
                     "temperature": data.get("temperature", 0.7),
                     "context_messages": data.get("context_messages", 5),
                 },
@@ -239,12 +245,16 @@ def test_ai_response(account_id: int, account: WhatsAppAccount, workspace_id: st
             rule_type="ai_chat"
         ).first()
         
-        system_prompt = DEFAULT_SYSTEM_PROMPT
-        fallback_message = "I'm sorry, I couldn't process your request."
+        system_prompt = build_business_system_prompt(
+            account.custom_name or account.verified_name
+        )
+        fallback_message = DEFAULT_HANDOFF_MESSAGE
         
         if ai_rule and ai_rule.response_config:
             system_prompt = ai_rule.response_config.get("system_prompt", system_prompt)
-            fallback_message = ai_rule.response_config.get("fallback_message", fallback_message)
+            fallback_message = normalize_fallback_message(
+                ai_rule.response_config.get("fallback_message", fallback_message)
+            )
         
         # Generate test response with RAG integration
         result = generate_ai_response(
@@ -252,8 +262,9 @@ def test_ai_response(account_id: int, account: WhatsAppAccount, workspace_id: st
             system_prompt=system_prompt,
             context=context,
             fallback_message=fallback_message,
-            workspace_id=workspace_id,  # Enable RAG retrieval
+            workspace_id=workspace_id,
             use_rag=use_rag,
+            business_name=account.custom_name or account.verified_name,
         )
         
         return jsonify({
@@ -297,7 +308,7 @@ def enable_ai(account_id: int, account: WhatsAppAccount, workspace_id: str):
                 response_config={
                     "system_prompt": DEFAULT_SYSTEM_PROMPT,
                     "fallback_message": "I'm sorry, I couldn't process your request. A team member will assist you soon.",
-                    "max_tokens": 256,
+                    "max_tokens": 1024,
                     "temperature": 0.7,
                     "context_messages": 5,
                 },

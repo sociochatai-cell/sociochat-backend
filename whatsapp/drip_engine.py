@@ -1,13 +1,104 @@
 import logging
 import json
 import re
+import os
+import uuid
 from datetime import datetime, timezone, timedelta
+from flask import current_app, has_app_context, has_request_context, request
+from sqlalchemy import text
 from models import db
+from shared_models import WhatsAppLinkTracking
 from .models import WhatsAppAccount
 from .drip_models import WhatsAppDripCampaign, WhatsAppDripStep, WhatsAppDripEnrollment
 from .services import WhatsAppService
 
 logger = logging.getLogger(__name__)
+
+
+def _is_url_like(value: str) -> bool:
+    candidate = str(value or "").strip().lower()
+    return candidate.startswith(("http://", "https://", "www."))
+
+
+def _normalized_url(value: str) -> str:
+    candidate = str(value or "").strip()
+    if candidate.lower().startswith("www."):
+        return f"https://{candidate}"
+    return candidate
+
+
+def _truthy(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text_value = str(value).strip().lower()
+    if text_value in {"1", "true", "yes", "on"}:
+        return True
+    if text_value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _is_media_variable_key(key: str) -> bool:
+    normalized = str(key or "").strip().lower()
+    return normalized in {"header_image_url", "header_video_url", "header_document_url"}
+
+
+def _tracking_base_url() -> str:
+    candidates = []
+    if has_request_context():
+        candidates.append((request.host_url or "").strip())
+    if has_app_context():
+        candidates.extend([
+            str(current_app.config.get("APP_BASE_URL") or "").strip(),
+            str(current_app.config.get("PUBLIC_APP_BASE_URL") or "").strip(),
+        ])
+    candidates.extend([
+        (os.getenv("APP_BASE_URL") or "").strip(),
+        (os.getenv("PUBLIC_APP_BASE_URL") or "").strip(),
+    ])
+    for candidate in candidates:
+        if candidate.lower().startswith(("http://", "https://")):
+            return candidate.rstrip("/")
+    return "http://localhost:5000"
+
+
+def _build_tracking_redirect_url(tracking_id: str) -> str:
+    return f"{_tracking_base_url()}/t/{tracking_id}"
+
+
+def _extract_target_url_from_variables(variables: dict, phone_number: str, fallback_message: str = "") -> str:
+    if not variables:
+        variables = {}
+    for key in ("target_url", "url", "link", "website", "website_url", "landing_url"):
+        value = variables.get(key)
+        if isinstance(value, str) and _is_url_like(value):
+            return _normalized_url(value)
+    for key, value in variables.items():
+        if _is_media_variable_key(key):
+            continue
+        if isinstance(value, str) and _is_url_like(value):
+            return _normalized_url(value)
+    wa_url = f"https://wa.me/{phone_number}"
+    if fallback_message:
+        from urllib.parse import quote
+        return f"{wa_url}?text={quote(fallback_message)}"
+    return wa_url
+
+
+def _inject_tracking_link_into_variables(variables: dict, short_link: str) -> dict:
+    updated = dict(variables or {})
+    updated["tracking_link"] = short_link
+    for key in ("link", "url", "target_url", "website", "website_url", "landing_url"):
+        if key in updated:
+            updated[key] = short_link
+    for key, value in list(updated.items()):
+        if _is_media_variable_key(key):
+            continue
+        if isinstance(value, str) and _is_url_like(value):
+            updated[key] = short_link
+    return updated
 
 
 def extract_step_params(variables: dict, step_order: int) -> list:
@@ -282,8 +373,34 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
         return
     
     # Extract template parameters from variables
-    variables = enrollment.variables or {}
-    logger.info(f"DRIP ENGINE - Enrollment {enrollment.id} Variables: {json.dumps(variables) if variables else 'None'}") # DEBUG LOG
+    variables = dict(enrollment.variables or {})
+    logger.info(f"DRIP ENGINE - Enrollment {enrollment.id} Variables: {json.dumps(variables) if variables else 'None'}")
+
+    enable_tracking_url = _truthy(variables.get("__enable_tracking_url"), default=True)
+    if enable_tracking_url:
+        tracking_id = f"clk_{uuid.uuid4().hex[:16]}"
+        redirect_link = _build_tracking_redirect_url(tracking_id)
+        target_url = _extract_target_url_from_variables(variables, enrollment.phone_number)
+        variables = _inject_tracking_link_into_variables(variables, redirect_link)
+        enrollment.tracking_id = tracking_id
+        db.session.add(WhatsAppLinkTracking(
+            workspace_id=str(campaign.workspace_id),
+            account_id=campaign.account_id,
+            source="bulk" if campaign.trigger_type == "manual" else "drip",
+            source_type="bulk_campaign" if campaign.trigger_type == "manual" else "drip_campaign",
+            tracking_id=tracking_id,
+            phone_number=enrollment.phone_number,
+            name=(variables.get("name") or variables.get("full_name") or variables.get("first_name")),
+            template_name=step.template_name,
+            campaign_name=campaign.name,
+            target_url=target_url,
+            utm_source=campaign.trigger_type or "drip",
+            utm_campaign=campaign.name,
+            click_count=0,
+        ))
+    else:
+        enrollment.tracking_id = None
+    enrollment.variables = variables
     
     # Check if template uses named parameters
     # We need to fetch the template to know its schema
@@ -474,6 +591,37 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
             # Other error - retry later
             enrollment.next_run_at = datetime.now(timezone.utc) + timedelta(hours=1)
             enrollment.status_reason = f"Send failed: {error_msg}"
+
+
+def check_scheduled_campaigns():
+    """
+    Finds campaigns that are 'scheduled' and due, marks them 'running',
+    and initiates their first step enrollments.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        sql = text("""
+            UPDATE whatsapp_drip_campaigns
+            SET status = 'running', trigger_value = NULL, updated_at = NOW()
+            WHERE id IN (
+                SELECT id FROM whatsapp_drip_campaigns
+                WHERE status = 'scheduled' AND trigger_type = 'manual' AND trigger_value <= :now
+                FOR UPDATE SKIP LOCKED
+                LIMIT 100
+            )
+            RETURNING id;
+        """)
+        result = db.session.execute(sql, {"now": now_iso}).fetchall()
+        db.session.commit()
+        campaign_ids = [row[0] for row in result]
+        for cid in campaign_ids:
+            logger.info("Scheduler: activated scheduled campaign %s", cid)
+            trigger_campaign_now(cid)
+        return campaign_ids
+    except Exception as e:
+        logger.exception("Error checking scheduled campaigns: %s", e)
+        db.session.rollback()
+        return []
 
 
 def process_due_drip_enrollments():

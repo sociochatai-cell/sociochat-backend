@@ -87,7 +87,7 @@ def verify_webhook_challenge(mode: str, token: str, challenge: str) -> Optional[
     Returns:
         Challenge string if valid, None otherwise
     """
-    verify_token = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
+    verify_token ="sociovia_whatsapp_verify_2024"
     
     if not verify_token:
         logger.error("WHATSAPP_VERIFY_TOKEN not configured!")

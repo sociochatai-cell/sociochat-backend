@@ -28,6 +28,7 @@ from models import db
 from .models import WhatsAppAccount, WhatsAppConversation, WhatsAppMessage
 from .encryption import encrypt_token
 from .connection_guard import check_phone_available
+from .connection_path import check_phone_number_status
 from .rate_limiter import WhatsAppRateLimiter
 from .utils import subscribe_waba_to_app
 
@@ -37,6 +38,153 @@ coexistence_bp = Blueprint("coexistence", __name__, url_prefix="/api/whatsapp/co
 
 META_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v22.0")
 META_GRAPH = f"https://graph.facebook.com/{META_API_VERSION}"
+
+
+def _load_coexistence_account(account_id, workspace_id=None):
+    """Load a coexistence account by id, optionally scoped to workspace."""
+    try:
+        account_id = int(account_id)
+    except (TypeError, ValueError):
+        return None
+    query = WhatsAppAccount.query.filter_by(id=account_id, is_active=True)
+    if workspace_id:
+        query = query.filter_by(workspace_id=str(workspace_id))
+    return query.first()
+
+
+def _device_activity_payload(account: WhatsAppAccount) -> dict:
+    now = datetime.now(timezone.utc)
+    last_echo = account.last_echo_at
+    if last_echo and last_echo.tzinfo is None:
+        last_echo = last_echo.replace(tzinfo=timezone.utc)
+    minutes_since = int((now - last_echo).total_seconds() // 60) if last_echo else None
+    days_since = (now - last_echo).days if last_echo else None
+
+    if days_since is None:
+        device_status = "unknown"
+        message = "No mobile activity recorded yet"
+    elif days_since <= 2:
+        device_status = "active"
+        message = "Mobile app is active"
+    elif days_since <= 7:
+        device_status = "warning"
+        message = "Mobile app has been idle for several days"
+    elif days_since <= 10:
+        device_status = "critical"
+        message = "Mobile app activity is at risk — open WhatsApp Business on your phone"
+    else:
+        device_status = "critical"
+        message = "Mobile app appears inactive — coexistence may stop working"
+
+    return {
+        "last_echo_at": last_echo.isoformat() if last_echo else None,
+        "device_status": device_status,
+        "minutes_since_last_echo": minutes_since,
+        "message": message,
+    }
+
+
+def _rate_limit_payload(account: WhatsAppAccount) -> dict:
+    mps = int(account.mps_limit or 5)
+    return {
+        "mps_limit": mps,
+        "tokens_available": float(mps),
+        "capacity": float(mps),
+        "usage_percent": 0.0,
+        "messages_sent_last_hour": 0,
+    }
+
+
+def _device_status_summary(account: WhatsAppAccount) -> dict:
+    now = datetime.now(timezone.utc)
+    last_activity = account.last_echo_at or account.coexistence_paired_at
+    if last_activity and last_activity.tzinfo is None:
+        last_activity = last_activity.replace(tzinfo=timezone.utc)
+    days_since = (now - last_activity).days if last_activity else None
+
+    if days_since is None:
+        status, health = "unknown", "warning"
+    elif days_since <= 2:
+        status, health = "active", "healthy"
+    elif days_since <= 7:
+        status, health = "idle", "warning"
+    elif days_since <= 10:
+        status, health = "at_risk", "critical"
+    else:
+        status, health = "inactive", "danger"
+
+    return {
+        "account_id": account.id,
+        "is_coexistence": bool(account.is_coexistence),
+        "status": status,
+        "health": health,
+        "last_mobile_activity": last_activity.isoformat() if last_activity else None,
+        "last_mobile_activity_at": last_activity.isoformat() if last_activity else None,
+        "days_since_activity": days_since,
+        "hours_since_activity": round(days_since * 24, 1) if days_since is not None else None,
+        "paired_at": account.coexistence_paired_at.isoformat() if account.coexistence_paired_at else None,
+    }
+
+
+def _history_sync_payload(account: WhatsAppAccount) -> dict:
+    conv_count = WhatsAppConversation.query.filter_by(account_id=account.id).count()
+    msg_count = WhatsAppMessage.query.join(WhatsAppConversation).filter(
+        WhatsAppConversation.account_id == account.id
+    ).count()
+    return {
+        "sync_status": account.sync_status or "idle",
+        "history_sync_completed": bool(account.history_sync_completed),
+        "conversations_synced": conv_count,
+        "messages_synced": msg_count,
+        "last_sync_at": account.last_synced_at.isoformat() if account.last_synced_at else None,
+        "history_sync_progress": getattr(account, "history_sync_progress", None) or (100 if account.history_sync_completed else 0),
+    }
+
+
+def _stats_7d(account_id: int) -> dict:
+    since = datetime.now(timezone.utc) - timedelta(days=7)
+    base = WhatsAppMessage.query.join(WhatsAppConversation).filter(
+        WhatsAppConversation.account_id == account_id,
+        WhatsAppMessage.created_at >= since,
+    )
+    incoming = base.filter(WhatsAppMessage.direction == "incoming").count()
+    outgoing = base.filter(WhatsAppMessage.direction == "outgoing").count()
+    echo = base.filter(WhatsAppMessage.direction == "echo").count()
+    failed = base.filter(WhatsAppMessage.status == "failed").count()
+    return {
+        "incoming": incoming,
+        "outgoing": outgoing,
+        "echo": echo,
+        "failed": failed,
+    }
+
+
+def _build_dashboard(account_id: int, workspace_id=None):
+    account = _load_coexistence_account(account_id, workspace_id)
+    if not account:
+        return None
+    device = _device_status_summary(account)
+    rate = _rate_limit_payload(account)
+    return {
+        "device_status": {
+            "status": device.get("status", "unknown"),
+            "health": device.get("health", "healthy"),
+            "last_mobile_activity_at": device.get("last_mobile_activity_at"),
+            "hours_since_activity": device.get("hours_since_activity"),
+            "is_coexistence": bool(account.is_coexistence),
+        },
+        "rate_limit": {
+            "tokens_available": rate["tokens_available"],
+            "max_tokens": rate["capacity"],
+            "messages_sent_today": 0,
+            "utilization_percent": rate["usage_percent"],
+            "is_coexistence": bool(account.is_coexistence),
+            "mps_limit": rate["mps_limit"],
+        },
+        "stats_7d": _stats_7d(account.id),
+        "total_contacts": WhatsAppConversation.query.filter_by(account_id=account.id).count(),
+        "history_sync": _history_sync_payload(account),
+    }
 
 
 # ============================================================
@@ -64,9 +212,11 @@ def connect_coexistence():
     """
     data = request.get_json(silent=True) or {}
     code = data.get("code")
-    workspace_id = data.get("workspace_id")
+    workspace_id = str(data.get("workspace_id") or "").strip()
     access_token_direct = data.get("access_token")  # For FB.login() flow
     user_id = data.get("user_id")
+    waba_id_hint = (data.get("waba_id") or "").strip() or None
+    phone_number_id_hint = (data.get("phone_number_id") or "").strip() or None
     
     if not workspace_id:
         return jsonify({"success": False, "error": "workspace_id is required"}), 400
@@ -76,6 +226,12 @@ def connect_coexistence():
     
     app_id = os.getenv("FB_APP_ID")
     app_secret = os.getenv("FB_APP_SECRET")
+
+    if not app_id or not app_secret:
+        return jsonify({
+            "success": False,
+            "error": "FB_APP_ID and FB_APP_SECRET must be set on the server",
+        }), 500
     
     try:
         access_token = access_token_direct
@@ -117,9 +273,21 @@ def connect_coexistence():
         except Exception as e:
             logger.warning(f"Failed to get long-lived token: {e}")
         
-        # Discover WABA and phone numbers
-        waba_id, phone_number_id, display_phone_number, verified_name, meta_business_id = \
-            _discover_waba(access_token, app_id, app_secret)
+        # Use Embedded Signup session hints when available, else discover via Graph API
+        waba_id = waba_id_hint
+        phone_number_id = phone_number_id_hint
+        display_phone_number = None
+        verified_name = None
+        meta_business_id = None
+
+        if waba_id and phone_number_id:
+            phone_status = check_phone_number_status(access_token, phone_number_id)
+            if phone_status.get("valid"):
+                display_phone_number = phone_status.get("display_phone_number")
+                verified_name = phone_status.get("verified_name")
+        else:
+            waba_id, phone_number_id, display_phone_number, verified_name, meta_business_id = \
+                _discover_waba(access_token, app_id, app_secret)
         
         if not waba_id or not phone_number_id:
             raise ValueError(
@@ -175,8 +343,18 @@ def connect_coexistence():
         
         logger.info(f"WhatsApp coexistence account connected: {phone_number_id} for workspace {workspace_id}")
         
-        # Subscribe WABA to our app (important for webhooks in coexistence)
-        subscribe_waba_to_app(waba_id, access_token)
+        # Subscribe WABA to our app (important for webhooks in coexistence).
+        # Retry once on failure and report the outcome to the frontend.
+        webhook_subscribed = False
+        webhook_error = None
+        for attempt in (1, 2):
+            sub_result = subscribe_waba_to_app(waba_id, access_token)
+            if sub_result.get("success"):
+                webhook_subscribed = True
+                webhook_error = None
+                break
+            webhook_error = sub_result.get("error")
+            logger.warning(f"⚠️ Webhook subscribe failed for WABA {waba_id} (attempt {attempt}): {webhook_error}")
         
         # For coexistence, skip phone registration — the number is already
         # registered on the WhatsApp Business app. Re-registering would
@@ -190,6 +368,8 @@ def connect_coexistence():
         return jsonify({
             "success": True,
             "message": "WhatsApp account connected in coexistence mode! Chat history sync has been initiated.",
+            "webhook_subscribed": webhook_subscribed,
+            "webhook_error": webhook_error,
             "account": account.to_dict(),
         })
         
@@ -370,8 +550,19 @@ def device_activity():
     Checks last_echo_at timestamps to detect inactive devices.
     
     GET /api/whatsapp/coexistence/device-activity?workspace_id=123
+    GET /api/whatsapp/coexistence/device-activity?account_id=1&workspace_id=123
     """
+    account_id = request.args.get("account_id")
     workspace_id = request.args.get("workspace_id")
+    if account_id:
+        account = _load_coexistence_account(account_id, workspace_id)
+        if not account:
+            return jsonify({"success": False, "error": "Account not found"}), 404
+        return jsonify({
+            "success": True,
+            "device_activity": _device_activity_payload(account),
+        })
+
     if not workspace_id:
         return jsonify({"success": False, "error": "workspace_id required"}), 400
     
@@ -475,8 +666,20 @@ def history_sync_status():
     After QR handshake, Meta sends up to 180 days of chat history.
     
     GET /api/whatsapp/coexistence/history-sync?workspace_id=123
+    GET /api/whatsapp/coexistence/history-sync?account_id=1&workspace_id=123
     """
+    account_id = request.args.get("account_id")
     workspace_id = request.args.get("workspace_id")
+    if account_id:
+        account = _load_coexistence_account(account_id, workspace_id)
+        if not account:
+            return jsonify({"success": False, "error": "Account not found"}), 404
+        return jsonify({
+            "success": True,
+            "history_sync": _history_sync_payload(account),
+            "logs": [],
+        })
+
     if not workspace_id:
         return jsonify({"success": False, "error": "workspace_id required"}), 400
     
@@ -559,10 +762,22 @@ def check_rate_limit():
     Check rate limit status for an account.
     
     GET /api/whatsapp/coexistence/rate-limit?phone_number_id=xxx
+    GET /api/whatsapp/coexistence/rate-limit?account_id=1&workspace_id=123
     """
+    account_id = request.args.get("account_id")
+    workspace_id = request.args.get("workspace_id")
+    if account_id:
+        account = _load_coexistence_account(account_id, workspace_id)
+        if not account:
+            return jsonify({"success": False, "error": "Account not found"}), 404
+        return jsonify({
+            "success": True,
+            "rate_limit": _rate_limit_payload(account),
+        })
+
     phone_number_id = request.args.get("phone_number_id")
     if not phone_number_id:
-        return jsonify({"success": False, "error": "phone_number_id required"}), 400
+        return jsonify({"success": False, "error": "phone_number_id or account_id required"}), 400
     
     account = WhatsAppAccount.query.filter_by(
         phone_number_id=phone_number_id,
@@ -601,22 +816,27 @@ def get_meta_errors():
     - 131031: Business account locked
     
     GET /api/whatsapp/coexistence/errors?workspace_id=123&limit=50
+    GET /api/whatsapp/coexistence/errors?account_id=1&workspace_id=123&limit=50
     """
     from .models import WhatsAppWebhookLog
     
+    account_id = request.args.get("account_id")
     workspace_id = request.args.get("workspace_id")
     limit = int(request.args.get("limit", 50))
     
-    if not workspace_id:
-        return jsonify({"success": False, "error": "workspace_id required"}), 400
-    
-    # Get account phone_number_ids for this workspace
-    accounts = WhatsAppAccount.query.filter_by(
-        workspace_id=workspace_id,
-        is_active=True,
-    ).all()
-    
-    phone_ids = [a.phone_number_id for a in accounts]
+    if account_id:
+        account = _load_coexistence_account(account_id, workspace_id)
+        if not account:
+            return jsonify({"success": False, "error": "Account not found"}), 404
+        phone_ids = [account.phone_number_id]
+    else:
+        if not workspace_id:
+            return jsonify({"success": False, "error": "workspace_id required"}), 400
+        accounts = WhatsAppAccount.query.filter_by(
+            workspace_id=workspace_id,
+            is_active=True,
+        ).all()
+        phone_ids = [a.phone_number_id for a in accounts]
     
     if not phone_ids:
         return jsonify({"success": True, "errors": [], "total": 0})
@@ -675,6 +895,243 @@ def get_meta_errors():
         "errors": errors[:limit],
         "total": len(errors),
         "critical_count": sum(1 for e in errors if e.get("is_critical")),
+    })
+
+
+# ============================================================
+# Frontend dashboard API (path-based aliases)
+# ============================================================
+
+@coexistence_bp.route("/dashboard/<int:account_id>", methods=["GET"])
+def coexistence_dashboard(account_id: int):
+    workspace_id = request.args.get("workspace_id")
+    dashboard = _build_dashboard(account_id, workspace_id)
+    if not dashboard:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+    return jsonify({"success": True, "dashboard": dashboard})
+
+
+@coexistence_bp.route("/status/<int:account_id>", methods=["GET"])
+def coexistence_account_status(account_id: int):
+    account = _load_coexistence_account(account_id, request.args.get("workspace_id"))
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+    device = _device_status_summary(account)
+    counts = _stats_7d(account.id)
+    total = sum(counts.values())
+    return jsonify({
+        "success": True,
+        "account_id": account.id,
+        "is_coexistence": bool(account.is_coexistence),
+        "device": {
+            "status": device.get("status", "unknown"),
+            "health": device.get("health", "healthy"),
+            "last_mobile_activity_at": device.get("last_mobile_activity"),
+            "hours_since_activity": (
+                round((device.get("days_since_activity") or 0) * 24, 1)
+                if device.get("days_since_activity") is not None
+                else None
+            ),
+            "is_coexistence": bool(account.is_coexistence),
+        },
+        "rate_limit": _rate_limit_payload(account),
+        "history_sync": _history_sync_payload(account),
+        "message_counts": {
+            "total": total,
+            "incoming": counts["incoming"],
+            "outgoing": counts["outgoing"],
+            "echo": counts["echo"],
+        },
+    })
+
+
+@coexistence_bp.route("/device/<int:account_id>", methods=["GET"])
+def coexistence_device_status(account_id: int):
+    account = _load_coexistence_account(account_id, request.args.get("workspace_id"))
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+    return jsonify({
+        "success": True,
+        "device_status": _device_status_summary(account),
+    })
+
+
+@coexistence_bp.route("/device/check-all", methods=["GET"])
+def coexistence_device_check_all():
+    accounts = WhatsAppAccount.query.filter_by(is_coexistence=True, is_active=True).all()
+    alerts = []
+    for account in accounts:
+        summary = _device_status_summary(account)
+        if summary.get("status") in ("at_risk", "inactive"):
+            alerts.append(summary)
+    return jsonify({
+        "success": True,
+        "checked": len(accounts),
+        "inactive_alerts": len(alerts),
+        "alerts": alerts,
+    })
+
+
+@coexistence_bp.route("/rate-limit/<int:account_id>", methods=["GET"])
+def coexistence_rate_limit_by_account(account_id: int):
+    account = _load_coexistence_account(account_id, request.args.get("workspace_id"))
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+    return jsonify({"success": True, "rate_limit": _rate_limit_payload(account)})
+
+
+@coexistence_bp.route("/history/<int:account_id>", methods=["GET"])
+def coexistence_history_by_account(account_id: int):
+    account = _load_coexistence_account(account_id, request.args.get("workspace_id"))
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+    return jsonify({
+        "success": True,
+        "history_sync": _history_sync_payload(account),
+        "logs": [],
+    })
+
+
+@coexistence_bp.route("/history/<int:account_id>/complete", methods=["POST"])
+def coexistence_history_complete(account_id: int):
+    account = _load_coexistence_account(account_id)
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+    account.history_sync_completed = True
+    if hasattr(account, "history_sync_progress"):
+        account.history_sync_progress = 100
+    account.sync_status = "synced"
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@coexistence_bp.route("/echo-messages/<int:account_id>", methods=["GET"])
+def coexistence_echo_messages(account_id: int):
+    account = _load_coexistence_account(account_id, request.args.get("workspace_id"))
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+    page = max(int(request.args.get("page", 1)), 1)
+    per_page = min(max(int(request.args.get("per_page", 20)), 1), 100)
+    query = WhatsAppMessage.query.join(WhatsAppConversation).filter(
+        WhatsAppConversation.account_id == account.id,
+        WhatsAppMessage.direction == "echo",
+    ).order_by(WhatsAppMessage.created_at.desc())
+    total = query.count()
+    rows = query.offset((page - 1) * per_page).limit(per_page).all()
+    return jsonify({
+        "success": True,
+        "total": total,
+        "echo_messages": [
+            {
+                "id": m.id,
+                "wamid": m.wamid,
+                "direction": "echo",
+                "type": m.type,
+                "content": m.content if isinstance(m.content, dict) else {"text": m.content},
+                "status": m.status,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m in rows
+        ],
+    })
+
+
+@coexistence_bp.route("/contacts", methods=["GET"])
+def coexistence_contacts():
+    account_id = request.args.get("account_id")
+    if not account_id:
+        return jsonify({"success": False, "error": "account_id required"}), 400
+    account = _load_coexistence_account(account_id)
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+    page = max(int(request.args.get("page", 1)), 1)
+    per_page = min(max(int(request.args.get("per_page", 20)), 1), 100)
+    search = (request.args.get("search") or "").strip().lower()
+    query = WhatsAppConversation.query.filter_by(account_id=account.id)
+    if search:
+        query = query.filter(
+            db.or_(
+                WhatsAppConversation.user_phone.ilike(f"%{search}%"),
+                WhatsAppConversation.user_name.ilike(f"%{search}%"),
+            )
+        )
+    total = query.count()
+    rows = query.order_by(WhatsAppConversation.last_message_at.desc()).offset((page - 1) * per_page).limit(per_page).all()
+    return jsonify({
+        "success": True,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "contacts": [
+            {
+                "id": c.id,
+                "phone": c.user_phone,
+                "name": c.user_name,
+                "wa_id": c.user_phone,
+                "labels": [],
+                "notes": None,
+                "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None,
+                "total_messages": WhatsAppMessage.query.filter_by(conversation_id=c.id).count(),
+            }
+            for c in rows
+        ],
+    })
+
+
+@coexistence_bp.route("/contacts/<int:contact_id>/label", methods=["POST"])
+def coexistence_contact_label(contact_id: int):
+    data = request.get_json(silent=True) or {}
+    label = (data.get("label") or "").strip()
+    if not label:
+        return jsonify({"success": False, "error": "label required"}), 400
+    conv = WhatsAppConversation.query.get(contact_id)
+    if not conv:
+        return jsonify({"success": False, "error": "Contact not found"}), 404
+    return jsonify({"success": True, "message": "Label storage not configured; contact verified"})
+
+
+@coexistence_bp.route("/upgrade/<int:account_id>", methods=["POST"])
+def upgrade_to_standard_by_id(account_id: int):
+    data = request.get_json(silent=True) or {}
+    workspace_id = data.get("workspace_id") or request.args.get("workspace_id")
+    if not workspace_id:
+        return jsonify({"success": False, "error": "workspace_id required"}), 400
+
+    account = WhatsAppAccount.query.filter_by(
+        id=account_id,
+        workspace_id=str(workspace_id),
+        is_coexistence=True,
+        is_active=True,
+    ).first()
+    if not account:
+        return jsonify({"success": False, "error": "Coexistence account not found"}), 404
+
+    access_token = account.get_access_token()
+    if access_token:
+        try:
+            register_resp = http_requests.post(
+                f"{META_GRAPH}/{account.phone_number_id}/register",
+                json={"messaging_product": "whatsapp", "pin": "123456"},
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15,
+            )
+            logger.info(f"Phone registration for upgrade: {register_resp.json()}")
+        except Exception as e:
+            logger.warning(f"Phone registration for upgrade failed: {e}")
+
+    account.is_coexistence = False
+    account.mps_limit = 80
+    account.sync_status = "synced"
+    db.session.commit()
+
+    return jsonify({
+        "success": True,
+        "message": "Account upgraded to standard Cloud API. Mobile app has been disconnected.",
+        "new_mps_limit": account.mps_limit,
+        "account": account.to_dict(),
     })
 
 
