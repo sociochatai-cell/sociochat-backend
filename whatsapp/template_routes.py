@@ -523,6 +523,103 @@ def upload_template_media():
         return jsonify({"error": str(e)}), 500
 
 
+@template_bp.route("/upload_media_url", methods=["POST"])
+def upload_template_media_url():
+    """Download media from a URL, upload to Meta, and return a template media handle."""
+    try:
+        import mimetypes
+        import tempfile
+        from urllib.parse import urlparse
+        import requests as http_requests
+
+        data = request.get_json() or {}
+        media_url = (data.get("url") or "").strip()
+        account_id = data.get("account_id")
+        media_type = str(data.get("media_type") or "image").lower()
+
+        if not media_url:
+            return jsonify({"success": False, "error": "url is required"}), 400
+        if not (media_url.startswith("https://") or media_url.startswith("http://")):
+            return jsonify({"success": False, "error": "URL must start with http:// or https://"}), 400
+
+        access_token = None
+        if account_id:
+            try:
+                account = WhatsAppAccount.query.get(int(account_id))
+                if account:
+                    access_token = account.get_access_token()
+            except Exception:
+                logger.warning("Could not load account %s for URL media upload", account_id)
+
+        if not access_token:
+            access_token = os.getenv("WHATSAPP_ACCESS_TOKEN")
+
+        if not access_token:
+            return jsonify({"success": False, "error": "No access token available. Please reconnect your WhatsApp account."}), 400
+
+        resp = http_requests.get(media_url, timeout=30, stream=True, allow_redirects=True)
+        if not resp.ok:
+            return jsonify({"success": False, "error": f"Failed to download media (HTTP {resp.status_code})"}), 400
+
+        content_type = (resp.headers.get("Content-Type") or "application/octet-stream").split(";")[0].strip().lower()
+
+        expected_by_type = {
+            "image": {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"},
+            "video": {"video/mp4", "video/quicktime", "video/3gpp", "video/avi", "video/mpeg"},
+            "document": {
+                "application/pdf",
+                "text/plain",
+                "application/msword",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            },
+        }
+
+        if media_type in expected_by_type and content_type not in expected_by_type[media_type]:
+            logger.warning("URL media type mismatch: requested=%s, content_type=%s, url=%s", media_type, content_type, media_url)
+
+        parsed = urlparse(media_url)
+        ext_from_url = os.path.splitext(parsed.path)[1]
+        ext_from_mime = mimetypes.guess_extension(content_type or "") or ""
+        suffix = ext_from_url or ext_from_mime or ".bin"
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_path = temp_file.name
+            total_written = 0
+            max_bytes = 100 * 1024 * 1024
+
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                total_written += len(chunk)
+                if total_written > max_bytes:
+                    return jsonify({"success": False, "error": "Downloaded file exceeds 100MB limit"}), 400
+                temp_file.write(chunk)
+
+        try:
+            if content_type in {"", "application/octet-stream"}:
+                guessed, _ = mimetypes.guess_type(temp_path)
+                if guessed:
+                    content_type = guessed
+
+            service = WhatsAppService()
+            handle = service.resumable_media_upload(temp_path, content_type or "application/octet-stream", access_token=access_token)
+
+            if not handle:
+                return jsonify({"success": False, "error": "Upload failed. Meta did not return a media handle."}), 500
+
+            return jsonify({"success": True, "handle": handle, "content_type": content_type}), 200
+        finally:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.exception("URL media upload error")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 # ==============================================================
 # GET /templates - List templates with sorting
 # ==============================================================

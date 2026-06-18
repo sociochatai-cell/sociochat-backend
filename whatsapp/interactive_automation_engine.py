@@ -20,6 +20,9 @@ from .visual_automation_models import WhatsAppVisualAutomation, WhatsAppConversa
 from .models import WhatsAppAccount, WhatsAppConversation, WhatsAppMessage
 from .services import WhatsAppService
 from .template_node_executor import TemplateNodeExecutor
+from . import input_node_handler
+from . import flow_variables
+from . import api_node_executor
 from notifications import notification_manager
 
 logger = logging.getLogger(__name__)
@@ -71,6 +74,17 @@ class InteractiveAutomationEngine:
             
             if active_state:
                 print(f"   ✓ Found active state: {active_state.id}, continuing flow")
+
+                # If the flow is paused on an input node waiting for a text reply,
+                # process the input first (additive - does not affect button/message flows).
+                if active_state.is_waiting_for_input and not is_button_reply:
+                    current_node = self._get_node_by_id(active_state, active_state.current_node_id)
+                    if current_node and current_node.get("type") == "input":
+                        print(f"   ✏️ Active input node, processing user reply")
+                        return self._handle_input_node_response(
+                            active_state, message_text, from_phone, current_node
+                        )
+
                 # User is already in a flow - handle button click or text input
                 return self._handle_flow_continuation(
                     active_state, message_text, from_phone, is_button_reply, button_payload
@@ -192,13 +206,13 @@ class InteractiveAutomationEngine:
             if edge.get("source") == trigger_id:
                 target_id = edge.get("target")
                 for node in nodes:
-                    if node.get("id") == target_id and node.get("type") in ("message", "template"):
+                    if node.get("id") == target_id and node.get("type") in ("message", "template", "input", "api", "end"):
                         first_node = node
                         break
                 break
-        
+
         if not first_node:
-            logger.warning(f"Automation {automation.id} has no message/template node connected to trigger")
+            logger.warning(f"Automation {automation.id} has no message/template/input/api node connected to trigger")
             return None
         
         # Create conversation state
@@ -217,11 +231,18 @@ class InteractiveAutomationEngine:
         automation.increment_trigger_count()
         db.session.commit()
         
-        # Send the first node (message or template)
-        if first_node.get("type") == "template":
+        # Send the first node (message, template, input, api, or end)
+        first_type = first_node.get("type")
+        if first_type == "template":
             return self._send_template_node(
                 automation, first_node, from_phone, state
             )
+        elif first_type == "input":
+            return self._send_input_question(automation, first_node, from_phone, state)
+        elif first_type == "api":
+            return self._execute_api_node(automation, first_node, from_phone, state)
+        elif first_type == "end":
+            return self._handle_end_node(automation, first_node, from_phone, state)
         else:
             return self._send_node_message(
                 automation, first_node, from_phone, state
@@ -265,10 +286,21 @@ class InteractiveAutomationEngine:
             return None
         
         print(f"      Automation: '{automation.name}' (active={automation.is_active})")
-        
+
+        # Additive: handle a button tap on dynamic buttons produced by an API node.
+        # These ids are not known at design time, so there is usually no static edge
+        # for them - we apply buttonCapture rules and route via the API node's
+        # 'output'/branch edge instead.
+        if is_button_reply and button_payload:
+            pending_result = self._handle_pending_api_button(
+                state, automation, button_payload, from_phone
+            )
+            if pending_result is not None:
+                return pending_result
+
         nodes = automation.nodes or []
         edges = automation.edges or []
-        
+
         current_node_id = state.current_node_id
         
         # Find the edge for this button click
@@ -430,9 +462,19 @@ class InteractiveAutomationEngine:
         if next_node.get("type") == "template":
             db.session.commit()
             return self._send_template_node(automation, next_node, from_phone, state)
-        
+
+        # Check if this is an input node - ask the question and wait for reply
+        if next_node.get("type") == "input":
+            db.session.commit()
+            return self._send_input_question(automation, next_node, from_phone, state)
+
+        # Check if this is an API node - perform the HTTP request
+        if next_node.get("type") == "api":
+            db.session.commit()
+            return self._execute_api_node(automation, next_node, from_phone, state)
+
         db.session.commit()
-        
+
         # Send the next message node
         return self._send_node_message(automation, next_node, from_phone, state)
     
@@ -543,7 +585,20 @@ class InteractiveAutomationEngine:
         header = node_data.get("header")
         footer = node_data.get("footer")
         buttons = node_data.get("buttons", [])
-        
+
+        # Additive: substitute {{variables}} (flow variables + collected input fields)
+        # in the message body/header/footer. No-op when there are no placeholders.
+        try:
+            _vars = self._resolve_flow_variables(automation, to_phone, state)
+            if body:
+                body = input_node_handler.substitute_variables(body, _vars)
+            if header:
+                header = input_node_handler.substitute_variables(header, _vars)
+            if footer:
+                footer = input_node_handler.substitute_variables(footer, _vars)
+        except Exception as e:
+            logger.debug(f"[interactive_engine] variable substitution skipped: {e}")
+
         # Header media support - try both camelCase and snake_case keys
         header_image_url = node_data.get("headerImageUrl") or node_data.get("header_image_url")
         header_video_url = node_data.get("headerVideoUrl") or node_data.get("header_video_url")
@@ -923,7 +978,7 @@ class InteractiveAutomationEngine:
         variables = {
             "phone": to_phone,
         }
-        
+
         # Try to get contact/conversation info
         try:
             conversation = WhatsAppConversation.query.get(state.conversation_id)
@@ -932,8 +987,456 @@ class InteractiveAutomationEngine:
                 variables["customer_name"] = conversation.contact_name or ""
         except Exception as e:
             logger.debug(f"Could not get conversation info: {e}")
-        
+
         return variables
+
+    # ============================================================
+    # Input / API node support (additive)
+    # ============================================================
+
+    def _get_node_by_id(
+        self,
+        state: WhatsAppConversationState,
+        node_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Find a node in the active automation by id."""
+        if not node_id or not state.automation_id:
+            return None
+        automation = WhatsAppVisualAutomation.query.get(state.automation_id)
+        if not automation:
+            return None
+        for node in (automation.nodes or []):
+            if node.get("id") == node_id:
+                return node
+        return None
+
+    def _get_default_next_node_id(
+        self,
+        automation: WhatsAppVisualAutomation,
+        node_id: str,
+        source_handle: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Follow edges out of a node. If source_handle is given, prefer the edge
+        with that sourceHandle, then fall back to the 'output' handle, then any
+        edge from the node.
+        """
+        edges = automation.edges or []
+        # Exact handle match
+        if source_handle:
+            for edge in edges:
+                if edge.get("source") == node_id and edge.get("sourceHandle") == source_handle:
+                    return edge.get("target")
+        # 'output' handle
+        for edge in edges:
+            if edge.get("source") == node_id and edge.get("sourceHandle") in ("output", None, ""):
+                return edge.get("target")
+        # Any edge from this node
+        for edge in edges:
+            if edge.get("source") == node_id:
+                return edge.get("target")
+        return None
+
+    def _resolve_flow_variables(
+        self,
+        automation: WhatsAppVisualAutomation,
+        to_phone: str,
+        state: WhatsAppConversationState,
+    ) -> Dict[str, Any]:
+        """
+        Build the variable map for {{var}} substitution and API requests.
+
+        Precedence (lowest -> highest):
+          flow variable defaults -> flow variables -> runtime (phone/contact)
+          -> collected input fields -> last_button_clicked
+        """
+        flow_config = automation.flow_config if isinstance(automation.flow_config, dict) else {}
+        defaults = flow_config.get("variableDefaults") if isinstance(flow_config, dict) else {}
+
+        variables: Dict[str, Any] = {}
+        if isinstance(defaults, dict):
+            variables.update(defaults)
+        flow_vars = automation.variables if isinstance(automation.variables, dict) else {}
+        variables.update(flow_vars)
+
+        # Runtime (phone, contact_name, customer_name)
+        variables.update(self._get_runtime_variables(to_phone, state))
+
+        # Collected input fields override everything else
+        try:
+            collected = state.get_collected_fields() or {}
+            variables.update(collected)
+        except Exception:
+            pass
+
+        if state.last_button_clicked:
+            variables["last_button_clicked"] = state.last_button_clicked
+
+        return variables
+
+    def _dispatch_node(
+        self,
+        automation: WhatsAppVisualAutomation,
+        node: Dict[str, Any],
+        to_phone: str,
+        state: WhatsAppConversationState,
+    ) -> Dict[str, Any]:
+        """Send/execute a node based on its type. Used after advancing the flow."""
+        node_type = node.get("type")
+        if node_type == "end":
+            return self._handle_end_node(automation, node, to_phone, state)
+        if node_type == "template":
+            return self._send_template_node(automation, node, to_phone, state)
+        if node_type == "input":
+            return self._send_input_question(automation, node, to_phone, state)
+        if node_type == "api":
+            return self._execute_api_node(automation, node, to_phone, state)
+        return self._send_node_message(automation, node, to_phone, state)
+
+    def _handle_end_node(
+        self,
+        automation: WhatsAppVisualAutomation,
+        node: Dict[str, Any],
+        to_phone: str,
+        state: WhatsAppConversationState,
+    ) -> Dict[str, Any]:
+        """Complete the flow and send the (optionally templated) end message."""
+        state.advance_to_node(node.get("id"))
+        state.complete()
+        db.session.commit()
+        end_message = node.get("data", {}).get("message")
+        if end_message:
+            variables = self._resolve_flow_variables(automation, to_phone, state)
+            end_message = input_node_handler.substitute_variables(end_message, variables)
+            return self._send_text_message(to_phone, end_message, state.conversation_id)
+        return {"completed": True, "message": "Flow completed"}
+
+    def _send_input_question(
+        self,
+        automation: WhatsAppVisualAutomation,
+        input_node: Dict[str, Any],
+        to_phone: str,
+        state: WhatsAppConversationState,
+    ) -> Dict[str, Any]:
+        """Send an input node's question and lock the state to wait for a reply."""
+        node_data = input_node.get("data", {})
+        field = node_data.get("field", "input")
+
+        # Advance to the input node and mark waiting for input
+        state.advance_to_node(input_node.get("id"))
+        state.set_waiting_for_input(field)
+        state.last_user_message_at = datetime.now(timezone.utc)
+
+        variables = self._resolve_flow_variables(automation, to_phone, state)
+        question_text = input_node_handler.build_question_message(node_data, variables)
+
+        result = self._send_text_message(to_phone, question_text, state.conversation_id)
+        try:
+            db.session.commit()
+        except Exception as e:
+            logger.warning(f"[interactive_engine] commit failed at input question send: {e}")
+            db.session.rollback()
+
+        if result.get("success"):
+            logger.info(
+                f"[interactive_engine] Sent input question for field '{field}' to {to_phone}, "
+                f"node={input_node.get('id')}"
+            )
+            return {
+                "success": True,
+                "automation_id": automation.id,
+                "node_id": input_node.get("id"),
+                "input_node": True,
+                "waiting_for_input": True,
+            }
+        logger.error(f"[interactive_engine] Failed to send input question: {result}")
+        return {"success": False, "error": result.get("error")}
+
+    def _handle_input_node_response(
+        self,
+        state: WhatsAppConversationState,
+        message_text: str,
+        from_phone: str,
+        current_node: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Process a user's text reply to an input node, then advance the flow."""
+        automation = WhatsAppVisualAutomation.query.get(state.automation_id)
+        if not automation:
+            state.complete()
+            db.session.commit()
+            return None
+
+        node_data = current_node.get("data", {})
+
+        # Validate / extract / store the input
+        result = input_node_handler.process_input_response(message_text, node_data, state)
+
+        # Correction: re-confirm with the same question (value already overwritten)
+        if result.get("is_correction") and result.get("valid"):
+            db.session.commit()
+            variables = self._resolve_flow_variables(automation, from_phone, state)
+            question_text = input_node_handler.build_question_message(node_data, variables)
+            self._send_text_message(from_phone, question_text, state.conversation_id)
+            return {"success": True, "input_correction": True, "node_id": current_node.get("id")}
+
+        # Invalid: re-ask with the custom error + same prompt in one bubble
+        if not result.get("valid"):
+            db.session.commit()
+            variables = self._resolve_flow_variables(automation, from_phone, state)
+            combined = input_node_handler.build_question_message(
+                node_data, variables, error_message=result.get("error_message")
+            )
+            self._send_text_message(from_phone, combined, state.conversation_id)
+            return {
+                "success": True,
+                "input_validation_failed": True,
+                "node_id": current_node.get("id"),
+            }
+
+        # Valid input - clear wait flag (already cleared in handler) and advance
+        state.last_user_message_at = datetime.now(timezone.utc)
+
+        next_node_id = self._get_default_next_node_id(
+            automation, current_node.get("id"), source_handle="output"
+        ) or node_data.get("targetNodeId")
+
+        if not next_node_id:
+            # No next node configured - flow ends after collecting input
+            state.complete()
+            db.session.commit()
+            logger.info(f"[interactive_engine] Input collected, no next node, completing flow")
+            return {"success": True, "completed": True, "input_collected": True}
+
+        next_node = self._get_node_by_id(state, next_node_id)
+        if not next_node:
+            state.complete()
+            db.session.commit()
+            logger.warning(f"[interactive_engine] Input next node {next_node_id} not found")
+            return {"success": True, "completed": True, "input_collected": True}
+
+        state.advance_to_node(next_node_id)
+        db.session.commit()
+
+        return self._dispatch_node(automation, next_node, from_phone, state)
+
+    def _execute_api_node(
+        self,
+        automation: WhatsAppVisualAutomation,
+        api_node: Dict[str, Any],
+        to_phone: str,
+        state: WhatsAppConversationState,
+    ) -> Dict[str, Any]:
+        """
+        Execute an API node: perform the HTTP request with variable substitution,
+        store the response (storeAs), render outbound messages, optionally capture
+        button fields, then branch to the next node.
+        """
+        node_data = api_node.get("data", {})
+        node_id = api_node.get("id")
+        state.advance_to_node(node_id)
+        state.last_user_message_at = datetime.now(timezone.utc)
+        db.session.commit()
+
+        variables = self._resolve_flow_variables(automation, to_phone, state)
+
+        logger.info(f"[interactive_engine] Executing API node {node_id} -> {node_data.get('url')}")
+        api_result = api_node_executor.execute_api_node(node_data, variables)
+
+        # Persist the response under storeAs (collected field) so later nodes can use it
+        store_as = node_data.get("storeAs")
+        if store_as and api_result.stored_value is not None:
+            try:
+                state.set_collected_field(str(store_as), api_result.stored_value)
+                db.session.commit()
+            except Exception as e:
+                logger.warning(f"[interactive_engine] Failed to store API result: {e}")
+                db.session.rollback()
+
+        # Send the rendered outbound messages (text / buttons / list / media)
+        sent_any = False
+        for outbound in api_result.outbound_messages or []:
+            try:
+                self._send_api_outbound_message(outbound, to_phone, state)
+                sent_any = True
+            except Exception as e:
+                logger.error(f"[interactive_engine] Failed to send API outbound: {e}")
+
+        # If the API output requires a user pick (buttons/list), wait for their tap.
+        # The next button click is matched by the normal edge/sourceHandle logic, and
+        # buttonCapture rules are applied at that point.
+        if api_node_executor.outbound_requires_user_pick(api_result.outbound_messages or []):
+            # Remember pending buttons + capture rules for button-reply handling
+            try:
+                pending = api_node_executor.extract_pending_api_buttons(api_result.outbound_messages or [])
+                sd = state.state_data if isinstance(state.state_data, dict) else {}
+                sd["_pending_api_buttons"] = pending
+                sd["_pending_api_node_id"] = node_id
+                state.state_data = sd
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(state, "state_data")
+                db.session.commit()
+            except Exception as e:
+                logger.warning(f"[interactive_engine] Failed to persist pending API buttons: {e}")
+                db.session.rollback()
+            return {
+                "success": True,
+                "automation_id": automation.id,
+                "node_id": node_id,
+                "api_node": True,
+                "waiting_for_input": True,
+            }
+
+        # Otherwise follow the API node's branch/success/error edge automatically
+        next_node_id = self._get_default_next_node_id(
+            automation, node_id, source_handle=api_result.handle
+        )
+
+        if not next_node_id:
+            state.complete()
+            db.session.commit()
+            return {
+                "success": api_result.success,
+                "automation_id": automation.id,
+                "node_id": node_id,
+                "api_node": True,
+                "completed": True,
+            }
+
+        next_node = self._get_node_by_id(state, next_node_id)
+        if not next_node:
+            state.complete()
+            db.session.commit()
+            return {"success": api_result.success, "completed": True, "api_node": True}
+
+        state.advance_to_node(next_node_id)
+        db.session.commit()
+        return self._dispatch_node(automation, next_node, to_phone, state)
+
+    def _handle_pending_api_button(
+        self,
+        state: WhatsAppConversationState,
+        automation: WhatsAppVisualAutomation,
+        button_payload: str,
+        from_phone: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        If the flow is waiting on dynamic buttons emitted by an API node, capture
+        the chosen value via buttonCapture rules and route through the API node's
+        edges. Returns None when there is no pending API selection (let the normal
+        button logic run).
+        """
+        sd = state.state_data if isinstance(state.state_data, dict) else {}
+        pending_node_id = sd.get("_pending_api_node_id")
+        if not pending_node_id:
+            return None
+
+        # Only intercept when there is no explicit static edge for this button.
+        for edge in (automation.edges or []):
+            if edge.get("sourceHandle") == button_payload and edge.get("source") == pending_node_id:
+                # A static edge exists - let the normal logic handle it (but still
+                # apply capture rules below first).
+                break
+
+        api_node = None
+        for node in (automation.nodes or []):
+            if node.get("id") == pending_node_id and node.get("type") == "api":
+                api_node = node
+                break
+        if not api_node:
+            return None
+
+        node_data = api_node.get("data", {})
+
+        # Apply buttonCapture rules so the chosen id is stored for later nodes
+        try:
+            rules = flow_variables.collect_button_capture_rules(node_data, automation.flow_config)
+            flow_variables.apply_button_capture_rules(
+                rules, button_payload, lambda f, v: state.set_collected_field(f, v)
+            )
+        except Exception as e:
+            logger.warning(f"[interactive_engine] buttonCapture failed: {e}")
+
+        # Clear pending markers
+        try:
+            sd.pop("_pending_api_buttons", None)
+            sd.pop("_pending_api_node_id", None)
+            state.state_data = sd
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(state, "state_data")
+        except Exception:
+            pass
+
+        state.record_button_click(button_payload)
+        state.last_user_message_at = datetime.now(timezone.utc)
+
+        # Route: prefer a static edge matching the button id, else the API 'output' edge
+        next_node_id = self._get_default_next_node_id(
+            automation, pending_node_id, source_handle=button_payload
+        )
+        if not next_node_id:
+            next_node_id = self._get_default_next_node_id(
+                automation, pending_node_id, source_handle="output"
+            )
+
+        if not next_node_id:
+            state.complete()
+            db.session.commit()
+            return {"success": True, "completed": True, "api_button": True}
+
+        next_node = self._get_node_by_id(state, next_node_id)
+        if not next_node:
+            state.complete()
+            db.session.commit()
+            return {"success": True, "completed": True, "api_button": True}
+
+        state.advance_to_node(next_node_id)
+        db.session.commit()
+        return self._dispatch_node(automation, next_node, from_phone, state)
+
+    def _send_api_outbound_message(
+        self,
+        outbound: Dict[str, Any],
+        to_phone: str,
+        state: WhatsAppConversationState,
+    ) -> Dict[str, Any]:
+        """Send a single rendered API outbound message via the WhatsApp service."""
+        account = WhatsAppAccount.query.get(self.account_id)
+        if not account:
+            return {"error": "Account not found"}
+        service = WhatsAppService(
+            phone_number_id=account.phone_number_id,
+            access_token=account.get_access_token(),
+        )
+
+        otype = (outbound.get("type") or "text").lower()
+        text = outbound.get("text") or outbound.get("caption") or ""
+
+        if otype == "buttons":
+            buttons = [
+                {"id": b.get("id"), "title": (b.get("title") or b.get("label") or "Option")[:20]}
+                for b in (outbound.get("buttons") or [])
+            ]
+            return service.send_interactive_buttons(
+                to=to_phone, body_text=text or "Choose an option:", buttons=buttons
+            )
+        if otype == "list":
+            return service.send_interactive_list(
+                to=to_phone,
+                body_text=text or "Choose an option:",
+                button_text=outbound.get("buttonText") or "View options",
+                sections=outbound.get("sections") or [],
+            )
+        if otype == "image" and outbound.get("url"):
+            return service.send_image(to=to_phone, image_url=outbound["url"], caption=outbound.get("caption"))
+        if otype == "document" and outbound.get("url"):
+            return service.send_document(
+                to=to_phone,
+                document_url=outbound["url"],
+                caption=outbound.get("caption"),
+                filename=outbound.get("filename") or "document.pdf",
+            )
+        # default: text
+        return self._send_text_message(to_phone, text, state.conversation_id)
 
 
 def process_interactive_automation(

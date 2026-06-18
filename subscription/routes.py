@@ -14,16 +14,22 @@ from datetime import date, timedelta
 
 import jwt
 from flask import Blueprint, current_app, has_request_context, jsonify, request, session
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from shared_models import db, User, Workspace, Admin
-from subscription.constants import VALID_PLANS, PLAN_FEATURES
+from subscription.constants import (
+    VALID_PLANS, PLAN_FEATURES, BILLING_SCOPE_GLOBAL, BILLING_SCOPE_PRIVATE,
+    PLAN_SCOPE_GLOBAL, PLAN_SCOPE_PRIVATE, PRIVATE_SLOT_GLOBAL_TIERS,
+)
 from subscription.models import SubscriptionUsage, AdSpendTracking, PlanChangeHistory
 from subscription.service import (
     get_user_plan,
     get_plan_limits,
     get_user_usage_stats,
     change_user_plan,
+    is_private_slot_user,
+    is_plan_assignable_to_user,
+    get_assignable_plan_slugs_for_user,
 )
 
 
@@ -160,27 +166,37 @@ def require_admin(f):
 @subscription_bp.route("/plans", methods=["GET"])
 def list_plans():
     """
-    GET /api/subscription/plans
-    
-    List all available plans with their features and limits.
-    No authentication required.
-    
-    Response:
-    {
-        "success": true,
-        "plans": {
-            "starter": { ... },
-            "growth": { ... },
-            "enterprise": { ... }
-        }
-    }
+    GET /api/subscription/plans — public plan catalog from DB.
     """
-    # Exclude beta from public list
-    plans = {k: v for k, v in PLAN_FEATURES.items() if k != "beta"}
-    return jsonify({
-        "success": True,
-        "plans": plans
-    })
+    from subscription.plan_models import SubscriptionPlan, PlanFeatureAccess, SubscriptionFeature
+
+    rows = SubscriptionPlan.query.filter(
+        SubscriptionPlan.is_public.is_(True),
+        SubscriptionPlan.is_active.is_(True),
+        or_(SubscriptionPlan.plan_scope == PLAN_SCOPE_GLOBAL, SubscriptionPlan.plan_scope.is_(None)),
+    ).order_by(
+        SubscriptionPlan.sort_order
+    ).all()
+
+    if not rows:
+        plans = {k: v for k, v in PLAN_FEATURES.items() if k != "beta"}
+        return jsonify({"success": True, "plans": plans})
+
+    plans = {}
+    for plan in rows:
+        matrix = {}
+        for acc in PlanFeatureAccess.query.filter_by(plan_id=plan.id).all():
+            feat = SubscriptionFeature.query.filter_by(key=acc.feature_key).first()
+            if feat and feat.feature_type == "limit":
+                matrix[acc.feature_key] = acc.limit_value
+            else:
+                matrix[acc.feature_key] = acc.enabled
+        plans[plan.slug] = {
+            **plan.to_dict(),
+            **matrix,
+        }
+
+    return jsonify({"success": True, "plans": plans})
 
 
 @subscription_bp.route("/limits", methods=["GET"])
@@ -211,6 +227,7 @@ def get_limits(user):
     plan_info = get_plan_limits(user)
     return jsonify({
         "success": True,
+        "billing_scope": getattr(user, "billing_scope", None) or "global",
         **plan_info
     })
 
@@ -507,12 +524,12 @@ def admin_update_plan(admin, user_id):
     
     if not new_plan:
         return jsonify({"success": False, "error": "plan_required"}), 400
-    
-    if new_plan not in VALID_PLANS:
+
+    if not is_plan_assignable_to_user(user, new_plan):
         return jsonify({
             "success": False,
             "error": "invalid_plan",
-            "valid_plans": VALID_PLANS
+            "valid_plans": get_assignable_plan_slugs_for_user(user),
         }), 400
     
     old_plan = user.plan or "beta"
@@ -649,3 +666,619 @@ def admin_daily_usage(admin):
             for row in daily_stats
         ]
     })
+
+
+@subscription_bp.route("/select-plan", methods=["POST"])
+@require_auth
+def select_plan(user):
+    """User selects a plan after signup (before or without payment)."""
+    from datetime import datetime, timezone, timedelta
+
+    data = request.get_json() or {}
+    new_plan = (data.get("plan") or "").strip().lower()
+
+    if new_plan not in VALID_PLANS:
+        return jsonify({"success": False, "error": "invalid_plan", "valid_plans": VALID_PLANS}), 400
+
+    old_plan = user.plan or "beta"
+    if new_plan == "beta":
+        user.beta_expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+
+    user.plan = new_plan
+    db.session.commit()
+
+    return jsonify({
+        "success": True,
+        "plan": new_plan,
+        "old_plan": old_plan,
+        "limits": get_plan_limits(user),
+    })
+
+
+# =============================================================================
+# Admin — Plan & Feature Matrix
+# =============================================================================
+
+@subscription_bp.route("/admin/plans", methods=["GET"])
+@require_admin
+def admin_list_plans(admin):
+    from subscription.plan_models import SubscriptionPlan, SubscriptionFeature, PlanFeatureAccess
+
+    plans = SubscriptionPlan.query.filter(
+        or_(SubscriptionPlan.plan_scope == PLAN_SCOPE_GLOBAL, SubscriptionPlan.plan_scope.is_(None))
+    ).order_by(SubscriptionPlan.sort_order).all()
+    features = SubscriptionFeature.query.filter_by(is_active=True).order_by(
+        SubscriptionFeature.sort_order
+    ).all()
+
+    matrix = {}
+    for plan in plans:
+        matrix[plan.slug] = {}
+        for acc in PlanFeatureAccess.query.filter_by(plan_id=plan.id).all():
+            matrix[plan.slug][acc.feature_key] = {
+                "enabled": acc.enabled,
+                "limit_value": acc.limit_value,
+            }
+
+    return jsonify({
+        "success": True,
+        "plans": [_plan_admin_dict(p) for p in plans],
+        "features": [f.to_dict() for f in features],
+        "matrix": matrix,
+    })
+
+
+def _plan_admin_dict(plan) -> dict:
+    """Plan row for admin UI with usage + delete eligibility."""
+    from subscription.constants import VALID_PLANS
+
+    scope = getattr(plan, "plan_scope", None) or PLAN_SCOPE_GLOBAL
+    if scope == PLAN_SCOPE_PRIVATE:
+        user_count = User.query.filter_by(plan=plan.slug, billing_scope=BILLING_SCOPE_PRIVATE).count()
+    else:
+        user_count = User.query.filter_by(plan=plan.slug).count()
+    is_system = plan.slug in VALID_PLANS and scope == PLAN_SCOPE_GLOBAL
+    data = plan.to_dict()
+    data["user_count"] = user_count
+    data["is_system"] = is_system
+    data["is_deletable"] = (not is_system) and user_count == 0
+    return data
+
+
+@subscription_bp.route("/admin/plans", methods=["POST"])
+@require_admin
+def admin_create_plan(admin):
+    from subscription.plan_models import SubscriptionPlan, SubscriptionFeature, PlanFeatureAccess, PlanConfigAuditLog
+
+    data = request.get_json() or {}
+    slug = (data.get("slug") or "").strip().lower()
+    name = (data.get("name") or "").strip()
+
+    if not slug or not name:
+        return jsonify({"success": False, "error": "slug_and_name_required"}), 400
+
+    if SubscriptionPlan.query.filter_by(slug=slug).first():
+        return jsonify({"success": False, "error": "slug_exists"}), 400
+
+    plan = SubscriptionPlan(
+        slug=slug,
+        name=name,
+        description=data.get("description"),
+        price_monthly_inr=data.get("price_monthly_inr"),
+        is_public=bool(data.get("is_public", True)),
+        sort_order=int(data.get("sort_order", 99)),
+        plan_scope=PLAN_SCOPE_GLOBAL,
+    )
+    db.session.add(plan)
+    db.session.flush()
+
+    for feat in SubscriptionFeature.query.filter_by(is_active=True).all():
+        db.session.add(PlanFeatureAccess(
+            plan_id=plan.id,
+            feature_key=feat.key,
+            enabled=bool(data.get("default_enabled", False)),
+            limit_value=-1 if feat.feature_type == "limit" else None,
+        ))
+
+    db.session.add(PlanConfigAuditLog(
+        admin_id=admin.id,
+        admin_email=admin.email,
+        action="create_plan",
+        plan_slug=slug,
+        new_value=name,
+    ))
+    db.session.commit()
+
+    return jsonify({"success": True, "plan": _plan_admin_dict(plan)}), 201
+
+
+@subscription_bp.route("/admin/plans/<slug>", methods=["PUT"])
+@require_admin
+def admin_update_plan_catalog(admin, slug):
+    from subscription.plan_models import SubscriptionPlan, PlanConfigAuditLog
+
+    plan = SubscriptionPlan.query.filter_by(slug=slug).first()
+    if not plan:
+        return jsonify({"success": False, "error": "plan_not_found"}), 404
+
+    data = request.get_json() or {}
+    old_name = plan.name
+
+    for field in ("name", "description", "price_monthly_inr", "is_public", "is_active", "sort_order"):
+        if field in data:
+            setattr(plan, field, data[field])
+
+    db.session.add(PlanConfigAuditLog(
+        admin_id=admin.id,
+        admin_email=admin.email,
+        action="update_plan",
+        plan_slug=slug,
+        old_value=old_name,
+        new_value=plan.name,
+    ))
+    db.session.commit()
+
+    return jsonify({"success": True, "plan": _plan_admin_dict(plan)})
+
+
+@subscription_bp.route("/admin/plans/<slug>", methods=["DELETE"])
+@require_admin
+def admin_delete_plan(admin, slug):
+    from subscription.plan_models import SubscriptionPlan, PlanFeatureAccess, PlanConfigAuditLog
+    from subscription.constants import VALID_PLANS
+
+    plan = SubscriptionPlan.query.filter_by(slug=slug).first()
+    if not plan:
+        return jsonify({"success": False, "error": "plan_not_found"}), 404
+
+    if slug in VALID_PLANS:
+        plan_row = SubscriptionPlan.query.filter_by(slug=slug).first()
+        if plan_row and (getattr(plan_row, "plan_scope", None) or PLAN_SCOPE_GLOBAL) == PLAN_SCOPE_GLOBAL:
+            return jsonify({
+                "success": False,
+                "error": "system_plan_protected",
+                "message": "Built-in plans cannot be deleted. Set inactive instead.",
+            }), 400
+
+    user_count = User.query.filter_by(plan=slug).count()
+    if user_count > 0:
+        return jsonify({
+            "success": False,
+            "error": "plan_in_use",
+            "message": f"Cannot delete: {user_count} user(s) are on this plan.",
+            "user_count": user_count,
+        }), 400
+
+    PlanFeatureAccess.query.filter_by(plan_id=plan.id).delete(synchronize_session=False)
+    plan_name = plan.name
+    db.session.delete(plan)
+    db.session.add(PlanConfigAuditLog(
+        admin_id=admin.id,
+        admin_email=admin.email,
+        action="delete_plan",
+        plan_slug=slug,
+        old_value=plan_name,
+    ))
+    db.session.commit()
+
+    return jsonify({"success": True, "deleted": slug})
+
+
+@subscription_bp.route("/admin/plans/<slug>/features", methods=["PUT"])
+@require_admin
+def admin_update_plan_features(admin, slug):
+    from subscription.plan_models import SubscriptionPlan, PlanFeatureAccess, PlanConfigAuditLog
+
+    plan = SubscriptionPlan.query.filter_by(slug=slug).first()
+    if not plan:
+        return jsonify({"success": False, "error": "plan_not_found"}), 404
+
+    data = request.get_json() or {}
+    updates = data.get("features") or data.get("matrix") or {}
+
+    for feature_key, cfg in updates.items():
+        if isinstance(cfg, bool):
+            enabled, limit_value = cfg, None
+        else:
+            enabled = bool(cfg.get("enabled", False))
+            limit_value = cfg.get("limit_value")
+
+        row = PlanFeatureAccess.query.filter_by(plan_id=plan.id, feature_key=feature_key).first()
+        old_val = None
+        if row:
+            old_val = f"enabled={row.enabled},limit={row.limit_value}"
+            row.enabled = enabled
+            if limit_value is not None:
+                row.limit_value = int(limit_value)
+        else:
+            row = PlanFeatureAccess(
+                plan_id=plan.id,
+                feature_key=feature_key,
+                enabled=enabled,
+                limit_value=int(limit_value) if limit_value is not None else None,
+            )
+            db.session.add(row)
+
+        db.session.add(PlanConfigAuditLog(
+            admin_id=admin.id,
+            admin_email=admin.email,
+            action="update_feature_access",
+            plan_slug=slug,
+            feature_key=feature_key,
+            old_value=old_val,
+            new_value=f"enabled={enabled},limit={limit_value}",
+        ))
+
+    db.session.commit()
+    return jsonify({"success": True, "message": "features_updated"})
+
+
+@subscription_bp.route("/admin/audit", methods=["GET"])
+@require_admin
+def admin_plan_audit(admin):
+    from subscription.plan_models import PlanConfigAuditLog
+
+    limit = min(request.args.get("limit", 50, type=int), 200)
+    rows = PlanConfigAuditLog.query.order_by(PlanConfigAuditLog.created_at.desc()).limit(limit).all()
+    return jsonify({"success": True, "logs": [r.to_dict() for r in rows]})
+
+
+# =============================================================================
+# Admin — Private Slot (one shared pool)
+# =============================================================================
+
+def _serialize_slot_user(user: User) -> dict:
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "phone": user.phone,
+        "plan": user.plan or "beta",
+        "billing_scope": getattr(user, "billing_scope", None) or BILLING_SCOPE_GLOBAL,
+        "status": user.status,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }
+
+
+def _private_plans_matrix():
+    from subscription.plan_models import SubscriptionPlan, SubscriptionFeature, PlanFeatureAccess
+
+    plans = SubscriptionPlan.query.filter_by(plan_scope=PLAN_SCOPE_PRIVATE).order_by(
+        SubscriptionPlan.sort_order
+    ).all()
+    features = SubscriptionFeature.query.filter_by(is_active=True).order_by(
+        SubscriptionFeature.sort_order
+    ).all()
+    matrix = {}
+    for plan in plans:
+        matrix[plan.slug] = {}
+        for acc in PlanFeatureAccess.query.filter_by(plan_id=plan.id).all():
+            matrix[plan.slug][acc.feature_key] = {
+                "enabled": acc.enabled,
+                "limit_value": acc.limit_value,
+            }
+    return plans, features, matrix
+
+
+@subscription_bp.route("/admin/private-slot", methods=["GET"])
+@require_admin
+def admin_private_slot_overview(admin):
+    """Overview: all users, private members, private plans matrix."""
+    search = (request.args.get("search") or "").strip().lower()
+
+    query = User.query.order_by(User.created_at.desc())
+    if search:
+        like = f"%{search}%"
+        filters = [
+            User.email.ilike(like),
+            User.name.ilike(like),
+            User.phone.ilike(like),
+        ]
+        if search.isdigit():
+            filters.append(User.id == int(search))
+        query = query.filter(or_(*filters))
+
+    users = query.limit(500).all()
+    private_members = [
+        _serialize_slot_user(u) for u in users
+        if (getattr(u, "billing_scope", None) or BILLING_SCOPE_GLOBAL) == BILLING_SCOPE_PRIVATE
+    ]
+
+    plans, features, matrix = _private_plans_matrix()
+
+    return jsonify({
+        "success": True,
+        "users": [_serialize_slot_user(u) for u in users],
+        "private_members": private_members,
+        "private_plans": [_plan_admin_dict(p) for p in plans],
+        "global_plan_options": PRIVATE_SLOT_GLOBAL_TIERS,
+        "features": [f.to_dict() for f in features],
+        "matrix": matrix,
+        "stats": {
+            "private_count": User.query.filter_by(billing_scope=BILLING_SCOPE_PRIVATE).count(),
+            "global_count": User.query.filter(
+                or_(User.billing_scope == BILLING_SCOPE_GLOBAL, User.billing_scope.is_(None))
+            ).count(),
+        },
+    })
+
+
+@subscription_bp.route("/admin/private-slot/users/<int:user_id>/scope", methods=["PATCH"])
+@require_admin
+def admin_private_slot_set_scope(admin, user_id):
+    """Move user between global and private slot."""
+    from subscription.plan_models import PlanConfigAuditLog
+
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"success": False, "error": "user_not_found"}), 404
+
+    data = request.get_json() or {}
+    scope = (data.get("billing_scope") or "").strip().lower()
+    if scope not in (BILLING_SCOPE_GLOBAL, BILLING_SCOPE_PRIVATE):
+        return jsonify({"success": False, "error": "invalid_billing_scope"}), 400
+
+    old_scope = getattr(user, "billing_scope", None) or BILLING_SCOPE_GLOBAL
+    user.billing_scope = scope
+
+    db.session.add(PlanConfigAuditLog(
+        admin_id=admin.id,
+        admin_email=admin.email,
+        action="private_slot_scope_change",
+        plan_slug=user.plan,
+        old_value=old_scope,
+        new_value=scope,
+    ))
+    db.session.commit()
+
+    return jsonify({"success": True, "user": _serialize_slot_user(user)})
+
+
+@subscription_bp.route("/admin/private-slot/users/scope", methods=["PATCH"])
+@require_admin
+def admin_private_slot_bulk_scope(admin):
+    """Bulk move users between global and private slot."""
+    from subscription.plan_models import PlanConfigAuditLog
+
+    data = request.get_json() or {}
+    scope = (data.get("billing_scope") or "").strip().lower()
+    raw_ids = data.get("user_ids") or []
+
+    if scope not in (BILLING_SCOPE_GLOBAL, BILLING_SCOPE_PRIVATE):
+        return jsonify({"success": False, "error": "invalid_billing_scope"}), 400
+
+    if not isinstance(raw_ids, list) or not raw_ids:
+        return jsonify({"success": False, "error": "user_ids_required"}), 400
+
+    user_ids = []
+    for val in raw_ids:
+        try:
+            user_ids.append(int(val))
+        except (TypeError, ValueError):
+            continue
+
+    if not user_ids:
+        return jsonify({"success": False, "error": "user_ids_invalid"}), 400
+
+    updated = []
+    for uid in user_ids:
+        user = db.session.get(User, uid)
+        if not user:
+            continue
+        old_scope = getattr(user, "billing_scope", None) or BILLING_SCOPE_GLOBAL
+        if old_scope == scope:
+            continue
+        user.billing_scope = scope
+        db.session.add(PlanConfigAuditLog(
+            admin_id=admin.id,
+            admin_email=admin.email,
+            action="private_slot_scope_change_bulk",
+            plan_slug=user.plan,
+            old_value=old_scope,
+            new_value=scope,
+        ))
+        updated.append(_serialize_slot_user(user))
+
+    db.session.commit()
+
+    return jsonify({
+        "success": True,
+        "updated_count": len(updated),
+        "users": updated,
+        "billing_scope": scope,
+    })
+
+
+@subscription_bp.route("/admin/private-slot/users/<int:user_id>/plan", methods=["PUT"])
+@require_admin
+def admin_private_slot_set_plan(admin, user_id):
+    """Assign plan to a private-slot user (global tiers + private plans)."""
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"success": False, "error": "user_not_found"}), 404
+
+    if not is_private_slot_user(user):
+        return jsonify({
+            "success": False,
+            "error": "not_private_slot_user",
+            "message": "User must be in private slot before assigning a private plan.",
+        }), 400
+
+    data = request.get_json() or {}
+    new_plan = (data.get("plan") or "").strip().lower()
+    if not new_plan:
+        return jsonify({"success": False, "error": "plan_required"}), 400
+
+    if not is_plan_assignable_to_user(user, new_plan):
+        return jsonify({
+            "success": False,
+            "error": "invalid_plan",
+            "valid_plans": get_assignable_plan_slugs_for_user(user),
+        }), 400
+
+    old_plan = user.plan or "beta"
+    try:
+        change_user_plan(user, new_plan, admin_id=admin.id, reason=data.get("reason") or "Private slot plan change")
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+    return jsonify({
+        "success": True,
+        "user": _serialize_slot_user(user),
+        "old_plan": old_plan,
+        "new_plan": new_plan,
+    })
+
+
+@subscription_bp.route("/admin/private-slot/plans", methods=["POST"])
+@require_admin
+def admin_private_slot_create_plan(admin):
+    """Create a plan that only applies to private-slot users."""
+    from subscription.plan_models import SubscriptionPlan, SubscriptionFeature, PlanFeatureAccess, PlanConfigAuditLog
+
+    data = request.get_json() or {}
+    slug = (data.get("slug") or "").strip().lower()
+    name = (data.get("name") or "").strip()
+
+    if not slug or not name:
+        return jsonify({"success": False, "error": "slug_and_name_required"}), 400
+
+    if SubscriptionPlan.query.filter_by(slug=slug).first():
+        return jsonify({"success": False, "error": "slug_exists"}), 400
+
+    plan = SubscriptionPlan(
+        slug=slug,
+        name=name,
+        description=data.get("description"),
+        price_monthly_inr=data.get("price_monthly_inr"),
+        is_public=False,
+        is_active=True,
+        sort_order=int(data.get("sort_order", 99)),
+        plan_scope=PLAN_SCOPE_PRIVATE,
+    )
+    db.session.add(plan)
+    db.session.flush()
+
+    for feat in SubscriptionFeature.query.filter_by(is_active=True).all():
+        db.session.add(PlanFeatureAccess(
+            plan_id=plan.id,
+            feature_key=feat.key,
+            enabled=bool(data.get("default_enabled", False)),
+            limit_value=-1 if feat.feature_type == "limit" else None,
+        ))
+
+    db.session.add(PlanConfigAuditLog(
+        admin_id=admin.id,
+        admin_email=admin.email,
+        action="create_private_plan",
+        plan_slug=slug,
+        new_value=name,
+    ))
+    db.session.commit()
+
+    return jsonify({"success": True, "plan": _plan_admin_dict(plan)}), 201
+
+
+@subscription_bp.route("/admin/private-slot/plans/<slug>", methods=["PUT"])
+@require_admin
+def admin_private_slot_update_plan(admin, slug):
+    from subscription.plan_models import SubscriptionPlan, PlanConfigAuditLog
+
+    plan = SubscriptionPlan.query.filter_by(slug=slug, plan_scope=PLAN_SCOPE_PRIVATE).first()
+    if not plan:
+        return jsonify({"success": False, "error": "plan_not_found"}), 404
+
+    data = request.get_json() or {}
+    old_name = plan.name
+    for field in ("name", "description", "price_monthly_inr", "is_active", "sort_order"):
+        if field in data:
+            setattr(plan, field, data[field])
+
+    db.session.add(PlanConfigAuditLog(
+        admin_id=admin.id,
+        admin_email=admin.email,
+        action="update_private_plan",
+        plan_slug=slug,
+        old_value=old_name,
+        new_value=plan.name,
+    ))
+    db.session.commit()
+    return jsonify({"success": True, "plan": _plan_admin_dict(plan)})
+
+
+@subscription_bp.route("/admin/private-slot/plans/<slug>", methods=["DELETE"])
+@require_admin
+def admin_private_slot_delete_plan(admin, slug):
+    from subscription.plan_models import SubscriptionPlan, PlanFeatureAccess, PlanConfigAuditLog
+
+    plan = SubscriptionPlan.query.filter_by(slug=slug, plan_scope=PLAN_SCOPE_PRIVATE).first()
+    if not plan:
+        return jsonify({"success": False, "error": "plan_not_found"}), 404
+
+    user_count = User.query.filter_by(plan=slug, billing_scope=BILLING_SCOPE_PRIVATE).count()
+    if user_count > 0:
+        return jsonify({
+            "success": False,
+            "error": "plan_in_use",
+            "message": f"Cannot delete: {user_count} private user(s) on this plan.",
+            "user_count": user_count,
+        }), 400
+
+    PlanFeatureAccess.query.filter_by(plan_id=plan.id).delete(synchronize_session=False)
+    plan_name = plan.name
+    db.session.delete(plan)
+    db.session.add(PlanConfigAuditLog(
+        admin_id=admin.id,
+        admin_email=admin.email,
+        action="delete_private_plan",
+        plan_slug=slug,
+        old_value=plan_name,
+    ))
+    db.session.commit()
+    return jsonify({"success": True, "deleted": slug})
+
+
+@subscription_bp.route("/admin/private-slot/plans/<slug>/features", methods=["PUT"])
+@require_admin
+def admin_private_slot_update_plan_features(admin, slug):
+    from subscription.plan_models import SubscriptionPlan, PlanFeatureAccess, PlanConfigAuditLog
+
+    plan = SubscriptionPlan.query.filter_by(slug=slug, plan_scope=PLAN_SCOPE_PRIVATE).first()
+    if not plan:
+        return jsonify({"success": False, "error": "plan_not_found"}), 404
+
+    data = request.get_json() or {}
+    features = data.get("features") or {}
+
+    for feature_key, cfg in features.items():
+        if not isinstance(cfg, dict):
+            continue
+        enabled = bool(cfg.get("enabled", False))
+        limit_value = cfg.get("limit_value")
+        row = PlanFeatureAccess.query.filter_by(plan_id=plan.id, feature_key=feature_key).first()
+        old_val = None
+        if row:
+            old_val = f"enabled={row.enabled},limit={row.limit_value}"
+            row.enabled = enabled
+            if limit_value is not None:
+                row.limit_value = limit_value
+        else:
+            db.session.add(PlanFeatureAccess(
+                plan_id=plan.id,
+                feature_key=feature_key,
+                enabled=enabled,
+                limit_value=limit_value,
+            ))
+
+        db.session.add(PlanConfigAuditLog(
+            admin_id=admin.id,
+            admin_email=admin.email,
+            action="update_private_feature_access",
+            plan_slug=slug,
+            feature_key=feature_key,
+            old_value=old_val,
+            new_value=f"enabled={enabled},limit={limit_value}",
+        ))
+
+    db.session.commit()
+    return jsonify({"success": True, "message": "features_updated"})

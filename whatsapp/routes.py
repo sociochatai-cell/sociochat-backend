@@ -502,13 +502,13 @@ def webhook_test():
     """
     import os
     base_url = os.environ.get("APP_BASE_URL", "https://sociovia-backend-362038465411.europe-west1.run.app")
-    verify_token = os.environ.get("WHATSAPP_VERIFY_TOKEN", "not_set")
+    verify_token = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
     
     return jsonify({
         "status": "ok",
         "message": "Webhook endpoint is accessible!",
         "webhook_url": f"{base_url}/api/whatsapp/webhook",
-        "verify_token_configured": verify_token != "not_set",
+        "verify_token_configured": bool(verify_token),
         "instructions": [
             "1. Go to Facebook Developer Console > WhatsApp > Configuration",
             "2. Edit Webhook settings",

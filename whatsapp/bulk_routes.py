@@ -14,6 +14,7 @@ from .drip_engine import process_single_enrollment, trigger_campaign_now
 from .scheduler import add_campaign_job
 from .utils import normalize_phone_robust
 from rate_limit.decorator import rate_limit
+from subscription.decorators import require_feature
 
 logger = logging.getLogger(__name__)
 
@@ -473,6 +474,7 @@ def list_campaigns():
     return jsonify({"success": True, "campaigns": result})
 
 @bulk_bp.route("/campaigns", methods=["POST"])
+@require_feature("whatsapp_bulk_messaging")
 @rate_limit("whatsapp.bulk.create")
 @require_account_access
 def create_campaign(account: WhatsAppAccount, workspace_id: str):

@@ -72,36 +72,26 @@ def _is_allowed_origin(origin):
     return False
 
 if CORS_ALLOW_ALL:
-    logger.warning("[CORS] DEBUG MODE: allowing all origins (*). Set CORS_ALLOW_ALL=0 to disable.")
-    CORS(
-        app,
-        resources={r"/*": {"origins": "*"}},
-        supports_credentials=False,
-        allow_headers=_CORS_ALLOW_HEADERS,
-        expose_headers=["Content-Type"],
-        methods=_CORS_ALLOW_METHODS,
+    logger.warning(
+        "[CORS] Dev mode: localhost + *.devtunnels.ms with credentials "
+        "(no wildcard * — required for credentials: include)."
     )
 else:
-    CORS(
-        app,
-        origins=FRONTEND_ORIGINS,
-        supports_credentials=True,
-        allow_headers=_CORS_ALLOW_HEADERS,
-        expose_headers=["Content-Type"],
-        methods=_CORS_ALLOW_METHODS,
-    )
+    logger.info("[CORS] Whitelist mode: FRONTEND_ORIGIN + EXTRA_CORS_ORIGINS + devtunnels.")
+
+# Never use origins="*" with supports_credentials=True — browsers block it.
+CORS(
+    app,
+    origins=FRONTEND_ORIGINS,
+    supports_credentials=True,
+    allow_headers=_CORS_ALLOW_HEADERS,
+    expose_headers=["Content-Type"],
+    methods=_CORS_ALLOW_METHODS,
+)
 
 @app.after_request
 def add_cors_headers(resp):
     origin = request.headers.get("Origin")
-    if CORS_ALLOW_ALL:
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Headers"] = _CORS_HEADERS_VALUE
-        resp.headers["Access-Control-Allow-Methods"] = _CORS_METHODS_VALUE
-        resp.headers["Vary"] = "Origin"
-        return resp
-
-    logger.debug(f"[CORS] Origin header: {origin!r}, allowed: {_is_allowed_origin(origin) if origin else 'N/A'}")
     if origin and _is_allowed_origin(origin):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
@@ -161,7 +151,7 @@ from whatsapp import (
     whatsapp_bp, automation_bp, ai_bp, faq_bp, knowledge_bp,
     template_bp, trigger_bp, drip_bp, interactive_automation_bp,
     bulk_bp, production_trigger_bp,
-    flow_bp, flow_testing_bp, flow_endpoint_bp,
+    flow_bp, flow_testing_bp, flow_endpoint_bp, flow_os_bp, bookings_bp,
     dataset_bp, coexistence_bp,
     catalog_bp, tracking_bp, tracking_redirect_bp, scheduler_bp,
 )
@@ -180,6 +170,8 @@ app.register_blueprint(bulk_bp)
 app.register_blueprint(flow_bp)
 app.register_blueprint(flow_testing_bp)
 app.register_blueprint(flow_endpoint_bp)
+app.register_blueprint(flow_os_bp)
+app.register_blueprint(bookings_bp)
 app.register_blueprint(dataset_bp, url_prefix="/api/whatsapp")
 app.register_blueprint(coexistence_bp)
 app.register_blueprint(catalog_bp, url_prefix="/api/whatsapp")
@@ -190,7 +182,9 @@ app.register_blueprint(usage_events_internal_bp, url_prefix="/api/internal/whats
 
 # Subscription / billing
 from subscription.routes import subscription_bp
+from admin_routes import admin_bp, ensure_default_admin
 app.register_blueprint(subscription_bp)
+app.register_blueprint(admin_bp)
 
 # Register Agent Blueprint
 from agent_backend import agent_bp
@@ -201,9 +195,24 @@ with app.app_context():
     # Ensure link tracking + subscription tables exist
     import shared_models  # noqa: F401
     import subscription.models  # noqa: F401
+    import subscription.plan_models  # noqa: F401
     from whatsapp import dataset_models  # noqa: F401
+    from whatsapp import flow_os_models  # noqa: F401
 
     db.create_all()
+
+    try:
+        from subscription.schema_migrations import ensure_private_slot_schema
+        ensure_private_slot_schema()
+    except Exception as e:
+        logger.warning(f"Private slot schema migration skipped: {e}")
+
+    try:
+        ensure_default_admin()
+        from subscription.seed import seed_subscription_catalog
+        seed_subscription_catalog()
+    except Exception as e:
+        logger.warning(f"Admin/subscription seed skipped: {e}")
 
     # CRM models (leads/contacts) used by drip/bulk audience import
     try:
@@ -398,7 +407,10 @@ def notification_stream():
     """Server-Sent Events (SSE) endpoint for real-time notifications."""
     if request.method == "OPTIONS":
         response = Response()
-        response.headers["Access-Control-Allow-Origin"] = "*"
+        origin = request.headers.get("Origin")
+        if origin and _is_allowed_origin(origin):
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Methods"] = _CORS_METHODS_VALUE
         response.headers["Access-Control-Allow-Headers"] = _CORS_HEADERS_VALUE
         return response
@@ -423,4 +435,4 @@ def hello():
      return "hello"
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True,use_reloader=False)

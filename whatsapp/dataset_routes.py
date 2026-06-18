@@ -22,6 +22,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from .dataset_models import Dataset, DatasetRow
 from models import db
+from subscription.decorators import require_feature
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ def list_datasets(workspace_id):
 
 
 @dataset_bp.route("/workspaces/<workspace_id>/datasets", methods=["POST"])
+@require_feature("whatsapp_datasets")
 def create_dataset(workspace_id):
     body = request.get_json(silent=True) or {}
     name = body.get("name", "").strip()

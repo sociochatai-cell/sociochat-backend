@@ -10,6 +10,7 @@ from .models import WhatsAppAccount
 from .drip_models import WhatsAppDripCampaign, WhatsAppDripStep, WhatsAppDripEnrollment, WhatsAppDataset, WhatsAppDatasetRow
 from .flow_access import require_account_access
 from rate_limit.decorator import rate_limit
+from subscription.decorators import require_feature
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +215,7 @@ def list_campaigns(account_id: int, account: WhatsAppAccount, workspace_id: str)
         return jsonify({"error": "Failed to list campaigns"}), 500
 
 @drip_bp.route("/accounts/<int:account_id>/drip-campaigns", methods=["POST"])
+@require_feature("whatsapp_drip")
 @rate_limit("whatsapp.drip.create")
 @require_account_access
 def create_campaign(account_id: int, account: WhatsAppAccount, workspace_id: str):

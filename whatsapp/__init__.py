@@ -41,6 +41,7 @@ from .interactive_automation_routes import interactive_automation_bp
 from .flow_routes import flow_bp
 from .flow_testing import flow_testing_bp
 from .flow_endpoint import flow_endpoint_bp
+from .flow_os_routes import flow_os_bp, bookings_bp
 from .dataset_routes import dataset_bp
 from .models import (
     WhatsAppAccount,
@@ -88,6 +89,8 @@ __all__ = [
     "flow_bp",
     "flow_testing_bp",
     "flow_endpoint_bp",
+    "flow_os_bp",
+    "bookings_bp",
     "dataset_bp",
     "coexistence_bp",
     "catalog_bp",

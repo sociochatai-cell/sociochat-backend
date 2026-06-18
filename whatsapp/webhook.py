@@ -52,6 +52,16 @@ from SocioviaCrm.capi_service import send_capi_event
 logger = logging.getLogger(__name__)
 
 
+def _normalize_verify_token(value: Optional[str]) -> str:
+    """Strip whitespace and optional surrounding quotes from Meta verify token."""
+    if not value:
+        return ""
+    cleaned = value.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ('"', "'"):
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+
 # ============================================================
 # Webhook Verification
 # ============================================================
@@ -87,7 +97,8 @@ def verify_webhook_challenge(mode: str, token: str, challenge: str) -> Optional[
     Returns:
         Challenge string if valid, None otherwise
     """
-    verify_token ="sociovia_whatsapp_verify_2024"
+    verify_token = _normalize_verify_token(os.getenv("WHATSAPP_VERIFY_TOKEN", ""))
+    token = _normalize_verify_token(token)
     
     if not verify_token:
         logger.error("WHATSAPP_VERIFY_TOKEN not configured!")
@@ -360,6 +371,29 @@ class WebhookProcessor:
             return
         print(f"✅ Stored message: id={msg_record.id}, type={msg_type}, content={content}")
         logger.info(f"Stored incoming message: {wamid} from {from_phone}")
+
+        if msg_type == "interactive" and content.get("interactive_type") == "nfm_reply":
+            try:
+                from .flow_os_routes import maybe_create_booking_from_submission
+                response_json = content.get("response_json")
+                if isinstance(response_json, str):
+                    import json as _json
+                    try:
+                        response_json = _json.loads(response_json)
+                    except _json.JSONDecodeError:
+                        response_json = {}
+                if isinstance(response_json, dict):
+                    maybe_create_booking_from_submission(
+                        account_id=account.id,
+                        conversation_id=conversation.id,
+                        wa_id=from_phone,
+                        response_json=response_json,
+                        flow_id=content.get("flow_id"),
+                    )
+                    self.db_session.commit()
+            except Exception as booking_err:
+                logger.warning("Could not create booking from flow submission: %s", booking_err)
+                self.db_session.rollback()
 
         # Broadcast real-time event
         try:
@@ -658,6 +692,11 @@ class WebhookProcessor:
                 content["list_id"] = reply.get("id")
                 content["list_title"] = reply.get("title")
                 content["list_description"] = reply.get("description")
+            elif int_type == "nfm_reply":
+                nfm = interactive.get("nfm_reply", {})
+                content["response_json"] = nfm.get("response_json")
+                content["flow_id"] = nfm.get("flow_id") or interactive.get("flow_id")
+                content["submission_status"] = "received"
         
         elif msg_type == "button":
             content["button_text"] = message.get("button", {}).get("text", "")

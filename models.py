@@ -46,6 +46,14 @@ class User(db.Model):
     )
     # beta | starter | growth | enterprise
 
+    # global = normal public plan catalog; private = private slot pool
+    billing_scope = db.Column(
+        db.String(16),
+        nullable=False,
+        default="global",
+        index=True,
+    )
+
     subscription_expires_at = db.Column(db.DateTime, nullable=True)
     beta_expires_at = db.Column(db.DateTime, nullable=True)
 

@@ -14,6 +14,15 @@ PLAN_ENTERPRISE = "enterprise"
 # All valid plans
 VALID_PLANS = [PLAN_BETA, PLAN_STARTER, PLAN_GROWTH, PLAN_ENTERPRISE]
 
+# Billing / plan scope
+BILLING_SCOPE_GLOBAL = "global"
+BILLING_SCOPE_PRIVATE = "private"
+PLAN_SCOPE_GLOBAL = "global"
+PLAN_SCOPE_PRIVATE = "private"
+
+# Global tier plans assignable inside private slot
+PRIVATE_SLOT_GLOBAL_TIERS = [PLAN_STARTER, PLAN_GROWTH, PLAN_ENTERPRISE, PLAN_BETA]
+
 # -1 means unlimited
 UNLIMITED = -1
 

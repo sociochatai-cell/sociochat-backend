@@ -193,44 +193,51 @@ def detect_whatsapp_connection_path(workspace_id: str) -> Dict[str, Any]:
             "can_use_manual_link": True,
         }
     
+    ws_id = str(workspace_id).strip()
+    
     # Query for existing WhatsApp account (active first, then any)
     account = WhatsAppAccount.query.filter_by(
-        workspace_id=workspace_id,
+        workspace_id=ws_id,
         is_active=True
     ).first()
     
-    # ============================================================
-    # FAST PATH: Active account with token + phone → return immediately
-    # No Meta API calls needed — just use what's in the DB.
-    # This is the common case and should be near-instant.
-    # ============================================================
-    if account and account.phone_number_id and account.get_access_token():
+    def _connected_response(acct, reason: str) -> Dict[str, Any]:
         account_summary = {
-            "id": account.id,
-            "waba_id": account.waba_id,
-            "phone_number": account.display_phone_number,
-            "phone_number_id": account.phone_number_id,
-            "verified_name": account.custom_name or account.verified_name,
+            "id": acct.id,
+            "waba_id": acct.waba_id,
+            "phone_number": acct.display_phone_number,
+            "phone_number_id": acct.phone_number_id,
+            "verified_name": acct.custom_name or acct.verified_name,
             "display_name_status": None,
-            "quality_rating": account.quality_score,
+            "quality_rating": acct.quality_score,
             "is_test_number": False,
-            "is_active": account.is_active,
-            "is_coexistence": account.is_coexistence,
-            "token_type": account.token_type,
+            "is_active": acct.is_active,
+            "is_coexistence": acct.is_coexistence,
+            "token_type": acct.token_type,
         }
         return {
             "status": ConnectionStatus.CONNECTED,
             "recommended_path": None,
-            "reason": "WhatsApp Business account is fully connected",
+            "reason": reason,
             "account_summary": account_summary,
             "can_use_embedded_signup": False,
             "can_use_manual_link": True,
         }
     
+    # ============================================================
+    # FAST PATH: Active account with phone_number_id → CONNECTED
+    # Token may be re-read from env if DB decrypt fails (dev/prod secret mismatch).
+    # ============================================================
+    if account and account.phone_number_id and account.is_active:
+        return _connected_response(
+            account,
+            "WhatsApp Business account is connected for this workspace",
+        )
+    
     # If no active account, check for inactive ones (user explicitly unlinked)
     if not account:
         account = WhatsAppAccount.query.filter_by(
-            workspace_id=workspace_id
+            workspace_id=ws_id
         ).order_by(WhatsAppAccount.id.desc()).first()
         
         if account:

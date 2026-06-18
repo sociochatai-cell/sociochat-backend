@@ -76,11 +76,26 @@ def decrypt_token(encrypted_token: str) -> str:
     if not encrypted_token:
         return ""
     
-    try:
-        key = get_encryption_key()
-        fernet = Fernet(key)
-        decrypted = fernet.decrypt(encrypted_token.encode())
-        return decrypted.decode()
-    except Exception as e:
-        raise ValueError(f"Failed to decrypt token: {e}")
+    keys_to_try = [get_encryption_key()]
+    legacy_secret = os.getenv("LEGACY_SECRET_KEY") or os.getenv("PRODUCTION_SECRET_KEY")
+    if legacy_secret:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=b'sociovia_wa_salt',
+            iterations=100000,
+        )
+        keys_to_try.append(base64.urlsafe_b64encode(kdf.derive(legacy_secret.encode())))
+    
+    last_error = None
+    for key in keys_to_try:
+        try:
+            fernet = Fernet(key)
+            decrypted = fernet.decrypt(encrypted_token.encode())
+            return decrypted.decode()
+        except Exception as e:
+            last_error = e
+            continue
+    
+    raise ValueError(f"Failed to decrypt token: {last_error}")
 

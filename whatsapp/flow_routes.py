@@ -25,6 +25,7 @@ from .flow_validator import validate_flow_json, generate_sample_flow, sanitize_f
 from .flow_access import require_flow_access, require_account_access, validate_flow_account_match
 from .token_helper import get_account_with_token
 from subscription.service import check_flow_limit
+from subscription.decorators import require_feature
 from models import Workspace, User
 
 # Create blueprint
@@ -36,6 +37,7 @@ flow_bp = Blueprint("flows", __name__, url_prefix="/api/whatsapp/flows")
 # ============================================================
 
 @flow_bp.route("", methods=["POST"])
+@require_feature("whatsapp_flows")
 def create_flow():
     """
     Create a new draft flow.

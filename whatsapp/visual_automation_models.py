@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 from models import db
 from sqlalchemy import Index, JSON, Text
+from sqlalchemy.orm.attributes import flag_modified
 
 
 class WhatsAppVisualAutomation(db.Model):
@@ -75,6 +76,9 @@ class WhatsAppVisualAutomation(db.Model):
             "description": self.description,
             "triggerType": self.trigger_type,
             "triggerConfig": self.trigger_config,
+            "variables": self.variables,
+            "flowConfig": self.flow_config,
+            "flow_config": self.flow_config,
             "nodes": self.nodes,
             "edges": self.edges,
             "viewport": self.viewport,
@@ -104,6 +108,41 @@ class WhatsAppVisualAutomation(db.Model):
         """Increment trigger count and update last triggered time."""
         self.trigger_count = (self.trigger_count or 0) + 1
         self.last_triggered_at = datetime.now(timezone.utc)
+
+    # -- Flow Variables & Config (additive, no migration) ---------------
+    # Flow-level variables (API tokens, URLs) and flow_config are stored
+    # inside the existing trigger_config JSON column under reserved keys so
+    # no schema migration is required.
+    _VARIABLES_KEY = "_flow_variables"
+    _FLOW_CONFIG_KEY = "_flow_config"
+
+    @property
+    def variables(self) -> Dict[str, Any]:
+        """Per-flow variables (e.g. {"flow_api_token": "..."})."""
+        cfg = self.trigger_config if isinstance(self.trigger_config, dict) else {}
+        value = cfg.get(self._VARIABLES_KEY)
+        return value if isinstance(value, dict) else {}
+
+    @variables.setter
+    def variables(self, value: Optional[Dict[str, Any]]) -> None:
+        cfg = dict(self.trigger_config) if isinstance(self.trigger_config, dict) else {}
+        cfg[self._VARIABLES_KEY] = value if isinstance(value, dict) else {}
+        self.trigger_config = cfg
+        flag_modified(self, "trigger_config")
+
+    @property
+    def flow_config(self) -> Dict[str, Any]:
+        """Per-flow config, e.g. {"variableDefaults": {...}, "buttonCaptureRules": [...]}."""
+        cfg = self.trigger_config if isinstance(self.trigger_config, dict) else {}
+        value = cfg.get(self._FLOW_CONFIG_KEY)
+        return value if isinstance(value, dict) else {}
+
+    @flow_config.setter
+    def flow_config(self, value: Optional[Dict[str, Any]]) -> None:
+        cfg = dict(self.trigger_config) if isinstance(self.trigger_config, dict) else {}
+        cfg[self._FLOW_CONFIG_KEY] = value if isinstance(value, dict) else {}
+        self.trigger_config = cfg
+        flag_modified(self, "trigger_config")
 
 
 class WhatsAppAutomationNode(db.Model):
@@ -225,3 +264,61 @@ class WhatsAppConversationState(db.Model):
         self.is_active = False
         self.completed_at = datetime.now(timezone.utc)
         self.updated_at = datetime.now(timezone.utc)
+
+    # -- Input Flow Helpers (additive) ----------------------------------
+    # Collected input fields, field order (for corrections), and the
+    # waiting-for-input flag are all stored inside the existing state_data
+    # JSON column - no schema migration required.
+
+    def set_collected_field(self, field: str, value) -> None:
+        """Store a collected input field value."""
+        sd = self.state_data if isinstance(self.state_data, dict) else {}
+        collected = sd.get("collected", {})
+        collected[field] = value
+        sd["collected"] = collected
+        # Track field order for correction support
+        field_order = sd.get("_field_order", [])
+        if field not in field_order:
+            field_order.append(field)
+        sd["_field_order"] = field_order
+        self.state_data = sd
+        flag_modified(self, "state_data")
+        self.updated_at = datetime.now(timezone.utc)
+
+    def get_collected_fields(self) -> dict:
+        """Get all collected input values."""
+        return (self.state_data or {}).get("collected", {})
+
+    def get_last_collected_field(self) -> Optional[str]:
+        """Get the name of the last collected field (for correction support)."""
+        sd = self.state_data if isinstance(self.state_data, dict) else {}
+        field_order = sd.get("_field_order", [])
+        return field_order[-1] if field_order else None
+
+    def set_waiting_for_input(self, field: str) -> None:
+        """Mark state as waiting for user input on a specific field."""
+        sd = self.state_data if isinstance(self.state_data, dict) else {}
+        sd["waiting_for_input"] = True
+        sd["current_field"] = field
+        self.state_data = sd
+        flag_modified(self, "state_data")
+        self.updated_at = datetime.now(timezone.utc)
+
+    def clear_waiting_for_input(self) -> None:
+        """Clear the input-waiting flag after successful input."""
+        sd = self.state_data if isinstance(self.state_data, dict) else {}
+        sd.pop("waiting_for_input", None)
+        sd.pop("current_field", None)
+        self.state_data = sd
+        flag_modified(self, "state_data")
+        self.updated_at = datetime.now(timezone.utc)
+
+    @property
+    def is_waiting_for_input(self) -> bool:
+        """True when the flow is blocked waiting for user text input."""
+        return bool((self.state_data or {}).get("waiting_for_input"))
+
+    @property
+    def current_input_field(self) -> Optional[str]:
+        """The field name we are currently collecting, or None."""
+        return (self.state_data or {}).get("current_field")

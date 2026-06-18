@@ -21,10 +21,55 @@ from flask import Blueprint, request, jsonify, g
 from models import db
 from .visual_automation_models import WhatsAppVisualAutomation
 from .models import WhatsAppAccount
+from . import api_node_executor
+from . import interactive_flow_ai
+from subscription.decorators import require_feature
+from . import flow_variables
 
 logger = logging.getLogger(__name__)
 
 interactive_automation_bp = Blueprint("interactive_automation", __name__)
+
+
+# ============================================================
+# Helper Functions (additive)
+# ============================================================
+
+def _merge_variables(existing: dict, incoming: dict, *, replace: bool = False) -> dict:
+    """Merge flow variables; preserve existing secrets when a masked placeholder is sent."""
+    if replace or not isinstance(existing, dict):
+        base = {}
+    else:
+        base = dict(existing)
+    if not isinstance(incoming, dict):
+        return base
+    for key, value in incoming.items():
+        if value == "***" and key in base:
+            continue
+        if (
+            flow_variables.is_sensitive_variable_key(key)
+            and (value is None or (isinstance(value, str) and not value.strip()))
+            and key in base
+            and base.get(key) not in (None, "")
+        ):
+            continue
+        base[key] = value
+    return base
+
+
+def _apply_automation_metadata(automation: WhatsAppVisualAutomation, data: dict) -> None:
+    """Apply variables / flow_config from an API payload (additive, no migration)."""
+    if "variables" in data:
+        incoming = data.get("variables") or {}
+        replace = bool(data.get("replaceVariables"))
+        automation.variables = _merge_variables(
+            automation.variables if isinstance(automation.variables, dict) else {},
+            incoming,
+            replace=replace,
+        )
+    if "flow_config" in data or "flowConfig" in data:
+        cfg = data.get("flow_config") if "flow_config" in data else data.get("flowConfig")
+        automation.flow_config = cfg if isinstance(cfg, dict) else {}
 
 
 # ============================================================
@@ -84,6 +129,7 @@ def list_interactive_automations(workspace_id: str):
 
 
 @interactive_automation_bp.route("/interactive-automations", methods=["POST"])
+@require_feature("whatsapp_interactive_automation")
 def create_interactive_automation():
     """
     Create a new interactive automation.
@@ -136,10 +182,13 @@ def create_interactive_automation():
             status="draft",
             is_active=False,
         )
-        
+
+        # Additive: persist flow variables / flow_config if provided
+        _apply_automation_metadata(automation, data)
+
         db.session.add(automation)
         db.session.commit()
-        
+
         logger.info(f"Created interactive automation {automation.id} for workspace {workspace_id}")
         
         return jsonify({
@@ -199,15 +248,27 @@ def update_interactive_automation(automation_id: int):
         if "trigger" in data:
             trigger = data["trigger"]
             automation.trigger_type = trigger.get("type", automation.trigger_type)
-            automation.trigger_config = trigger
+            # Preserve reserved flow variable / config keys stored in trigger_config
+            existing_cfg = automation.trigger_config if isinstance(automation.trigger_config, dict) else {}
+            new_cfg = dict(trigger) if isinstance(trigger, dict) else {}
+            for reserved_key in (
+                WhatsAppVisualAutomation._VARIABLES_KEY,
+                WhatsAppVisualAutomation._FLOW_CONFIG_KEY,
+            ):
+                if reserved_key in existing_cfg:
+                    new_cfg[reserved_key] = existing_cfg[reserved_key]
+            automation.trigger_config = new_cfg
         if "viewport" in data:
             automation.viewport = data["viewport"]
-            
+
+        # Additive: persist flow variables / flow_config if provided
+        _apply_automation_metadata(automation, data)
+
         automation.version = (automation.version or 1) + 1
         automation.updated_at = datetime.now(timezone.utc)
-        
+
         db.session.commit()
-        
+
         logger.info(f"Updated interactive automation {automation_id}")
         
         return jsonify({
@@ -304,6 +365,129 @@ def pause_interactive_automation(automation_id: int):
         db.session.rollback()
         logger.error(f"Error pausing interactive automation: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ============================================================
+# Flow variables (additive)
+# ============================================================
+
+@interactive_automation_bp.route("/interactive-automations/<int:automation_id>/variables", methods=["PUT", "PATCH"])
+def update_interactive_automation_variables(automation_id: int):
+    """
+    Update per-flow variables (API tokens, URLs) and flow_config.
+
+    Body: { "variables": { "flow_api_token": "..." }, "flow_config": { "variableDefaults": {} } }
+    Send "replaceVariables": true to replace the entire variables map.
+    """
+    try:
+        automation = WhatsAppVisualAutomation.query.get(automation_id)
+        if not automation:
+            return jsonify({"success": False, "error": "Automation not found"}), 404
+
+        data = request.get_json() or {}
+        _apply_automation_metadata(automation, data)
+        automation.version = (automation.version or 1) + 1
+        automation.updated_at = datetime.now(timezone.utc)
+        db.session.commit()
+
+        return jsonify({"success": True, "automation": automation.to_dict()})
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Error updating automation variables: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ============================================================
+# API node dry-run (builder preview / connectivity test)
+# ============================================================
+
+@interactive_automation_bp.route("/interactive-automations/test-api-node", methods=["POST"])
+def test_api_node():
+    """
+    Dry-run an API node configuration (builder preview / connectivity test).
+
+    Body:
+    {
+      "node": { "data": { ... api node config ... } },
+      "variables": { "phone": "9198...", "name": "Test" },
+      "automation_id": 123   // optional - merge stored flow variables
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        node = data.get("node") or {}
+        node_data = node.get("data") if isinstance(node, dict) else {}
+        if not node_data and isinstance(data.get("data"), dict):
+            node_data = data["data"]
+        variables = data.get("variables") or {}
+        automation_id = data.get("automation_id") or data.get("automationId")
+        if automation_id:
+            automation = WhatsAppVisualAutomation.query.get(int(automation_id))
+            if automation and isinstance(automation.variables, dict):
+                merged = dict(automation.variables)
+                merged.update(variables)
+                variables = merged
+                flow_config = automation.flow_config if isinstance(automation.flow_config, dict) else {}
+                defaults = flow_config.get("variableDefaults") or {}
+                variables = flow_variables.merge_variable_defaults(variables, defaults)
+
+        errors = api_node_executor.validate_api_node_data(node_data)
+        if errors:
+            return jsonify({"success": False, "errors": errors}), 400
+
+        result = api_node_executor.execute_api_node(node_data, variables)
+        return jsonify({
+            "success": result.success,
+            "status_code": result.status_code,
+            "handle": result.handle,
+            "error": result.error,
+            "parsed": result.parsed,
+            "raw_preview": (result.raw_text or "")[:2000],
+            "outbound_messages": result.outbound_messages,
+        })
+    except Exception as exc:
+        logger.exception("test-api-node failed: %s", exc)
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+# ============================================================
+# AI flow generation
+# ============================================================
+
+@interactive_automation_bp.route("/interactive-automations/ai-generate", methods=["POST"])
+def ai_generate_interactive_flow():
+    """
+    Generate a draft interactive automation from a natural-language prompt.
+
+    Body: { "prompt": "...", "workspace_id": "optional" }
+    Returns nodes + edges ready for the visual builder (does not persist).
+    """
+    try:
+        data = request.get_json() or {}
+        prompt = (data.get("prompt") or data.get("description") or "").strip()
+        if not prompt:
+            return jsonify({"success": False, "error": "prompt is required"}), 400
+
+        workspace_id = data.get("workspace_id") or request.args.get("workspace_id")
+        draft = interactive_flow_ai.generate_interactive_flow_draft(
+            prompt=prompt,
+            workspace_id=str(workspace_id) if workspace_id else None,
+        )
+        return jsonify({
+            "success": True,
+            "draft": draft,
+            "hint": (
+                "Set draft.variables.flow_api_token in flow settings before publishing. "
+                "API nodes include Authorization headers using {{flow_api_token}}."
+            ),
+        })
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 503
+    except Exception as exc:
+        logger.exception("ai-generate interactive flow failed: %s", exc)
+        return jsonify({"success": False, "error": str(exc) or "AI generation failed"}), 500
 
 
 @interactive_automation_bp.route("/interactive-automations/clear-states", methods=["GET", "POST"])

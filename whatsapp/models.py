@@ -13,6 +13,7 @@ Tables:
 
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
+import os
 import enum
 import json
 
@@ -400,13 +401,22 @@ class WhatsAppAccount(db.Model):
     
     def get_access_token(self) -> Optional[str]:
         """Get decrypted access token (for internal use only)."""
-        if not self.access_token_encrypted:
-            return None
-        from .encryption import decrypt_token
-        try:
-            return decrypt_token(self.access_token_encrypted)
-        except Exception:
-            return None
+        if self.access_token_encrypted:
+            from .encryption import decrypt_token
+            try:
+                token = decrypt_token(self.access_token_encrypted)
+                if token:
+                    return token
+            except Exception:
+                pass
+
+        # Env fallback when DB token missing or encrypted with a different server secret
+        env_token = os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TEMP_TOKEN")
+        env_phone_id = (os.getenv("WHATSAPP_PHONE_NUMBER_ID") or "").strip()
+        if env_token:
+            if not env_phone_id or env_phone_id == (self.phone_number_id or ""):
+                return env_token
+        return None
     
     def set_access_token(self, token: str, token_type: str = "permanent", expires_at: Optional[datetime] = None) -> None:
         """Set encrypted access token."""

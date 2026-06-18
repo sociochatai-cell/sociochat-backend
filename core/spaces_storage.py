@@ -9,6 +9,32 @@ import os
 from typing import Optional, Tuple
 
 
+def _normalize_spaces_endpoint(
+    endpoint: str,
+    region: Optional[str],
+    bucket: Optional[str],
+) -> str:
+    """
+    DigitalOcean Spaces expects a regional endpoint only, e.g.
+    https://blr1.digitaloceanspaces.com — not the bucket hostname and not /sociochat paths.
+    """
+    endpoint = endpoint.rstrip("/")
+    if not endpoint and region:
+        return f"https://{region}.digitaloceanspaces.com"
+
+    # Strip accidental path suffixes like /sociochat (prefix belongs in object keys, not endpoint).
+    if "digitaloceanspaces.com/" in endpoint:
+        endpoint = endpoint.split("digitaloceanspaces.com/", 1)[0] + "digitaloceanspaces.com"
+
+    # Convert bucket virtual-host URLs back to regional endpoint for boto3.
+    if bucket and region:
+        bucket_host = f"https://{bucket}.{region}.digitaloceanspaces.com"
+        if endpoint.startswith(bucket_host):
+            endpoint = f"https://{region}.digitaloceanspaces.com"
+
+    return endpoint
+
+
 def get_space_prefix() -> str:
     """Folder prefix inside the bucket, e.g. sociochat."""
     return (os.getenv("SPACE_PREFIX") or "sociochat").strip().strip("/")
@@ -27,9 +53,11 @@ def get_spaces_config() -> Tuple[Optional[str], Optional[str], Optional[str], Op
         or os.getenv("SPACE_SECRET_KEY")
         or os.getenv("DO_SECRET_ACCESS_KEY")
     )
-    endpoint = (os.getenv("SPACE_ENDPOINT") or "").strip().rstrip("/")
-    if not endpoint and region:
-        endpoint = f"https://{region}.digitaloceanspaces.com"
+    endpoint = _normalize_spaces_endpoint(
+        (os.getenv("SPACE_ENDPOINT") or "").strip(),
+        region,
+        bucket,
+    )
     cdn = (os.getenv("SPACE_CDN") or "").strip().rstrip("/") or None
     return bucket, region, access_key, secret_key, endpoint, cdn
 
@@ -65,10 +93,13 @@ def get_s3_client():
             "DigitalOcean Spaces not configured. Set SPACE_NAME, SPACE_REGION, "
             "ACCESS_KEY, DO_SPACES_SECRET_KEY, and SPACE_ENDPOINT."
         )
+    from botocore.client import Config
+
     return boto3.client(
         "s3",
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
         endpoint_url=endpoint,
         region_name=region,
+        config=Config(signature_version="s3v4"),
     ), bucket
