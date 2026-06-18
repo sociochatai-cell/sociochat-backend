@@ -88,6 +88,27 @@ class PlanFeatureAccess(db.Model):
         }
 
 
+class UserFeatureAccess(db.Model):
+    __tablename__ = "user_feature_access"
+    __table_args__ = (
+        db.UniqueConstraint("user_id", "feature_key", name="uq_user_feature"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    feature_key = db.Column(db.String(64), nullable=False, index=True)
+    enabled = db.Column(db.Boolean, nullable=False, default=True)
+    limit_value = db.Column(db.Integer, nullable=True)  # reserved for future; not used by logic now
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "user_id": self.user_id,
+            "feature_key": self.feature_key,
+            "enabled": self.enabled,
+            "limit_value": self.limit_value,
+        }
+
+
 class PlanConfigAuditLog(db.Model):
     __tablename__ = "plan_config_audit_logs"
 

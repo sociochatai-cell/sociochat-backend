@@ -913,6 +913,137 @@ def admin_update_plan_features(admin, slug):
     return jsonify({"success": True, "message": "features_updated"})
 
 
+@subscription_bp.route("/admin/users/<int:user_id>/features", methods=["GET"])
+@require_admin
+def admin_get_user_features(admin, user_id):
+    """
+    GET /api/subscription/admin/users/<user_id>/features
+
+    Return access-type features, plan defaults, and per-user overrides.
+    """
+    from subscription.plan_models import SubscriptionFeature, UserFeatureAccess
+    from subscription.service import load_plan_matrix, LIMIT_KEYS
+
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"success": False, "error": "user_not_found"}), 404
+
+    feats = SubscriptionFeature.query.filter_by(
+        is_active=True, feature_type="access"
+    ).order_by(SubscriptionFeature.sort_order).all()
+
+    matrix = load_plan_matrix(get_user_plan(user))
+    plan_defaults = {f.key: bool(matrix.get(f.key, False)) for f in feats}
+
+    overrides = {
+        ov.feature_key: bool(ov.enabled)
+        for ov in UserFeatureAccess.query.filter_by(user_id=user.id)
+        if ov.feature_key not in LIMIT_KEYS
+    }
+
+    return jsonify({
+        "success": True,
+        "user": {
+            "id": user.id,
+            "name": user.name,
+            "email": user.email,
+            "plan": user.plan or "beta",
+            "billing_scope": getattr(user, "billing_scope", None) or BILLING_SCOPE_GLOBAL,
+        },
+        "features": [f.to_dict() for f in feats],
+        "plan_defaults": plan_defaults,
+        "overrides": overrides,
+    })
+
+
+@subscription_bp.route("/admin/users/<int:user_id>/features", methods=["PUT"])
+@require_admin
+def admin_update_user_features(admin, user_id):
+    """
+    PUT /api/subscription/admin/users/<user_id>/features
+
+    Body: {"overrides": {"<feature_key>": true|false|null}}
+    - true  -> force ON
+    - false -> force OFF
+    - null  -> reset (inherit from plan)
+    """
+    from subscription.plan_models import SubscriptionFeature, UserFeatureAccess, PlanConfigAuditLog
+    from subscription.service import LIMIT_KEYS
+
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"success": False, "error": "user_not_found"}), 404
+
+    data = request.get_json() or {}
+    overrides = data.get("overrides")
+    if not isinstance(overrides, dict):
+        return jsonify({"success": False, "error": "overrides_required"}), 400
+
+    valid_keys = {
+        f.key for f in SubscriptionFeature.query.filter_by(
+            is_active=True, feature_type="access"
+        ).all()
+    }
+
+    def _state_str(val):
+        if val is None:
+            return "inherit"
+        return "on" if val else "off"
+
+    for key, val in overrides.items():
+        if key not in valid_keys or key in LIMIT_KEYS:
+            continue
+
+        row = UserFeatureAccess.query.filter_by(user_id=user.id, feature_key=key).first()
+        if row is not None:
+            old_state = "on" if row.enabled else "off"
+        else:
+            old_state = "inherit"
+
+        if val is None:
+            if row is not None:
+                db.session.delete(row)
+            new_state = "inherit"
+        else:
+            enabled = bool(val)
+            if row is not None:
+                row.enabled = enabled
+            else:
+                db.session.add(UserFeatureAccess(
+                    user_id=user.id,
+                    feature_key=key,
+                    enabled=enabled,
+                ))
+            new_state = _state_str(enabled)
+
+        db.session.add(PlanConfigAuditLog(
+            admin_id=admin.id,
+            admin_email=admin.email,
+            action="update_user_feature_access",
+            plan_slug=user.plan,
+            feature_key=key,
+            old_value=old_state,
+            new_value=new_state,
+        ))
+
+    db.session.commit()
+
+    try:
+        from monolith_integration.trigger import schedule_capabilities_resync_for_user
+        schedule_capabilities_resync_for_user(int(user.id), reason="user_feature_override")
+    except Exception:
+        pass
+
+    return jsonify({
+        "success": True,
+        "overrides": {
+            ov.feature_key: bool(ov.enabled)
+            for ov in UserFeatureAccess.query.filter_by(user_id=user.id)
+            if ov.feature_key not in LIMIT_KEYS
+        },
+    })
+
+
 @subscription_bp.route("/admin/audit", methods=["GET"])
 @require_admin
 def admin_plan_audit(admin):

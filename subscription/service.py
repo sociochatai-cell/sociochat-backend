@@ -147,10 +147,24 @@ def get_user_plan(user: User) -> str:
     return get_effective_plan_slug(user)
 
 
+def load_user_matrix(user) -> dict:
+    """Plan matrix with per-user access overrides applied on top."""
+    plan = get_user_plan(user)
+    matrix = load_plan_matrix(plan)
+    if not user:
+        return matrix
+    from subscription.plan_models import UserFeatureAccess
+    for ov in UserFeatureAccess.query.filter_by(user_id=user.id).all():
+        if ov.feature_key in LIMIT_KEYS:
+            continue  # access-only overrides
+        matrix[ov.feature_key] = bool(ov.enabled)
+    return matrix
+
+
 def get_plan_limits(user: User) -> dict:
     """Get all limits and feature access for user's current plan."""
     plan = get_user_plan(user)
-    matrix = load_plan_matrix(plan)
+    matrix = load_user_matrix(user)
 
     limits = {
         "workspaces": matrix.get("workspaces", 1),
@@ -190,7 +204,7 @@ def check_feature_access(user: User, feature: str) -> Tuple[bool, Optional[str]]
         return False, "Your subscription has expired. Please renew or upgrade your plan."
 
     plan = get_user_plan(user)
-    matrix = load_plan_matrix(plan)
+    matrix = load_user_matrix(user)
 
     if feature in LIMIT_KEYS:
         limit = matrix.get(feature, 0)
