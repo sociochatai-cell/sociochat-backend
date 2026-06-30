@@ -69,6 +69,15 @@ from .coexistence_routes import coexistence_bp
 from .catalog_routes import catalog_bp
 from .tracking_routes import tracking_bp, tracking_redirect_bp
 
+# Flow + dataset + scheduler blueprints (flow_os_routes/dataset_routes are target-only modules
+# kept from the multi-tenant app; flow_routes/flow_testing/flow_endpoint/scheduler_routes are shared).
+from .flow_routes import flow_bp
+from .flow_testing import flow_testing_bp
+from .flow_endpoint import flow_endpoint_bp
+from .flow_os_routes import flow_os_bp, bookings_bp
+from .dataset_routes import dataset_bp
+from .scheduler_routes import scheduler_bp
+
 __all__ = [
     "whatsapp_bp",
     "automation_bp",
@@ -86,6 +95,13 @@ __all__ = [
     "tracking_bp",
     "tracking_redirect_bp",
     "verification_bp",
+    "flow_bp",
+    "flow_testing_bp",
+    "flow_endpoint_bp",
+    "flow_os_bp",
+    "bookings_bp",
+    "dataset_bp",
+    "scheduler_bp",
     "WhatsAppAccount",
     "WhatsAppConversation",
     "WhatsAppMessage",
