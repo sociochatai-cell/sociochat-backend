@@ -480,6 +480,15 @@ with app.app_context():
     except Exception as e:
         logger.warning(f"WhatsApp schema patch skipped: {e}")
 
+    # Generic expand-only sync: add ANY ORM column missing from existing whatsapp_* tables
+    # (covers the ~60 newer columns the fixed .sql migrations above never added). Nullable +
+    # idempotent, so it's safe on prod tables with existing rows and a no-op on a fresh DB.
+    try:
+        from core.whatsapp_schema_patch import ensure_whatsapp_orm_columns_full
+        ensure_whatsapp_orm_columns_full(db.engine)
+    except Exception as e:
+        logger.warning(f"WhatsApp ORM column sync skipped: {e}")
+
     # Appointment-reminder columns on existing FlowOS tables (idempotent).
     # create_all() won't ALTER existing tables, so add the new columns here.
     try:

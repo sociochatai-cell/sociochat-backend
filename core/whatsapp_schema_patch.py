@@ -429,3 +429,62 @@ def ensure_whatsapp_accounts_orm_columns(engine: Engine) -> None:
     )
     if is_non_dev_environment():
         sys.exit(1)
+
+
+def ensure_whatsapp_orm_columns_full(engine: Engine) -> None:
+    """Generic expand-only schema sync for EVERY ``whatsapp_*`` table.
+
+    The targeted migrations above (010/011/012, FK cascades) only cover a fixed set of
+    columns. The ORM models have since grown more columns (notification_email, warmup_config,
+    trust_score, ...) that the .sql migrations never added, so an existing prod DB stays
+    under-migrated and ORM SELECTs 500 with UndefinedColumn.
+
+    This compares each whatsapp_* table's ORM columns against the live DB and ``ALTER TABLE
+    ... ADD COLUMN IF NOT EXISTS`` for any that are missing, always NULLABLE (safe on tables
+    that already have rows). Idempotent + concurrency-safe via IF NOT EXISTS; new tables are
+    left to create_all(). Scoped to whatsapp_* so tenant/CRM/core tables are never touched.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    if not _auto_schema_patch_allowed():
+        return
+    try:
+        from sqlalchemy import inspect as _sa_inspect
+        from models import db as _db
+    except Exception:
+        logger.exception("WHATSAPP_ORM_COLUMN_SYNC: could not import db/inspect")
+        return
+
+    insp = _sa_inspect(engine)
+    added = 0
+    for table_name, table in _db.metadata.tables.items():
+        if not table_name.startswith("whatsapp"):
+            continue
+        try:
+            if not insp.has_table(table_name):
+                continue  # brand-new table -> create_all() builds it fully
+            existing = {c["name"] for c in insp.get_columns(table_name)}
+        except Exception:
+            continue
+        for col in table.columns:
+            if col.name in existing:
+                continue
+            try:
+                coltype = col.type.compile(dialect=engine.dialect)
+            except Exception:
+                coltype = "TEXT"
+            ddl = f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS "{col.name}" {coltype}'
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(ddl))
+                added += 1
+                logger.info("WHATSAPP_ORM_COLUMN_SYNC added %s.%s (%s)", table_name, col.name, coltype)
+            except Exception as exc:
+                logger.warning("WHATSAPP_ORM_COLUMN_SYNC skip %s.%s: %s", table_name, col.name, exc)
+
+    if added:
+        logger.warning(
+            "WHATSAPP_ORM_COLUMN_SYNC: added %s missing column(s) to existing whatsapp_* tables", added
+        )
+    else:
+        logger.info("WHATSAPP_ORM_COLUMN_SYNC: no missing columns")
