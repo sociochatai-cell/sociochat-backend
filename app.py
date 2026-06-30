@@ -370,6 +370,30 @@ app.register_blueprint(tracking_redirect_bp)
 app.register_blueprint(scheduler_bp, url_prefix="/api/internal/scheduler")
 app.register_blueprint(usage_events_internal_bp, url_prefix="/api/internal/whatsapp")
 
+# Source full-parity feature blueprints: warmup, onboarding, lead-growth, verification,
+# trust snapshots, capabilities + admin-verification (internal). Each registration is wrapped
+# so a single import/registration failure cannot break app startup.
+def _register_optional_wa_blueprint(import_path, attr, url_prefix=None):
+    try:
+        import importlib
+        mod = importlib.import_module(import_path)
+        bp = getattr(mod, attr)
+        if url_prefix:
+            app.register_blueprint(bp, url_prefix=url_prefix)
+        else:
+            app.register_blueprint(bp)
+    except Exception as _e:
+        import logging
+        logging.getLogger(__name__).warning("WA optional blueprint %s.%s skipped: %s", import_path, attr, _e)
+
+_register_optional_wa_blueprint("whatsapp.onboarding_routes", "onboarding_bp", "/api/whatsapp/onboarding")
+_register_optional_wa_blueprint("whatsapp.warmup_routes", "warmup_bp", "/api/whatsapp/warmup")
+_register_optional_wa_blueprint("whatsapp.trust_snapshot_routes", "trust_snapshot_bp", "/api/whatsapp")
+_register_optional_wa_blueprint("whatsapp.lead_growth_routes", "lead_growth_bp")
+_register_optional_wa_blueprint("whatsapp.verification_routes", "verification_bp", "/api/whatsapp")
+_register_optional_wa_blueprint("whatsapp.capabilities_routes", "capabilities_internal_bp", "/api/internal/whatsapp")
+_register_optional_wa_blueprint("whatsapp.admin_verification_routes", "admin_verification_internal_bp", "/api/internal/whatsapp")
+
 # Subscription / billing
 from subscription.routes import subscription_bp
 from admin_routes import admin_bp, ensure_default_admin
