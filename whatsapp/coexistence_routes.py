@@ -224,8 +224,11 @@ def connect_coexistence():
     if not code and not access_token_direct:
         return jsonify({"success": False, "error": "Authorization code or access_token is required"}), 400
     
-    app_id = os.getenv("FB_APP_ID")
-    app_secret = os.getenv("FB_APP_SECRET")
+    # Resolve the tenant's Meta app (env fallback for T0000 / unconfigured).
+    from tenant.integration import get_tenant_meta_config
+    cfg = get_tenant_meta_config(workspace_id=workspace_id)
+    app_id = cfg.app_id or os.getenv("FB_APP_ID")
+    app_secret = cfg.app_secret or os.getenv("FB_APP_SECRET")
 
     if not app_id or not app_secret:
         return jsonify({

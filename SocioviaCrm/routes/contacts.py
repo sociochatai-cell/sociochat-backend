@@ -22,6 +22,43 @@ def _get_activity_model():
         return None
 
 
+def _get_workspace_from_request():
+    """Resolve the active workspace id from query param or X-Workspace-ID header.
+    Returns the raw string value or None. Ownership is validated by the global
+    before_request hook when this value is present."""
+    ws = request.args.get("workspace_id") or request.headers.get("X-Workspace-ID")
+    return str(ws) if ws else None
+
+
+def _require_workspace_id():
+    """Fail-closed resolver. Returns (wid:int, None) on success, or
+    (None, (response, status)) on failure so callers can `return err`."""
+    raw = _get_workspace_from_request()
+    if not raw:
+        return None, (jsonify({"success": False, "error": "workspace_required"}), 400)
+    try:
+        return int(raw), None
+    except (TypeError, ValueError):
+        return None, (jsonify({"success": False, "error": "invalid_workspace_id"}), 400)
+
+
+# Valid activity_type enum values. Keep in sync with the DB enum so we never
+# attempt to insert an unknown label (which would 500 on commit).
+ALLOWED_ACTIVITY_TYPES = {
+    "email_opened", "page_visit", "call", "note_created",
+    "status_change", "stage_change", "deal_created", "meeting",
+}
+
+
+def normalize_activity_type(t):
+    """Normalize an incoming activity type to a known enum label.
+    Falls back to 'note_created' for missing/unknown values."""
+    if not t:
+        return "note_created"
+    tt = str(t).strip().lower()
+    return tt if tt in ALLOWED_ACTIVITY_TYPES else "note_created"
+
+
 def _get_request_user_id():
     uid = session.get("user_id")
     if uid:
@@ -129,6 +166,11 @@ def list_contacts():
 
     columns = _model_columns(Contact)
 
+    # SECURITY: workspace_id is REQUIRED to prevent cross-workspace data leakage.
+    wid, err = _require_workspace_id()
+    if err:
+        return err
+
     page = int(request.args.get("page", 1))
     per_page = int(request.args.get("per_page", 25))
     sort_by = request.args.get("sort_by", None)
@@ -136,8 +178,12 @@ def list_contacts():
 
     q = db.session.query(Contact)
 
+    # Always scope by the active workspace.
+    if "workspace_id" in columns:
+        q = q.filter(Contact.workspace_id == wid)
+
     # filter by any supported queryable fields (only apply if model has them)
-    for param_name in ("workspace_id", "user_id", "email", "name", "company", "phone", "external_source", "external_id"):
+    for param_name in ("user_id", "email", "name", "company", "phone", "external_source", "external_id"):
         val = request.args.get(param_name)
         if val and param_name in columns:
             col_obj = getattr(Contact, param_name)
@@ -208,8 +254,12 @@ def get_contact(contact_id):
     if not Contact:
         return jsonify({"error": "Contact model not configured"}), 500
 
-    # contact_id is a string (UUID or text)
-    c = db.session.get(Contact, contact_id)
+    wid, err = _require_workspace_id()
+    if err:
+        return err
+
+    # contact_id is a string (UUID or text); scope the lookup to the active workspace.
+    c = db.session.query(Contact).filter_by(id=contact_id, workspace_id=wid).one_or_none()
     if not c:
         return jsonify({"error": "not found"}), 404
 
@@ -582,8 +632,12 @@ def update_contact(contact_id):
     if not Contact:
         return jsonify({"error": "Contact model not configured"}), 500
 
+    wid, err = _require_workspace_id()
+    if err:
+        return err
+
     body = request.get_json(silent=True) or {}
-    c = db.session.get(Contact, contact_id)
+    c = db.session.query(Contact).filter_by(id=contact_id, workspace_id=wid).one_or_none()
     if not c:
         return jsonify({"error": "not found"}), 404
 
@@ -626,7 +680,11 @@ def delete_contact(contact_id):
     if not Contact:
         return jsonify({"error": "Contact model not configured"}), 500
 
-    c = db.session.get(Contact, contact_id)
+    wid, err = _require_workspace_id()
+    if err:
+        return err
+
+    c = db.session.query(Contact).filter_by(id=contact_id, workspace_id=wid).one_or_none()
     if not c:
         return jsonify({"error": "not found"}), 404
     try:
@@ -647,15 +705,27 @@ def delete_contact(contact_id):
 def contact_history(contact_id):
     db = current_app.db
     Activity = _get_activity_model()
+    Contact = _get_contact_model()
     if not Activity:
         return jsonify([])
 
-    acts = (
+    wid, err = _require_workspace_id()
+    if err:
+        return err
+
+    # Verify the contact belongs to the active workspace before exposing history.
+    if Contact:
+        contact_obj = db.session.query(Contact).filter_by(id=contact_id, workspace_id=wid).one_or_none()
+        if not contact_obj:
+            return jsonify({"error": "contact not found"}), 404
+
+    aq = (
         db.session.query(Activity)
         .filter(Activity.entity_type == "contact", Activity.entity_id == contact_id)
-        .order_by(Activity.timestamp.desc())
-        .all()
     )
+    if hasattr(Activity, "workspace_id"):
+        aq = aq.filter(Activity.workspace_id == wid)
+    acts = aq.order_by(Activity.timestamp.desc()).all()
     out = []
     for a in acts:
         out.append({
@@ -679,7 +749,11 @@ def add_contact_history(contact_id):
     if not Activity or not Contact:
         return jsonify({"error": "Activity or Contact model not configured"}), 500
 
-    contact_obj = db.session.get(Contact, contact_id)
+    wid, err = _require_workspace_id()
+    if err:
+        return err
+
+    contact_obj = db.session.query(Contact).filter_by(id=contact_id, workspace_id=wid).one_or_none()
     if not contact_obj:
         return jsonify({"error": "contact not found"}), 404
 
@@ -692,11 +766,12 @@ def add_contact_history(contact_id):
         except Exception:
             ts = datetime.utcnow()
 
+        incoming_type = payload.get("type") or payload.get("activity_type")
         activity_kwargs = {
             "entity_type": "contact",
             "entity_id": contact_id,
-            "type": payload.get("type") or payload.get("activity_type") or "note",
-            "title": payload.get("title") or (payload.get("type") or "History"),
+            "type": normalize_activity_type(incoming_type),
+            "title": payload.get("title") or (incoming_type or "History"),
             "description": payload.get("description"),
             "timestamp": ts,
         }

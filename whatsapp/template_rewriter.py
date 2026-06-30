@@ -56,12 +56,21 @@ class TemplateRewriter:
     - ❌ Never convert Marketing → Utility if promotional
     """
     
-    def __init__(self):
-        """Initialize Gemini client."""
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    def __init__(self, workspace_id: Optional[str] = None):
+        """Initialize Gemini client.
+
+        When a ``workspace_id`` is supplied, the tenant's own Gemini API key is
+        used (so the tenant is billed on their own AI quota). The resolver falls
+        back to the global env key, so for T0000 / unset / no-workspace this is
+        byte-identical to reading GEMINI_API_KEY directly.
+        """
+        # Lazy import keeps the tenant package out of the import-time graph.
+        from tenant.integration import get_tenant_ai_config
+        cfg = get_tenant_ai_config(workspace_id=workspace_id)
+        api_key = cfg.gemini_api_key
         if api_key:
             genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel("gemini-1.5-flash")
+            self.model = genai.GenerativeModel("gemini-3.1-flash-lite")
         else:
             self.model = None
     
@@ -271,13 +280,17 @@ def rewrite_template(
     target_category: str,
     mode: str = RewriteMode.NEUTRAL_UTILITY,
     current_category: Optional[str] = None,
+    workspace_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Rewrite a template and return results as dict.
-    
+
     Convenience wrapper for API routes.
+
+    Pass ``workspace_id`` to bill the tenant's own Gemini key; when omitted the
+    resolver falls back to the global env key (byte-identical to before).
     """
-    rewriter = TemplateRewriter()
+    rewriter = TemplateRewriter(workspace_id=workspace_id)
     result = rewriter.rewrite(
         body=body,
         target_category=target_category,

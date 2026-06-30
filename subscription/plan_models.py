@@ -13,11 +13,17 @@ class SubscriptionPlan(db.Model):
     slug = db.Column(db.String(32), unique=True, nullable=False, index=True)
     name = db.Column(db.String(64), nullable=False)
     description = db.Column(db.Text, nullable=True)
+    # Short promotional note written by an admin, shown to the end user.
+    offer_text = db.Column(db.Text, nullable=True)
     price_monthly_inr = db.Column(db.Integer, nullable=True)
+    # Billing cadence for END-USER plans: monthly | quarterly | yearly
+    billing_period = db.Column(db.String(16), nullable=False, default="monthly")
     is_public = db.Column(db.Boolean, nullable=False, default=True)
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     # global = public catalog; private = private-slot-only plans
     plan_scope = db.Column(db.String(16), nullable=False, default="global", index=True)
+    # NULL = global catalog plan; set = a custom plan belonging to exactly one tenant.
+    tenant_id = db.Column(db.Integer, nullable=True, index=True)
     sort_order = db.Column(db.Integer, nullable=False, default=0)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = db.Column(
@@ -32,10 +38,13 @@ class SubscriptionPlan(db.Model):
             "slug": self.slug,
             "name": self.name,
             "description": self.description,
+            "offer_text": self.offer_text,
             "price_monthly_inr": self.price_monthly_inr,
+            "billing_period": self.billing_period,
             "is_public": self.is_public,
             "is_active": self.is_active,
             "plan_scope": self.plan_scope,
+            "tenant_id": self.tenant_id,
             "sort_order": self.sort_order,
         }
 

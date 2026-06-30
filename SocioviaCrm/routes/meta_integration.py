@@ -51,7 +51,7 @@ def get_genai_client():
 
 logger = logging.getLogger("sociovia.meta_integration")
 
-GENAI_MODEL = os.getenv("TEXT_MODEL", "gemini-2.0-flash")  # Read from env, fallback to stable model
+GENAI_MODEL = os.getenv("TEXT_MODEL", "gemini-3.1-flash-lite")  # Read from env, fallback to stable model
 GENAI_TEMPERATURE = 0.7
 GENAI_MAX_TOKENS = 1000
 
@@ -1375,7 +1375,7 @@ def generate_targeting():
     
     try:
         response = client.models.generate_content(
-            model="gemini-2.0-flash-exp", 
+            model="gemini-3.1-flash-lite",
             contents=prompt
         )
         text = response.text

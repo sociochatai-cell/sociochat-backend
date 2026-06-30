@@ -32,3 +32,12 @@ knowledge_base/
 
 # Test output
 test_output.txt
+
+# --- safety additions (wa-rebase) ---
+env.yaml
+.env
+.env.*
+myenv/
+__pycache__/
+*.pyc
+instance/

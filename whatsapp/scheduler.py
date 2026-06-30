@@ -62,6 +62,51 @@ def execute_campaign_job(campaign_id):
         logger.exception(f"[SCHEDULER] Error executing campaign {campaign_id}: {e}")
 
 
+def execute_booking_reminder(booking_id):
+    """Send an appointment reminder with proper Flask app context.
+    This is the function APScheduler calls at the booking's remind_at time."""
+    logger.info(f"[SCHEDULER] execute_booking_reminder called for booking {booking_id}")
+
+    if _flask_app is None:
+        logger.error("[SCHEDULER] Flask app not initialized - cannot send booking reminder")
+        return
+
+    try:
+        with _flask_app.app_context():
+            from .booking_reminders import send_booking_reminder
+            send_booking_reminder(booking_id)
+            logger.info(f"[SCHEDULER] Completed booking reminder {booking_id}")
+    except Exception as e:
+        logger.exception(f"[SCHEDULER] Error sending booking reminder {booking_id}: {e}")
+
+
+def add_booking_reminder_job(booking_id, run_date):
+    """Schedule a one-off appointment reminder at run_date (a tz-aware UTC datetime)."""
+    if not scheduler:
+        logger.error("Scheduler not initialized")
+        return None
+
+    job_id = f"booking_reminder_{booking_id}"
+
+    try:
+        scheduler.remove_job(job_id)
+        logger.info(f"Removed existing job {job_id}")
+    except Exception:
+        pass
+
+    job = scheduler.add_job(
+        execute_booking_reminder,
+        'date',
+        run_date=run_date,
+        args=[booking_id],
+        id=job_id,
+        replace_existing=True,
+        misfire_grace_time=300,  # 5 min grace if the process was busy/restarting
+    )
+    logger.info(f"[SCHEDULER] Scheduled booking reminder {job_id} for {run_date}")
+    return job.id
+
+
 def add_campaign_job(campaign_id, run_date, func=None):
     """
     Schedule a campaign processing job at a specific time.

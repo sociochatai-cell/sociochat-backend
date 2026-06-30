@@ -1,4 +1,7 @@
 venv/
+myenv/
+env/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -8,3 +11,8 @@ knowledge_base/
 .git/
 .gitignore
 *.md
+.env
+.env.*
+env.yaml
+node_modules/
+*.log

@@ -33,11 +33,13 @@ def ensure_default_admin() -> None:
 
 
 def get_current_admin():
-    admin_id = session.get("admin_id") or request.headers.get("X-Admin-Id")
-    if not admin_id:
+    # Session OR a SIGNED admin JWT only — X-Admin-Id header is no longer trusted.
+    from auth_core import authenticated_admin_id
+    aid = authenticated_admin_id()
+    if aid is None:
         return None
     try:
-        return db.session.get(Admin, int(admin_id))
+        return db.session.get(Admin, aid)
     except (TypeError, ValueError):
         return None
 
@@ -81,35 +83,87 @@ def _audit(admin: Admin, action: str, user_id: int | None = None, meta: dict | N
 
 @admin_bp.route("/api/admin/login", methods=["POST"])
 def admin_login():
+    from tenant.models import Tenant
+    from tenant.branding import INTERNAL_TENANT_CODE
+
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
+    code = (data.get("tenant_code") or "").strip().upper()
 
     if not email or not password:
         return jsonify({"success": False, "error": "email_password_required"}), 400
 
-    admin = Admin.query.filter_by(email=email).first()
-    if admin and check_password_hash(admin.password_hash, password):
+    def _super_admin_response(admin: Admin):
+        from auth_core import create_admin_token
         session["admin_id"] = admin.id
         session.modified = True
         return jsonify({
             "success": True,
+            "role": "super_admin",
+            "token": create_admin_token(admin.id, admin.email),
             "user": {"id": admin.id, "email": admin.email, "role": "admin", "name": "Administrator"},
+            "redirect": "/superadmin/tenants",
         })
 
-    # Bootstrap login with default credentials
-    if email == DEFAULT_ADMIN_EMAIL and password == DEFAULT_ADMIN_PASSWORD:
-        ensure_default_admin()
-        admin = Admin.query.filter_by(email=DEFAULT_ADMIN_EMAIL).first()
-        if admin:
-            session["admin_id"] = admin.id
-            session.modified = True
-            return jsonify({
-                "success": True,
-                "user": {"id": admin.id, "email": admin.email, "role": "admin", "name": "Administrator"},
-            })
+    # 1. Super Admin path — empty code or the internal tenant code.
+    if code == "" or code == INTERNAL_TENANT_CODE:
+        admin = Admin.query.filter_by(email=email).first()
+        if admin and check_password_hash(admin.password_hash, password):
+            return _super_admin_response(admin)
 
-    return jsonify({"success": False, "error": "invalid_credentials"}), 401
+        # Bootstrap login with default credentials
+        if email == DEFAULT_ADMIN_EMAIL and password == DEFAULT_ADMIN_PASSWORD:
+            ensure_default_admin()
+            admin = Admin.query.filter_by(email=DEFAULT_ADMIN_EMAIL).first()
+            if admin:
+                return _super_admin_response(admin)
+
+        # Admin auth failed. With an empty code, behavior is unchanged (401).
+        # With T0000, fall through so the internal tenant's tenant_admin can
+        # still sign in via the internal code.
+        if code == "":
+            return jsonify({"success": False, "error": "invalid_credentials"}), 401
+
+    # 2. Tenant Admin path — a real tenant code (or T0000 fall-through).
+    tenant = Tenant.query.filter_by(tenant_code=code).first()
+    if not tenant:
+        return jsonify({"success": False, "error": "invalid_credentials"}), 401
+    if tenant.status == "suspended":
+        return jsonify({"success": False, "error": "tenant_suspended"}), 403
+
+    user = User.query.filter_by(tenant_id=tenant.id, email=email).first()
+    if not user or not check_password_hash(user.password_hash, password):
+        return jsonify({"success": False, "error": "invalid_credentials"}), 401
+    if user.role not in ("tenant_admin", "admin"):
+        return jsonify({"success": False, "error": "not_an_admin"}), 403
+
+    # Establish a normal user session for the tenant admin.
+    session["user_id"] = user.id
+    session.pop("admin_id", None)
+    session.modified = True
+
+    from auth_core import create_user_token
+    workspaces = Workspace.query.filter_by(user_id=user.id).all()
+    return jsonify({
+        "success": True,
+        "role": "tenant_admin",
+        "token": create_user_token(user.id, user.email),
+        "user": {
+            "id": user.id,
+            "name": user.name,
+            "email": user.email,
+            "role": user.role,
+            "tenant_id": user.tenant_id,
+        },
+        "tenant": {
+            "tenant_code": tenant.tenant_code,
+            "company_name": tenant.company_name,
+            "branding": tenant.branding_dict(),
+        },
+        "workspaces": [{"id": w.id, "business_name": w.business_name} for w in workspaces],
+        "redirect": "/tenant-admin",
+    })
 
 
 @admin_bp.route("/api/admin/logout", methods=["POST"])
@@ -124,17 +178,35 @@ def admin_me(admin):
     return jsonify({"success": True, "admin": {"id": admin.id, "email": admin.email, "role": "admin"}})
 
 
+def _internal_user_filter(query):
+    """Restrict a User query to the platform's OWN tenant (T0000).
+
+    The Super Admin's "Users" portal manages the platform's own application
+    users only — tenant users are managed under Tenant Management, kept fully
+    separate. Legacy rows with NULL tenant_id are treated as internal.
+    """
+    from sqlalchemy import or_
+    from tenant.models import Tenant
+    from tenant.branding import INTERNAL_TENANT_CODE
+
+    internal = Tenant.query.filter_by(tenant_code=INTERNAL_TENANT_CODE).first()
+    if internal:
+        return query.filter(or_(User.tenant_id == internal.id, User.tenant_id.is_(None)))
+    return query
+
+
 @admin_bp.route("/api/admin/users", methods=["GET"])
 @require_admin
 def list_users(admin):
-    users = User.query.order_by(User.created_at.desc()).all()
+    users = _internal_user_filter(User.query).order_by(User.created_at.desc()).all()
     return jsonify([serialize_user(u) for u in users])
 
 
 @admin_bp.route("/api/admin/review", methods=["POST"])
 @require_admin
 def review_users(admin):
-    users = User.query.filter_by(status="under_review").order_by(User.created_at.desc()).all()
+    users = (_internal_user_filter(User.query.filter_by(status="under_review"))
+             .order_by(User.created_at.desc()).all())
     return jsonify({
         "success": True,
         "users": [serialize_user(u) for u in users],

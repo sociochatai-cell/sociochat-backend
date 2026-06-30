@@ -95,6 +95,45 @@ def scheduler_tick():
         logger.warning("safe mode engine tick: %s", e)
         results["safe_mode_evaluations_error"] = str(e)
 
+    # 7. Auto-sync Google Sheet drip campaigns (enroll newly added rows)
+    try:
+        from whatsapp.drip_models import WhatsAppDripCampaign
+        from whatsapp.drip_routes import sync_sheet_campaign_internal
+
+        sheet_campaigns = WhatsAppDripCampaign.query.filter(
+            WhatsAppDripCampaign.trigger_type == "google_sheet_row",
+            WhatsAppDripCampaign.status == "active",
+            WhatsAppDripCampaign.sheet_id.isnot(None),
+        ).all()
+
+        sheet_sync_stats = {
+            "campaigns": len(sheet_campaigns),
+            "synced": 0,
+            "enrolled": 0,
+            "errors": 0,
+        }
+        for campaign in sheet_campaigns:
+            try:
+                sync_result = sync_sheet_campaign_internal(campaign.id)
+                if sync_result.get("success"):
+                    sheet_sync_stats["synced"] += 1
+                    sheet_sync_stats["enrolled"] += sync_result.get("enrolled", 0) or 0
+                else:
+                    sheet_sync_stats["errors"] += 1
+                    logger.warning(
+                        "Sheet sync failed for campaign %s: %s",
+                        campaign.id,
+                        sync_result.get("error"),
+                    )
+            except Exception as inner_e:
+                sheet_sync_stats["errors"] += 1
+                logger.warning("Sheet sync raised for campaign %s: %s", campaign.id, inner_e)
+
+        results["sheet_syncs"] = sheet_sync_stats
+    except Exception as e:
+        logger.warning("sheet sync tick: %s", e)
+        results["sheet_syncs_error"] = str(e)
+
     logger.info(f"[SCHEDULER TICK] Completed. Results: {results}")
     
     return jsonify({

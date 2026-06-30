@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 FEATURE_CATALOG: List[Tuple[str, str, str, str, str]] = [
     # key, label, category, route_path, feature_type
     ("whatsapp_inbox", "WhatsApp Inbox", "whatsapp", "/dashboard/inbox", "access"),
+    ("whatsapp_coexistence", "WhatsApp Coexistence", "whatsapp", "/dashboard/coexistence", "access"),
     ("whatsapp_templates", "Message Templates", "whatsapp", "/dashboard/templates", "access"),
     ("whatsapp_automation", "Automation", "whatsapp", "/dashboard/automation", "access"),
     ("whatsapp_drip", "Drip Campaigns", "whatsapp", "/dashboard/drip", "access"),
@@ -30,6 +31,7 @@ FEATURE_CATALOG: List[Tuple[str, str, str, str, str]] = [
     ("ai_chatbot_dashboard", "AI Chatbot Dashboard", "ai", None, "access"),
     ("human_agent_whatsapp", "Human Agent Handoff", "whatsapp", None, "access"),
     ("unified_dashboard_analytics", "Unified Dashboard", "analytics", "/dashboard/hub", "access"),
+    ("crm", "CRM", "crm", "/dashboard/crm", "access"),
     ("messages_per_day", "Messages per day", "limits", None, "limit"),
     ("interactive_flows", "Interactive flow limit", "limits", None, "limit"),
     ("workspaces", "Workspaces", "limits", None, "limit"),
@@ -190,6 +192,21 @@ def seed_subscription_catalog(force_access: bool = False) -> None:
                     elif force_access:
                         row.enabled = enabled
                         row.limit_value = limit_val
+        else:
+            # On an already-seeded DB, insert-if-missing for newly introduced
+            # catalog features so each plan gains a togglable access row without
+            # a DB wipe. Existing rows (admin edits) are never overwritten.
+            for slug, plan in plans.items():
+                for key, feat in features.items():
+                    row = PlanFeatureAccess.query.filter_by(plan_id=plan.id, feature_key=key).first()
+                    if not row:
+                        enabled, limit_val = _access_for_plan(slug, key, feat.feature_type)
+                        db.session.add(PlanFeatureAccess(
+                            plan_id=plan.id,
+                            feature_key=key,
+                            enabled=enabled,
+                            limit_value=limit_val,
+                        ))
 
         db.session.commit()
         logger.info("Subscription catalog seeded (%d plans, %d features)", len(plans), len(features))

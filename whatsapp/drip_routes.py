@@ -17,13 +17,34 @@ logger = logging.getLogger(__name__)
 drip_bp = Blueprint("drip", __name__, url_prefix="/api/whatsapp")
 
 
-def get_sheets_credentials():
+def get_sheets_credentials(workspace_id=None):
     """
     Get Google Sheets credentials from environment variable or file.
     Returns tuple: (creds_data_dict, error_message)
     If successful: (dict, None)
     If failed: (None, error_string)
+
+    When ``workspace_id`` is supplied and that tenant has configured their own
+    Google service-account JSON, it is used first (so the tenant authorizes
+    Sheets with THEIR own service account). With no workspace, no tenant
+    override, or invalid tenant JSON, this falls back to exactly the env/file
+    resolution used before — byte-identical for T0000 / unconfigured tenants.
     """
+    # Priority 0: Per-tenant service-account JSON (tenant brings their own).
+    if workspace_id:
+        try:
+            from tenant.integration import get_tenant_ai_config
+            cfg = get_tenant_ai_config(workspace_id=workspace_id)
+            if cfg.is_custom and cfg.google_sa_json:
+                try:
+                    creds_data = json.loads(cfg.google_sa_json)
+                    logger.info("Using tenant Google Sheets service-account JSON (workspace_id=%s)", workspace_id)
+                    return creds_data, None
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse tenant google_sa_json: {e}; falling back to env")
+        except Exception as e:
+            logger.warning(f"Tenant AI config resolution failed ({e}); falling back to env Sheets creds")
+
     # Priority 1: Check env variables for JSON string (supports multiple names)
     env_vars_to_check = [
         "GOOGLE_SHEETS_ACCOUNT_JSON",
@@ -64,20 +85,23 @@ def get_sheets_credentials():
     return None, "No Google Sheets credentials configured. Set GOOGLE_SHEETS_ACCOUNT_JSON in .env"
 
 
-def get_gspread_client():
+def get_gspread_client(workspace_id=None):
     """
     Get an authorized gspread client.
     Returns tuple: (gspread_client, error_message)
     If successful: (client, None)
     If failed: (None, error_string)
+
+    Pass ``workspace_id`` to authorize with the tenant's own Google
+    service-account JSON; omitting it falls back to the env/file creds.
     """
     try:
         import gspread
         from google.oauth2.service_account import Credentials
     except ImportError:
         return None, "gspread not installed. Run: pip install gspread"
-    
-    creds_data, error = get_sheets_credentials()
+
+    creds_data, error = get_sheets_credentials(workspace_id=workspace_id)
     if error:
         return None, error
     
@@ -330,7 +354,30 @@ def update_campaign(account_id: int, campaign_id: int, account: WhatsAppAccount,
             campaign.trigger_type = data["trigger_type"]
         if "status" in data:
             campaign.status = data["status"]
-            
+
+            # BUG 3 fix: When resuming a campaign (transitioning TO active/running),
+            # re-activate any enrollments the engine auto-paused when the campaign
+            # was paused. Without this they stay frozen as 'paused' forever.
+            if data["status"] in ("active", "running"):
+                try:
+                    paused_enrollments = WhatsAppDripEnrollment.query.filter_by(
+                        campaign_id=campaign_id,
+                        status="paused"
+                    ).all()
+                    reactivated = 0
+                    for enr in paused_enrollments:
+                        enr.status = "active"
+                        if enr.next_run_at is None:
+                            enr.next_run_at = datetime.now(timezone.utc)
+                        reactivated += 1
+                    logger.info(
+                        f"Resumed campaign {campaign_id}: re-activated {reactivated} paused enrollment(s)"
+                    )
+                except Exception as e:
+                    logger.exception(
+                        f"Error re-activating paused enrollments for campaign {campaign_id}: {e}"
+                    )
+
         # Update sheet configuration
         if "sheet_id" in data:
             campaign.sheet_id = data["sheet_id"]
@@ -377,12 +424,15 @@ def delete_campaign(account_id: int, campaign_id: int, account: WhatsAppAccount,
         ).delete(synchronize_session='fetch')
         logger.info(f"Deleted {deleted_steps} steps for campaign {campaign_id}")
         
-        # Delete any sheet syncs (raw SQL since model may not exist)
+        # Delete any sheet syncs (legacy table that may not exist). Run inside a
+        # SAVEPOINT: in Postgres a failed statement aborts the whole transaction,
+        # so without this the missing table would break the campaign delete below.
         try:
-            db.session.execute(
-                db.text("DELETE FROM whatsapp_sheet_syncs WHERE campaign_id = :cid"),
-                {"cid": campaign_id}
-            )
+            with db.session.begin_nested():
+                db.session.execute(
+                    db.text("DELETE FROM whatsapp_sheet_syncs WHERE campaign_id = :cid"),
+                    {"cid": campaign_id}
+                )
             logger.info(f"Deleted sheet syncs for campaign {campaign_id}")
         except Exception as sync_err:
             logger.debug(f"No sheet syncs to delete or table doesn't exist: {sync_err}")
@@ -769,11 +819,11 @@ def dataset_import_sheets(dataset_id: int):
     
     if not sheet_id:
         return jsonify({"success": False, "error": "Sheet URL is required"}), 400
-        
-    gc, error = get_gspread_client()
+
+    gc, error = get_gspread_client(workspace_id=dataset.workspace_id)
     if error:
         return jsonify({"success": False, "error": error}), 500
-        
+
     try:
         # Extract ID
         actual_sheet_id = sheet_id
@@ -781,7 +831,7 @@ def dataset_import_sheets(dataset_id: int):
             match = re.search(r'/d/([a-zA-Z0-9-_]+)', sheet_id)
             if match:
                 actual_sheet_id = match.group(1)
-        
+
         spreadsheet = gc.open_by_key(actual_sheet_id)
         try:
             worksheet = spreadsheet.worksheet(sheet_name)
@@ -1593,8 +1643,8 @@ def sync_sheet_campaign(campaign_id: int):
                 "success": False,
                 "error": "No Google Sheet URL configured for this campaign"
             }), 400
-        
-        gc, error = get_gspread_client()
+
+        gc, error = get_gspread_client(workspace_id=campaign.workspace_id)
         if error:
             return jsonify({
                 "success": False,
@@ -1791,8 +1841,8 @@ def sync_sheet_campaign_internal(campaign_id: int) -> dict:
         
         if not campaign.sheet_id:
             return {"success": False, "error": "No sheet URL configured"}
-        
-        gc, error = get_gspread_client()
+
+        gc, error = get_gspread_client(workspace_id=campaign.workspace_id)
         if error:
             return {"success": False, "error": error}
         
@@ -2180,28 +2230,43 @@ def bulk_enroll(account_id: int, campaign_id: int, account: WhatsAppAccount, wor
             phone = str(phone).strip()
             if not phone:
                 continue
-                
+
             # Basic validation
             clean_phone = "".join(filter(str.isdigit, phone))
             if len(clean_phone) < 10:
                 skipped += 1
                 continue
-                
+
+            # BUG 5 fix: Normalize the phone the same way /enroll and the CRM
+            # paths do, so dedup and storage are consistent across all paths.
+            phone = normalize_phone_number(phone)
+            if not phone:
+                skipped += 1
+                continue
+
+            # BUG 5 fix: If the campaign has no step_order=1 step, an enrollment
+            # would be created with next_run_at=None and could never fire. Skip
+            # such phones instead of creating a dead enrollment.
+            if not first_step:
+                logger.warning(
+                    f"Skipping bulk-enroll of {phone}: campaign {campaign_id} has no step_order=1 step"
+                )
+                skipped += 1
+                continue
+
             # Check if already enrolled
             existing = WhatsAppDripEnrollment.query.filter_by(
                 campaign_id=campaign_id,
                 phone_number=phone,
                 status="active"
             ).first()
-            
+
             if existing:
                 skipped += 1
                 continue
-            
-            next_run = None
-            if first_step:
-                next_run = datetime.now(timezone.utc) + timedelta(seconds=first_step.delay_seconds)
-            
+
+            next_run = datetime.now(timezone.utc) + timedelta(seconds=first_step.delay_seconds)
+
             enrollment = WhatsAppDripEnrollment(
                 campaign_id=campaign_id,
                 phone_number=phone,
@@ -2446,11 +2511,11 @@ def import_contacts_sheet(account_id: int, campaign_id: int, account: WhatsAppAc
     
     if not sheet_url:
         return jsonify({"error": "Sheet URL is required"}), 400
-        
-    gc, error = get_gspread_client()
+
+    gc, error = get_gspread_client(workspace_id=workspace_id)
     if error:
         return jsonify({"error": error}), 500
-        
+
     try:
         campaign = WhatsAppDripCampaign.query.filter_by(
             id=campaign_id,

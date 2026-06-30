@@ -30,6 +30,23 @@ def _get_activity_model():
         return None
 
 
+# Valid activity_type enum values. Keep in sync with the DB enum so we never
+# attempt to insert an unknown label (which would 500 on commit).
+ALLOWED_ACTIVITY_TYPES = {
+    "email_opened", "page_visit", "call", "note_created",
+    "status_change", "stage_change", "deal_created", "meeting",
+}
+
+
+def normalize_activity_type(t):
+    """Normalize an incoming activity type to a known enum label.
+    Falls back to 'note_created' for missing/unknown values."""
+    if not t:
+        return "note_created"
+    tt = str(t).strip().lower()
+    return tt if tt in ALLOWED_ACTIVITY_TYPES else "note_created"
+
+
 def _get_request_user_id():
     """
     Try to determine user_id from:
@@ -377,6 +394,91 @@ def create_lead():
     return jsonify({"id": l.id}), 201
 
 
+# --------- Create Lead from WhatsApp Conversation ---------
+@bp.route("/from-conversation", methods=["POST"])
+def lead_from_conversation():
+    """
+    Promote a WhatsApp conversation to a CRM Lead.
+
+    Body: {"conversation_id": <id>, "name"?: str, "status"?: str}
+
+    Uses the shared SocioviaCrm.lead_ingest.upsert_lead_from_conversation bridge
+    (the same logic the inbound webhook auto-capture uses), so dedupe is
+    consistent: existing leads (by external_id then phone) are refreshed, not
+    duplicated. workspace_id is resolved from the conversation's account.
+    """
+    db = current_app.db
+    Lead = _get_lead_model()
+    if not Lead:
+        return jsonify({"error": "Lead model not configured"}), 500
+
+    payload = request.get_json(silent=True) or {}
+    conversation_id = payload.get("conversation_id")
+    if conversation_id is None:
+        return jsonify({"error": "conversation_id is required"}), 400
+
+    # Lazy import to avoid circular imports between SocioviaCrm and whatsapp.
+    try:
+        from whatsapp.models import WhatsAppConversation, WhatsAppAccount
+        from SocioviaCrm.lead_ingest import upsert_lead_from_conversation
+    except Exception as imp_err:
+        current_app.logger.exception("lead_from_conversation: import failed")
+        return jsonify({"error": "internal import error", "details": str(imp_err)}), 500
+
+    conversation = db.session.get(WhatsAppConversation, conversation_id)
+    if not conversation:
+        return jsonify({"error": "conversation not found"}), 404
+
+    account = db.session.get(WhatsAppAccount, conversation.account_id)
+    if not account:
+        return jsonify({"error": "account for conversation not found"}), 404
+
+    # Optional overrides applied to the conversation before ingest.
+    name_override = payload.get("name")
+    if name_override:
+        conversation.user_name = name_override
+
+    lead = upsert_lead_from_conversation(conversation, account, db_session=db.session)
+    if lead is None:
+        return jsonify({"error": "could not create or update lead from conversation"}), 500
+
+    # Optional status override (the bridge always sets "new" for fresh leads).
+    status_override = payload.get("status")
+    created = getattr(lead, "created_at", None) == getattr(lead, "updated_at", None)
+    if status_override:
+        try:
+            lead.status = status_override
+            lead.updated_at = datetime.utcnow()
+            db.session.add(lead)
+            db.session.commit()
+        except SQLAlchemyError:
+            current_app.logger.exception("lead_from_conversation: status override failed")
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+
+    result = {
+        "id": lead.id,
+        "name": lead.name,
+        "email": getattr(lead, "email", None),
+        "phone": getattr(lead, "phone", None),
+        "company": getattr(lead, "company", None),
+        "status": lead.status,
+        "source": getattr(lead, "source", None),
+        "external_source": getattr(lead, "external_source", None),
+        "external_id": getattr(lead, "external_id", None),
+        "sync_status": getattr(lead, "sync_status", None) or "in_sync",
+        "score": getattr(lead, "score", None),
+        "value": float(lead.value or 0.0) if getattr(lead, "value", None) is not None else 0.0,
+        "details": getattr(lead, "details", None),
+        "lastInteraction": (lead.last_interaction_at.isoformat() if getattr(lead, "last_interaction_at", None) else None),
+        "created_at": (lead.created_at.isoformat() if getattr(lead, "created_at", None) else None),
+        "conversation_id": conversation.id,
+    }
+    return jsonify(result), (201 if created else 200)
+
+
 # --------- Patch Lead ---------
 @bp.route("/<lead_id>", methods=["PATCH"])
 def patch_lead(lead_id):
@@ -392,9 +494,15 @@ def patch_lead(lead_id):
         return jsonify({"error": "not found"}), 404
 
     payload = request.get_json() or {}
-    allowed = {"status", "name", "email", "phone", "company", "job_title", "score", "value", "owner_id", "source"}
+    allowed = {"status", "name", "email", "phone", "company", "job_title", "score", "value", "owner_id", "source", "notes"}
 
     old_status = l.status
+
+    # column names on the Lead model (used to decide where to persist notes)
+    try:
+        lead_cols = set(l.__class__.__table__.columns.keys())
+    except Exception:
+        lead_cols = set()
 
     for k, v in payload.items():
         if k in allowed:
@@ -402,6 +510,18 @@ def patch_lead(lead_id):
                 try:
                     setattr(l, k, Decimal(str(v)))
                 except Exception:
+                    setattr(l, k, v)
+            elif k == "notes" and "notes" not in lead_cols:
+                # Lead has no dedicated notes column on this schema; persist the
+                # note inside the JSON `details` column so it isn't lost.
+                if "details" in lead_cols:
+                    try:
+                        existing = dict(getattr(l, "details", None) or {})
+                    except Exception:
+                        existing = {}
+                    existing["notes"] = v
+                    l.details = existing
+                else:
                     setattr(l, k, v)
             else:
                 setattr(l, k, v)
@@ -471,6 +591,17 @@ def patch_lead(lead_id):
             except Exception:
                 pass
 
+    # Recompute the automatic lead score from the lead's new state, unless the
+    # caller explicitly set "score" in this request (a manual score is respected).
+    if "score" not in payload:
+        try:
+            from SocioviaCrm.lead_scoring import recompute_and_save_lead_score
+            recompute_and_save_lead_score(l)
+        except Exception:
+            current_app.logger.warning(
+                "patch_lead: lead score recompute failed", exc_info=True
+            )
+
     return jsonify({"ok": True})
 
 
@@ -518,11 +649,12 @@ def add_lead_activity(lead_id):
 
     payload = request.get_json(silent=True) or {}
     try:
+        incoming_type = payload.get("type") or payload.get("activity_type")
         activity_kwargs = {
             "entity_type": "lead",
             "entity_id": lead_id,
-            "type": payload.get("type") or payload.get("activity_type") or "note",
-            "title": payload.get("title") or (payload.get("type") or "Activity"),
+            "type": normalize_activity_type(incoming_type),
+            "title": payload.get("title") or (incoming_type or "Activity"),
             "description": payload.get("description"),
             "timestamp": datetime.utcnow(),
         }

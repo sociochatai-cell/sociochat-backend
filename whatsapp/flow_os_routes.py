@@ -66,7 +66,13 @@ def _extract_submissions(account_id: int) -> List[Dict[str, Any]]:
             "conversation_id": conv.id,
             "response_json": response_json,
             "status": content.get("submission_status", "received"),
-            "submitted_at": msg.created_at.isoformat() if msg.created_at else None,
+            # created_at is stored in UTC but the DateTime column is timezone-naive,
+            # so stamp it as UTC here. Without the "+00:00" marker the browser reads
+            # it as LOCAL time and shows every submission shifted by the UTC offset.
+            "submitted_at": (
+                (msg.created_at if msg.created_at.tzinfo else msg.created_at.replace(tzinfo=timezone.utc)).isoformat()
+                if msg.created_at else None
+            ),
             "flow_name": flow.name if flow else None,
         })
     return submissions
@@ -378,6 +384,22 @@ def remove_blocked_date(date_id: int):
     return jsonify({"success": True})
 
 
+def _normalize_booking_date(val: Any) -> str:
+    """Return a YYYY-MM-DD string.
+
+    The WhatsApp Flows DatePicker submits the date as epoch milliseconds
+    (e.g. "1751328000000"), not "YYYY-MM-DD". Convert that; otherwise pass
+    through the first 10 chars of an already-formatted date string.
+    """
+    s = str(val).strip()
+    if s.isdigit() and len(s) >= 12:  # epoch milliseconds
+        try:
+            return datetime.fromtimestamp(int(s) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        except (ValueError, OverflowError, OSError):
+            return ""
+    return s[:10]
+
+
 def maybe_create_booking_from_submission(
     account_id: int,
     conversation_id: int,
@@ -390,20 +412,27 @@ def maybe_create_booking_from_submission(
         response_json.get("booking_date")
         or response_json.get("date")
         or response_json.get("appointment_date")
+        or response_json.get("preferred_date")
     )
     time_val = (
         response_json.get("booking_time")
         or response_json.get("time")
         or response_json.get("appointment_time")
         or response_json.get("slot")
+        or response_json.get("preferred_time")
     )
     if not date_val or not time_val:
+        return
+
+    date_val = _normalize_booking_date(date_val)
+    if not date_val:
         return
 
     name = (
         response_json.get("customer_name")
         or response_json.get("name")
         or response_json.get("full_name")
+        or response_json.get("your_name")
     )
     service = response_json.get("service_type") or response_json.get("service")
 
@@ -424,3 +453,14 @@ def maybe_create_booking_from_submission(
         status="confirmed",
     )
     db.session.add(booking)
+
+    # Schedule an appointment reminder at the exact booked time (minus lead time).
+    # flush() assigns booking.id without committing; the caller commits the txn.
+    # Isolated so a scheduling hiccup never blocks creating the booking itself.
+    try:
+        db.session.flush()
+        from .booking_reminders import schedule_booking_reminder
+        schedule_booking_reminder(booking)
+    except Exception as reminder_err:
+        logger.warning("Could not schedule reminder for booking %s: %s",
+                       getattr(booking, "id", "?"), reminder_err)

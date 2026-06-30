@@ -11,7 +11,7 @@ def parse_date(s):
         return datetime.fromisoformat(s) if "T" in s else datetime.strptime(s, "%Y-%m-%d")
     except Exception:
         return None
-    
+
 def resolve_date_range(start_raw, end_raw):
     now = datetime.utcnow()
 
@@ -44,133 +44,185 @@ def resolve_date_range(start_raw, end_raw):
 
     return start, end
 
+
 @bp.route("/stats", methods=["GET"])
 def stats():
+    """
+    Chat/CRM dashboard KPIs derived from Leads (and Deals for conversion).
+
+    Returns a FLAT shape matching the frontend DashboardStats contract:
+        {
+            "total_leads": int,
+            "new_leads": int,        # leads created within the selected range
+            "active_leads": int,     # leads whose status != "closed"
+            "conversion_rate": float # won deals / total leads * 100, guarded
+        }
+    """
     db = current_app.db
     models = current_app.crm_models
     Lead = models["Lead"]
-    Campaign = models["Campaign"]
+    Deal = models.get("Deal")
 
-    workspace_id = request.args.get("workspace_id")  # String type in DB
-    user_id = request.args.get("user_id", type=int)
-
-    if not workspace_id or not user_id:
-        return jsonify({"error": "workspace_id and user_id required"}), 400
+    workspace_id = request.args.get("workspace_id")  # TEXT in DB → compare as string
+    if not workspace_id:
+        return jsonify({"error": "workspace_id required"}), 400
 
     start, end = resolve_date_range(
-        request.args.get("startDate"),
+        request.args.get("startDate") or request.args.get("range"),
         request.args.get("endDate")
     )
 
-    # -------------------------
-    # Leads
-    # -------------------------
-    leads_q = db.session.query(Lead).filter(
-        Lead.workspace_id == workspace_id
-    )
+    try:
+        # All leads in the workspace (range-independent totals).
+        base_q = db.session.query(Lead).filter(Lead.workspace_id == workspace_id)
 
-    if start:
-        leads_q = leads_q.filter(Lead.created_at >= start)
-    if end:
-        leads_q = leads_q.filter(Lead.created_at < end)
+        total_leads = base_q.count()
+        active_leads = base_q.filter(Lead.status != "closed").count()
 
-    total_leads = leads_q.count()
-    active_leads = leads_q.filter(Lead.status != "closed").count()
+        # New leads = created within the selected range (fall back to all if no range).
+        new_q = base_q
+        if start:
+            new_q = new_q.filter(Lead.created_at >= start)
+        if end:
+            new_q = new_q.filter(Lead.created_at < end)
+        new_leads = new_q.count()
 
-    # -------------------------
-    # Campaign metrics
-    # -------------------------
-    campaign_q = db.session.query(Campaign).filter(
-        Campaign.workspace_id == workspace_id
-    )
+        # Conversion rate = won deals / total leads * 100 (guard divide-by-zero).
+        won_deals = 0
+        if Deal is not None:
+            try:
+                won_deals = (
+                    db.session.query(Deal)
+                    .filter(Deal.workspace_id == workspace_id)
+                    .filter(Deal.stage == "won")
+                    .count()
+                )
+            except Exception:
+                # Deal.workspace_id type may differ (Integer vs TEXT); fail soft.
+                current_app.logger.exception("dashboard.stats: won deals query failed")
+                try:
+                    db.session.rollback()
+                except Exception:
+                    pass
+                won_deals = 0
 
-    if start:
-        campaign_q = campaign_q.filter(Campaign.created_at >= start)
-    if end:
-        campaign_q = campaign_q.filter(Campaign.created_at < end)
+        conversion_rate = (won_deals / total_leads * 100) if total_leads > 0 else 0.0
 
-    revenue = float(
-        campaign_q.with_entities(
-            db.func.coalesce(db.func.sum(Campaign.revenue), 0)
-        ).scalar()
-    )
+        return jsonify({
+            "total_leads": int(total_leads),
+            "new_leads": int(new_leads),
+            "active_leads": int(active_leads),
+            "conversion_rate": round(float(conversion_rate), 2),
+        })
+    except Exception:
+        current_app.logger.exception("dashboard.stats failed")
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return jsonify({
+            "total_leads": 0,
+            "new_leads": 0,
+            "active_leads": 0,
+            "conversion_rate": 0.0,
+        })
 
-    link_clicks = int(
-        campaign_q.with_entities(
-            db.func.coalesce(db.func.sum(Campaign.clicks), 0)
-        ).scalar()
-    )
-
-    conversion_rate = (
-        (total_leads / link_clicks) * 100 if link_clicks > 0 else 0.0
-    )
-
-    return jsonify({
-        "revenue": {"value": revenue, "change": 0.0, "trend": "up"},
-        "active_leads": {"value": active_leads, "change": 0.0, "trend": "up"},
-        "conversion_rate": {"value": round(conversion_rate, 2), "change": 0.0, "trend": "up"},
-        "link_clicks": {"value": link_clicks, "change": 0.0, "trend": "up"}
-    })
 
 @bp.route("/charts/revenue", methods=["GET"])
 def revenue_chart():
-    db = current_app.db
-    Campaign = current_app.crm_models["Campaign"]
+    """
+    Leads-created-per-day trend over the selected range.
 
-    workspace_id = request.args.get("workspace_id")  # String type in DB
+    Returns ChartPoint[] → [{"label": <day>, "value": <count>}].
+    NOTE: the frontend titles this card "Revenue Trend", but the Campaign
+    revenue table is empty in this app, so we surface leads-per-day instead —
+    the meaningful signal here. Label is cosmetic only.
+    """
+    db = current_app.db
+    Lead = current_app.crm_models["Lead"]
+
+    workspace_id = request.args.get("workspace_id")  # TEXT in DB → compare as string
     if not workspace_id:
         return jsonify({"error": "workspace_id required"}), 400
 
     start, end = resolve_date_range(
-        request.args.get("startDate"),
+        request.args.get("startDate") or request.args.get("range"),
         request.args.get("endDate")
     )
 
-    q = (
-        db.session.query(
-            db.func.date(Campaign.created_at).label("day"),
-            db.func.coalesce(db.func.sum(Campaign.revenue), 0)
+    try:
+        q = (
+            db.session.query(
+                db.func.date(Lead.created_at).label("day"),
+                db.func.count(Lead.id),
+            )
+            .filter(Lead.workspace_id == workspace_id)
         )
-        .filter(Campaign.workspace_id == workspace_id)
-    )
 
-    if start:
-        q = q.filter(Campaign.created_at >= start)
-    if end:
-        q = q.filter(Campaign.created_at < end)
+        if start:
+            q = q.filter(Lead.created_at >= start)
+        if end:
+            q = q.filter(Lead.created_at < end)
 
-    rows = (
-        q
-        .group_by("day")
-        .order_by("day")
-        .all()
-    )
+        rows = (
+            q
+            .group_by("day")
+            .order_by("day")
+            .all()
+        )
 
-    return jsonify([
-        {"date": day.strftime("%a"), "value": float(value)}
-        for day, value in rows
-    ])
+        out = []
+        for day, count in rows:
+            # day may be a date/datetime or a string depending on the DB driver.
+            if hasattr(day, "strftime"):
+                label = day.strftime("%a")
+            else:
+                label = str(day)
+            out.append({"label": label, "value": int(count)})
+
+        return jsonify(out)
+    except Exception:
+        current_app.logger.exception("dashboard.revenue_chart failed")
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return jsonify([])
+
 
 @bp.route("/charts/sources", methods=["GET"])
 def sources_chart():
+    """
+    Leads grouped by source.
+
+    Returns ChartPoint[] → [{"label": <source>, "value": <count>}].
+    """
     db = current_app.db
     Lead = current_app.crm_models["Lead"]
 
-    workspace_id = request.args.get("workspace_id")  # String type in DB
+    workspace_id = request.args.get("workspace_id")  # TEXT in DB → compare as string
     if not workspace_id:
         return jsonify({"error": "workspace_id required"}), 400
 
-    rows = (
-        db.session.query(
-            Lead.source,
-            db.func.count(Lead.id)
+    try:
+        rows = (
+            db.session.query(
+                Lead.source,
+                db.func.count(Lead.id)
+            )
+            .filter(Lead.workspace_id == workspace_id)
+            .group_by(Lead.source)
+            .all()
         )
-        .filter(Lead.workspace_id == workspace_id)
-        .group_by(Lead.source)
-        .all()
-    )
 
-    return jsonify([
-        {"name": source or "Unknown", "value": int(count)}
-        for source, count in rows
-    ])
+        return jsonify([
+            {"label": source or "Unknown", "value": int(count)}
+            for source, count in rows
+        ])
+    except Exception:
+        current_app.logger.exception("dashboard.sources_chart failed")
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return jsonify([])

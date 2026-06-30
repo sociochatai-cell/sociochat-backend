@@ -44,6 +44,8 @@ PLAN_FEATURES = {
         "ai_chatbot_dashboard": True,
         "whatsapp_smart_ai": True,
         "human_agent_whatsapp": True,
+        "crm": True,
+        "whatsapp_coexistence": True,
     },
     # Starter - basic tier
     PLAN_STARTER: {
@@ -61,6 +63,8 @@ PLAN_FEATURES = {
         "ai_chatbot_dashboard": False,
         "whatsapp_smart_ai": True,
         "human_agent_whatsapp": True,
+        "crm": True,
+        "whatsapp_coexistence": True,
     },
     # Growth - mid tier
     PLAN_GROWTH: {
@@ -78,6 +82,8 @@ PLAN_FEATURES = {
         "ai_chatbot_dashboard": True,
         "whatsapp_smart_ai": True,
         "human_agent_whatsapp": True,
+        "crm": True,
+        "whatsapp_coexistence": True,
     },
     # Enterprise - all features
     PLAN_ENTERPRISE: {
@@ -95,6 +101,8 @@ PLAN_FEATURES = {
         "ai_chatbot_dashboard": True,
         "whatsapp_smart_ai": True,
         "human_agent_whatsapp": True,
+        "crm": True,
+        "whatsapp_coexistence": True,
     },
 }
 

@@ -38,10 +38,37 @@ def ensure_private_slot_schema() -> None:
             db.session.commit()
             logger.info("Added subscription_plans.plan_scope column")
 
+        if plan_cols and "billing_period" not in plan_cols:
+            db.session.execute(
+                text(
+                    "ALTER TABLE subscription_plans "
+                    "ADD COLUMN billing_period VARCHAR(16) NOT NULL DEFAULT 'monthly'"
+                )
+            )
+            db.session.commit()
+            logger.info("Added subscription_plans.billing_period column")
+
+        if plan_cols and "offer_text" not in plan_cols:
+            db.session.execute(
+                text(
+                    "ALTER TABLE subscription_plans "
+                    "ADD COLUMN offer_text TEXT"
+                )
+            )
+            db.session.commit()
+            logger.info("Added subscription_plans.offer_text column")
+
         # Backfill NULL/empty scopes on existing rows
         if plan_cols:
             db.session.execute(
                 text("UPDATE subscription_plans SET plan_scope = 'global' WHERE plan_scope IS NULL OR plan_scope = ''")
+            )
+            db.session.commit()
+
+        # Backfill NULL/empty billing periods on existing rows
+        if plan_cols:
+            db.session.execute(
+                text("UPDATE subscription_plans SET billing_period = 'monthly' WHERE billing_period IS NULL OR billing_period = ''")
             )
             db.session.commit()
     except Exception:

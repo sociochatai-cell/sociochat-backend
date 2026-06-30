@@ -19,6 +19,9 @@ class WhatsAppFormBusinessHours(db.Model):
     slot_duration_minutes = db.Column(db.Integer, nullable=False, default=30)
     max_bookings_per_slot = db.Column(db.Integer, nullable=False, default=1)
     max_bookings_per_day = db.Column(db.Integer, nullable=True)
+    # IANA timezone the open/close/slot times are expressed in. Used to fire
+    # appointment reminders at the correct local wall-clock time.
+    timezone = db.Column(db.String(64), nullable=False, default="Asia/Kolkata")
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = db.Column(
@@ -38,6 +41,7 @@ class WhatsAppFormBusinessHours(db.Model):
             "slot_duration_minutes": self.slot_duration_minutes,
             "max_bookings_per_slot": self.max_bookings_per_slot,
             "max_bookings_per_day": self.max_bookings_per_day,
+            "timezone": self.timezone,
             "is_active": self.is_active,
         }
 
@@ -76,6 +80,10 @@ class WhatsAppFormBooking(db.Model):
     service_type = db.Column(db.String(128), nullable=True)
     status = db.Column(db.String(16), nullable=False, default="confirmed")  # confirmed, cancelled, completed
     notes = db.Column(db.Text, nullable=True)
+    # Appointment reminder: when (UTC) to fire, the APScheduler job id, and whether sent.
+    remind_at = db.Column(db.DateTime, nullable=True)
+    reminder_job_id = db.Column(db.String(64), nullable=True)
+    reminded = db.Column(db.Boolean, nullable=False, default=False)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = db.Column(
         db.DateTime,
@@ -96,5 +104,7 @@ class WhatsAppFormBooking(db.Model):
             "service_type": self.service_type,
             "status": self.status,
             "notes": self.notes,
+            "remind_at": self.remind_at.isoformat() if self.remind_at else None,
+            "reminded": self.reminded,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

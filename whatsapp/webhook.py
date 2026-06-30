@@ -394,6 +394,16 @@ class WebhookProcessor:
             except Exception as booking_err:
                 logger.warning("Could not create booking from flow submission: %s", booking_err)
                 self.db_session.rollback()
+            # CRM: auto-advance lead status -> qualified (completed a flow).
+            # Forward-only/idempotent; isolated so CRM logic never breaks msg processing.
+            try:
+                from SocioviaCrm.lead_ingest import advance_lead_status_from_conversation
+                advance_lead_status_from_conversation(
+                    conversation, account, "qualified",
+                    reason="Completed WhatsApp flow", db_session=self.db_session
+                )
+            except Exception as e:
+                logger.warning(f"Failed to advance CRM lead status to qualified (flow): {e}")
 
         # Broadcast real-time event
         try:
@@ -407,7 +417,40 @@ class WebhookProcessor:
             })
         except Exception as e:
             logger.error(f"Failed to broadcast message received event: {e}")
-        
+
+        # Auto-capture: mirror this conversation into the CRM as a Lead.
+        # Lazy import to avoid circular imports (SocioviaCrm <-> whatsapp).
+        # New conversations create a Lead; existing ones just refresh
+        # last_interaction_at (dedupe-safe). Never break message processing.
+        try:
+            from SocioviaCrm.lead_ingest import upsert_lead_from_conversation
+            is_new_conversation = getattr(conversation, "_is_new", False)
+            if is_new_conversation:
+                upsert_lead_from_conversation(
+                    conversation, account, db_session=self.db_session
+                )
+                logger.info(
+                    f"Auto-captured CRM lead for new conversation {conversation.id}"
+                )
+            else:
+                # Cheap refresh of last_interaction_at on an already-known lead.
+                upsert_lead_from_conversation(
+                    conversation, account, db_session=self.db_session
+                )
+                # CRM: auto-advance lead status -> contacted (a reply on an
+                # existing conversation). Forward-only/idempotent; new
+                # conversations stay "new" so this lives only in the else branch.
+                try:
+                    from SocioviaCrm.lead_ingest import advance_lead_status_from_conversation
+                    advance_lead_status_from_conversation(
+                        conversation, account, "contacted",
+                        reason="Replied on WhatsApp", db_session=self.db_session
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to advance CRM lead status to contacted: {e}")
+        except Exception as e:
+            logger.error(f"Failed to auto-capture CRM lead from conversation: {e}")
+
         # Process automation rules (after commit to avoid blocking)
         # Handle both text messages and interactive button replies
         if msg_type == "text":
@@ -424,6 +467,36 @@ class WebhookProcessor:
                 )
             # Check for lead keywords in text messages
             self._check_for_lead_keywords(account, conversation, text_content)
+            # CRM Phase 2: buying-intent keyword rule -> advance lead to rule's status
+            # (per-workspace configurable). Forward-only/idempotent; isolated so CRM
+            # logic never breaks message processing. Runs AFTER the reply->contacted
+            # hook so cheap signals win first.
+            rule = None
+            try:
+                from SocioviaCrm.qualify_keywords import match_qualify_rule
+                from SocioviaCrm.lead_ingest import advance_lead_status_from_conversation
+                rule = match_qualify_rule(text_content, account.workspace_id)
+                if rule:
+                    advance_lead_status_from_conversation(
+                        conversation, account, rule["status"],
+                        reason=f"Keyword '{rule['keyword']}' -> {rule['status']}",
+                        db_session=self.db_session)
+            except Exception as e:
+                logger.warning(f"interest-keyword qualify hook failed: {e}")
+            # CRM Phase 3: AI fallback classifier. ONLY runs when the keyword rule
+            # did NOT match (rule is None). classify_lead_status returns None when AI
+            # is disabled / chit-chat / error, so this is cheap when off. Fail-safe.
+            if rule is None:
+                try:
+                    from SocioviaCrm.ai_status_classifier import classify_lead_status
+                    _st = classify_lead_status(text_content, account.workspace_id)
+                    if _st:
+                        advance_lead_status_from_conversation(
+                            conversation, account, _st,
+                            reason=f"AI classified -> {_st}",
+                            db_session=self.db_session)
+                except Exception as e:
+                    logger.warning(f"AI status classify hook failed: {e}")
         elif msg_type == "interactive":
             # Handle button replies from interactive messages
             interactive = message.get("interactive", {})
@@ -456,7 +529,7 @@ class WebhookProcessor:
         if msg_type == "text":
             text_content = extract_message_text(message)
             self._check_for_lead_keywords(account, conversation, text_content)
-    
+
     def _check_for_lead_keywords(self, account, conversation, text):
         """
         Check message text for lead identifiers (Ref tags, campaign IDs).
@@ -774,11 +847,12 @@ class WebhookProcessor:
             )
             self.db_session.add(conversation)
             self.db_session.flush()
+            conversation._is_new = True  # transient flag for downstream lead capture
             logger.info(f"Created conversation with: {canonical}")
         elif user_name and conversation.user_name != user_name:
             # Update name if it changed or was missing
             conversation.user_name = user_name
-        
+
         return conversation
     
     def _process_attribution(
@@ -918,6 +992,16 @@ class WebhookProcessor:
             self._trigger_capi_lead_event(
                 account, conversation, ad_id=ad_id, lead_type="keyword"
             )
+            # CRM: auto-advance lead status -> qualified (matched interest keyword).
+            # Forward-only/idempotent; isolated so CRM logic never breaks msg processing.
+            try:
+                from SocioviaCrm.lead_ingest import advance_lead_status_from_conversation
+                advance_lead_status_from_conversation(
+                    conversation, account, "qualified",
+                    reason="Matched interest keyword", db_session=self.db_session
+                )
+            except Exception as e:
+                logger.warning(f"Failed to advance CRM lead status to qualified (keyword): {e}")
             logger.info(f"Keyword lead detected in conv {conversation.id}, ad_id={ad_id}")
     
     def _process_automation(

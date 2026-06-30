@@ -20,12 +20,20 @@ page_adaccount = db.Table(
 
 class User(db.Model):
     __tablename__ = "users"
+    # Email is unique PER TENANT (not globally): the same email may exist in
+    # multiple tenants (e.g. ABC001+admin@x and XYZ001+admin@x are distinct).
+    __table_args__ = (
+        db.UniqueConstraint("tenant_id", "email", name="uq_users_tenant_email"),
+    )
 
     id = db.Column(db.Integer, primary_key=True)
+    # Multi-tenant owner. Soft FK (plain indexed int) to tenants.id — kept
+    # plain to match existing codebase style and avoid create_all FK ordering.
+    tenant_id = db.Column(db.Integer, nullable=True, index=True)
     name = db.Column(db.String(120), nullable=False)
-    email = db.Column(db.String(255), unique=True, nullable=False, index=True)
+    email = db.Column(db.String(255), nullable=False, index=True)
     # Role-based access control
-    # Roles: user (default), marketing_admin, admin
+    # Roles: user (default), tenant_admin, marketing_admin, admin
     role = db.Column(db.String(32), nullable=False, default="user", index=True)
     phone = db.Column(db.String(30))
 
@@ -121,6 +129,7 @@ class AuditLog(db.Model):
     actor = db.Column(db.String(255))
     action = db.Column(db.String(64))
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    tenant_id = db.Column(db.Integer, nullable=True, index=True)  # denormalized for tenant scoping
     meta = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 

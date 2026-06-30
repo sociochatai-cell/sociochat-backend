@@ -8,7 +8,15 @@ def get_ma():
     return ma
 
 def init_schemas():
-    ma = get_ma()
+    # Flask-Marshmallow is optional: the live CRM routes (leads/contacts/deals/
+    # tasks/dashboard/settings/webhook) serialize by hand and never read
+    # current_app.crm_schemas. When app.ma is absent, degrade to a safe no-op so
+    # the blueprint can register without pulling in marshmallow.
+    ma = getattr(current_app, "ma", None)
+    if ma is None:
+        current_app.crm_schemas = {}
+        return
+
     models = getattr(current_app, "crm_models", None)
     if models is None:
         raise RuntimeError("crm_models not initialized; call init_models first")

@@ -40,6 +40,18 @@ subscription_bp = Blueprint("subscription", __name__, url_prefix="/api/subscript
 # Helper Functions
 # =============================================================================
 
+_VALID_BILLING_PERIODS = ("monthly", "quarterly", "yearly")
+
+
+def _normalize_billing_period(val):
+    """Normalize a request-supplied billing_period to the allowed set.
+
+    Anything not in {monthly, quarterly, yearly} falls back to 'monthly'.
+    """
+    period = (str(val or "")).strip().lower()
+    return period if period in _VALID_BILLING_PERIODS else "monthly"
+
+
 def _coerce_user_pk(val):
     """Best-effort parse of JWT / header values into an integer users.id."""
     if val is None:
@@ -86,14 +98,9 @@ def _user_id_from_bearer_jwt():
         except jwt.InvalidTokenError:
             continue
     if payload is None:
-        try:
-            payload = jwt.decode(
-                token,
-                options={"verify_signature": False},
-                algorithms=["HS256", "RS256"],
-            )
-        except jwt.InvalidTokenError:
-            return None
+        # SECURITY: never fall back to an unverified decode — a forged token must
+        # not authenticate. If no known secret verified the signature, reject.
+        return None
 
     for key in ("user_id", "id", "sub", "userId", "uid"):
         uid = _coerce_user_pk(payload.get(key))
@@ -103,34 +110,27 @@ def _user_id_from_bearer_jwt():
 
 
 def get_current_user():
-    """Get current user from session, X-User-Id, or Bearer JWT (same DB as monolith)."""
-    user_id = session.get("user_id") or request.headers.get("X-User-Id")
-    if not user_id:
-        user_id = _user_id_from_bearer_jwt()
-    if not user_id:
+    """Current user from the server session or a SIGNED Bearer JWT only.
+    The forgeable X-User-Id header is no longer trusted (see auth_core)."""
+    from auth_core import authenticated_user_id
+    uid = authenticated_user_id()
+    if uid is None:
         return None
     try:
-        return db.session.get(User, int(user_id))
+        return db.session.get(User, uid)
     except Exception:
         return None
 
 
 def get_current_admin():
-    """Get current admin from session or headers."""
-    admin_id = session.get("admin_id")
-    
-    # Fallback to X-Admin-Id header if session is not available (cross-origin)
-    if not admin_id:
-        admin_id = request.headers.get("X-Admin-Id")
-    
-    # Fallback to query param for testing
-    if not admin_id:
-        admin_id = request.args.get("admin_id")
-    
-    if not admin_id:
+    """Current platform admin from the server session or a SIGNED admin JWT only.
+    The forgeable X-Admin-Id header and ?admin_id= query param are no longer trusted."""
+    from auth_core import authenticated_admin_id
+    aid = authenticated_admin_id()
+    if aid is None:
         return None
     try:
-        return db.session.get(Admin, int(admin_id))
+        return db.session.get(Admin, aid)
     except Exception:
         return None
 
@@ -163,24 +163,11 @@ def require_admin(f):
 # User-Facing Routes
 # =============================================================================
 
-@subscription_bp.route("/plans", methods=["GET"])
-def list_plans():
-    """
-    GET /api/subscription/plans — public plan catalog from DB.
-    """
-    from subscription.plan_models import SubscriptionPlan, PlanFeatureAccess, SubscriptionFeature
-
-    rows = SubscriptionPlan.query.filter(
-        SubscriptionPlan.is_public.is_(True),
-        SubscriptionPlan.is_active.is_(True),
-        or_(SubscriptionPlan.plan_scope == PLAN_SCOPE_GLOBAL, SubscriptionPlan.plan_scope.is_(None)),
-    ).order_by(
-        SubscriptionPlan.sort_order
-    ).all()
-
-    if not rows:
-        plans = {k: v for k, v in PLAN_FEATURES.items() if k != "beta"}
-        return jsonify({"success": True, "plans": plans})
+def _build_plans_payload(rows) -> dict:
+    """Build the {slug: {...plan.to_dict(), ...feature matrix}} map for a list
+    of SubscriptionPlan rows. Shared by /plans and /my-plans so the response
+    shape is identical."""
+    from subscription.plan_models import PlanFeatureAccess, SubscriptionFeature
 
     plans = {}
     for plan in rows:
@@ -195,8 +182,48 @@ def list_plans():
             **plan.to_dict(),
             **matrix,
         }
+    return plans
 
-    return jsonify({"success": True, "plans": plans})
+
+@subscription_bp.route("/plans", methods=["GET"])
+def list_plans():
+    """
+    GET /api/subscription/plans — public plan catalog from DB.
+    """
+    from subscription.plan_models import SubscriptionPlan
+
+    rows = SubscriptionPlan.query.filter(
+        SubscriptionPlan.is_public.is_(True),
+        SubscriptionPlan.is_active.is_(True),
+        or_(SubscriptionPlan.plan_scope == PLAN_SCOPE_GLOBAL, SubscriptionPlan.plan_scope.is_(None)),
+    ).order_by(
+        SubscriptionPlan.sort_order
+    ).all()
+
+    if not rows:
+        plans = {k: v for k, v in PLAN_FEATURES.items() if k != "beta"}
+        return jsonify({"success": True, "plans": plans})
+
+    return jsonify({"success": True, "plans": _build_plans_payload(rows)})
+
+
+@subscription_bp.route("/my-plans", methods=["GET"])
+@require_auth
+def list_my_plans(user):
+    """
+    GET /api/subscription/my-plans — tenant-aware plan catalog for the current
+    user. Same response shape as /plans but built ONLY from the rows visible to
+    this user (their tenant's plans, or the global SocioChat catalog for
+    internal users).
+    """
+    from subscription.service import get_user_plan_rows, get_current_subscription_info
+
+    rows = get_user_plan_rows(user)
+    return jsonify({
+        "success": True,
+        "plans": _build_plans_payload(rows),
+        "current": get_current_subscription_info(user),
+    })
 
 
 @subscription_bp.route("/limits", methods=["GET"])
@@ -674,11 +701,37 @@ def select_plan(user):
     """User selects a plan after signup (before or without payment)."""
     from datetime import datetime, timezone, timedelta
 
+    from subscription.service import get_assignable_user_plan_slugs
+
     data = request.get_json() or {}
     new_plan = (data.get("plan") or "").strip().lower()
 
-    if new_plan not in VALID_PLANS:
-        return jsonify({"success": False, "error": "invalid_plan", "valid_plans": VALID_PLANS}), 400
+    assignable = get_assignable_user_plan_slugs(user)
+    if new_plan not in assignable:
+        return jsonify({"success": False, "error": "invalid_plan", "valid_plans": assignable}), 400
+
+    # Payment gate: only FREE plans (beta / price 0) may be granted directly.
+    # A PRICED plan must go through PayU — it only activates in the verified
+    # payment callback, so the paid tiers cannot be bypassed here. A custom
+    # (null-price, e.g. enterprise) plan is NOT self-serviceable: it requires a
+    # sales/admin path, so we never auto-grant it for free.
+    from subscription.plan_models import SubscriptionPlan
+    plan_row = SubscriptionPlan.query.filter_by(slug=new_plan).first()
+    price = plan_row.price_monthly_inr if plan_row else None
+    if new_plan != "beta":
+        if price is None:
+            return jsonify({
+                "success": False,
+                "error": "contact_sales",
+                "plan": new_plan,
+            }), 400
+        if price > 0:
+            return jsonify({
+                "success": False,
+                "error": "payment_required",
+                "requires_payment": True,
+                "plan": new_plan,
+            }), 402
 
     old_plan = user.plan or "beta"
     if new_plan == "beta":
@@ -764,7 +817,9 @@ def admin_create_plan(admin):
         slug=slug,
         name=name,
         description=data.get("description"),
+        offer_text=(data.get("offer_text") or None),
         price_monthly_inr=data.get("price_monthly_inr"),
+        billing_period=_normalize_billing_period(data.get("billing_period")),
         is_public=bool(data.get("is_public", True)),
         sort_order=int(data.get("sort_order", 99)),
         plan_scope=PLAN_SCOPE_GLOBAL,
@@ -807,6 +862,10 @@ def admin_update_plan_catalog(admin, slug):
     for field in ("name", "description", "price_monthly_inr", "is_public", "is_active", "sort_order"):
         if field in data:
             setattr(plan, field, data[field])
+    if "offer_text" in data:
+        plan.offer_text = (data.get("offer_text") or None)
+    if "billing_period" in data:
+        plan.billing_period = _normalize_billing_period(data.get("billing_period"))
 
     db.session.add(PlanConfigAuditLog(
         admin_id=admin.id,
@@ -962,10 +1021,10 @@ def admin_update_user_features(admin, user_id):
     """
     PUT /api/subscription/admin/users/<user_id>/features
 
-    Body: {"overrides": {"<feature_key>": true|false|null}}
-    - true  -> force ON
-    - false -> force OFF
-    - null  -> reset (inherit from plan)
+    Body: {"overrides": {"<feature_key>": <value>}}
+    - access feature:  true -> force ON, false -> force OFF, null -> inherit
+    - limit  feature:  <int> -> set the per-user limit (e.g. max workspaces;
+                       -1 = unlimited), null -> inherit from plan/tenant
     """
     from subscription.plan_models import SubscriptionFeature, UserFeatureAccess, PlanConfigAuditLog
     from subscription.service import LIMIT_KEYS
@@ -979,9 +1038,14 @@ def admin_update_user_features(admin, user_id):
     if not isinstance(overrides, dict):
         return jsonify({"success": False, "error": "overrides_required"}), 400
 
-    valid_keys = {
+    valid_access_keys = {
         f.key for f in SubscriptionFeature.query.filter_by(
             is_active=True, feature_type="access"
+        ).all()
+    }
+    valid_limit_keys = {
+        f.key for f in SubscriptionFeature.query.filter_by(
+            is_active=True, feature_type="limit"
         ).all()
     }
 
@@ -991,30 +1055,55 @@ def admin_update_user_features(admin, user_id):
         return "on" if val else "off"
 
     for key, val in overrides.items():
-        if key not in valid_keys or key in LIMIT_KEYS:
+        is_limit = key in valid_limit_keys or key in LIMIT_KEYS
+        if key not in valid_access_keys and not is_limit:
             continue
 
         row = UserFeatureAccess.query.filter_by(user_id=user.id, feature_key=key).first()
-        if row is not None:
-            old_state = "on" if row.enabled else "off"
-        else:
-            old_state = "inherit"
 
-        if val is None:
-            if row is not None:
-                db.session.delete(row)
-            new_state = "inherit"
-        else:
-            enabled = bool(val)
-            if row is not None:
-                row.enabled = enabled
+        if is_limit:
+            # Per-user NUMERIC limit override (e.g. max workspaces).
+            old_state = ("inherit" if row is None or row.limit_value is None
+                         else str(row.limit_value))
+            if val is None:
+                if row is not None:
+                    db.session.delete(row)
+                new_state = "inherit"
             else:
-                db.session.add(UserFeatureAccess(
-                    user_id=user.id,
-                    feature_key=key,
-                    enabled=enabled,
-                ))
-            new_state = _state_str(enabled)
+                try:
+                    limit_value = int(val)
+                except (TypeError, ValueError):
+                    continue
+                if row is not None:
+                    row.limit_value = limit_value
+                    if row.enabled is None:
+                        row.enabled = True
+                else:
+                    db.session.add(UserFeatureAccess(
+                        user_id=user.id,
+                        feature_key=key,
+                        enabled=True,
+                        limit_value=limit_value,
+                    ))
+                new_state = str(limit_value)
+        else:
+            old_state = ("inherit" if row is None
+                         else ("on" if row.enabled else "off"))
+            if val is None:
+                if row is not None:
+                    db.session.delete(row)
+                new_state = "inherit"
+            else:
+                enabled = bool(val)
+                if row is not None:
+                    row.enabled = enabled
+                else:
+                    db.session.add(UserFeatureAccess(
+                        user_id=user.id,
+                        feature_key=key,
+                        enabled=enabled,
+                    ))
+                new_state = _state_str(enabled)
 
         db.session.add(PlanConfigAuditLog(
             admin_id=admin.id,
@@ -1034,13 +1123,18 @@ def admin_update_user_features(admin, user_id):
     except Exception:
         pass
 
+    access_overrides = {}
+    limit_overrides = {}
+    for ov in UserFeatureAccess.query.filter_by(user_id=user.id):
+        if ov.feature_key in LIMIT_KEYS or ov.limit_value is not None:
+            limit_overrides[ov.feature_key] = ov.limit_value
+        else:
+            access_overrides[ov.feature_key] = bool(ov.enabled)
+
     return jsonify({
         "success": True,
-        "overrides": {
-            ov.feature_key: bool(ov.enabled)
-            for ov in UserFeatureAccess.query.filter_by(user_id=user.id)
-            if ov.feature_key not in LIMIT_KEYS
-        },
+        "overrides": access_overrides,
+        "limit_overrides": limit_overrides,
     })
 
 
@@ -1253,6 +1347,25 @@ def admin_private_slot_set_plan(admin, user_id):
     except ValueError as e:
         return jsonify({"success": False, "error": str(e)}), 400
 
+    # Set the subscription end date: from an explicit date if provided,
+    # otherwise auto-compute from the plan's billing period.
+    from datetime import datetime, timezone
+    from subscription.service import expiry_from_period
+    from subscription.plan_models import SubscriptionPlan
+
+    _exp_raw = (data.get("subscription_expires_at") or data.get("expires_at"))
+    if _exp_raw:
+        try:
+            user.subscription_expires_at = datetime.fromisoformat(str(_exp_raw).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            pass
+    else:
+        _sp = SubscriptionPlan.query.filter_by(slug=new_plan).first()
+        _auto = expiry_from_period(datetime.now(timezone.utc), getattr(_sp, "billing_period", None))
+        if _auto is not None:
+            user.subscription_expires_at = _auto
+    db.session.commit()
+
     return jsonify({
         "success": True,
         "user": _serialize_slot_user(user),
@@ -1281,7 +1394,9 @@ def admin_private_slot_create_plan(admin):
         slug=slug,
         name=name,
         description=data.get("description"),
+        offer_text=(data.get("offer_text") or None),
         price_monthly_inr=data.get("price_monthly_inr"),
+        billing_period=_normalize_billing_period(data.get("billing_period")),
         is_public=False,
         is_active=True,
         sort_order=int(data.get("sort_order", 99)),
@@ -1324,6 +1439,10 @@ def admin_private_slot_update_plan(admin, slug):
     for field in ("name", "description", "price_monthly_inr", "is_active", "sort_order"):
         if field in data:
             setattr(plan, field, data[field])
+    if "offer_text" in data:
+        plan.offer_text = (data.get("offer_text") or None)
+    if "billing_period" in data:
+        plan.billing_period = _normalize_billing_period(data.get("billing_period"))
 
     db.session.add(PlanConfigAuditLog(
         admin_id=admin.id,

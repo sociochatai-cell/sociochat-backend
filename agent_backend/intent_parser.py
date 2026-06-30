@@ -221,14 +221,20 @@ class IntentParser:
     Falls back to keyword matching if Gemini is unavailable.
     """
 
-    def __init__(self):
+    def __init__(self, workspace_id: Optional[str] = None):
+        self._workspace_id = workspace_id
         self._model = None
         self._client = None        # google.genai.Client (newer SDK)
         self._use_new_sdk = False
-        self._init_gemini()
+        self._init_gemini(workspace_id)
 
-    def _init_gemini(self):
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    def _init_gemini(self, workspace_id: Optional[str] = None):
+        # Per-tenant Gemini key (tenant brings their own AI billing). The resolver
+        # falls back to the global GEMINI_API_KEY env, so for T0000 / unset /
+        # no-workspace this is byte-identical to reading the env var directly.
+        from tenant.integration import get_tenant_ai_config
+        cfg = get_tenant_ai_config(workspace_id=workspace_id)
+        api_key = cfg.gemini_api_key
         if not api_key:
             logger.warning("IntentParser: No GEMINI_API_KEY found — using keyword fallback")
             return
@@ -237,7 +243,7 @@ class IntentParser:
         try:
             import google.generativeai as genai
             genai.configure(api_key=api_key)
-            self._model = genai.GenerativeModel("gemini-1.5-flash")
+            self._model = genai.GenerativeModel("gemini-3.1-flash-lite")
             logger.info("IntentParser: Gemini model initialised (google-generativeai)")
             return
         except Exception as exc:
@@ -282,6 +288,7 @@ OUTPUT FORMAT (strict JSON):
         message: str,
         action_schema: list,
         conversation_history: Optional[List[Dict[str, str]]] = None,
+        workspace_id: Optional[str] = None,
     ) -> AgentIntent:
         """
         Parse a user message into a structured AgentIntent.
@@ -290,10 +297,31 @@ OUTPUT FORMAT (strict JSON):
             message: The user's natural language input.
             action_schema: Output of action_registry.get_schema_for_intent_parser().
             conversation_history: Recent messages for multi-turn context.
+            workspace_id: When supplied (and different from this parser's own
+                workspace), the tenant's own Gemini key is used for this call so
+                the tenant is billed on their AI quota. Omitting it preserves the
+                existing global-env behavior exactly.
 
         Returns:
             AgentIntent dataclass.
         """
+        # If a caller threads in a workspace_id that differs from how this parser
+        # was built, build a per-workspace parser so the tenant's own Gemini key
+        # is used. The resolver falls back to the global env key, so a no-override
+        # tenant (or T0000) yields exactly the same client as before.
+        if workspace_id is not None and workspace_id != self._workspace_id:
+            try:
+                return IntentParser(workspace_id=workspace_id).parse(
+                    message,
+                    action_schema=action_schema,
+                    conversation_history=conversation_history,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "IntentParser: per-workspace parser failed (%s) — using default parser",
+                    exc,
+                )
+
         if not self._model and not self._client:
             logger.info("IntentParser.parse: no Gemini model available, using keyword fallback")
             return _keyword_fallback(message)
@@ -318,7 +346,7 @@ OUTPUT FORMAT (strict JSON):
             if self._use_new_sdk and self._client:
                 # Newer google-genai SDK
                 response = self._client.models.generate_content(
-                    model="gemini-1.5-flash",
+                    model="gemini-3.1-flash-lite",
                     contents=system_prompt + "\n\n" + user_prompt,
                 )
                 raw = response.text.strip()

@@ -15,6 +15,36 @@ from .services import WhatsAppService
 logger = logging.getLogger(__name__)
 
 
+# Internal / non-template keys that must NOT be used as flat template params
+# when falling back from missing step_N_-prefixed keys.
+_NON_TEMPLATE_FLAT_KEYS = {
+    "tracking_link",
+    "header_image_url",
+    "header_video_url",
+    "header_document_url",
+    "header_text",
+}
+
+
+def _is_excluded_flat_key(key: str) -> bool:
+    """A flat variable key that should be excluded from template-param fallback."""
+    if key is None:
+        return True
+    if str(key).startswith("_"):
+        return True
+    return str(key).strip().lower() in _NON_TEMPLATE_FLAT_KEYS
+
+
+# Permanent WhatsApp Cloud API send error codes. When the send fails with one of
+# these, retrying will never succeed, so the enrollment is marked failed and
+# next_run_at is cleared (no further retries).
+_PERMANENT_WHATSAPP_ERROR_CODES = {
+    "131008", "131009", "131026", "131047", "131051",
+    "132000", "132001", "132005", "132007", "132012",
+    "132015", "132016", "132068", "132069", "100",
+}
+
+
 def _is_url_like(value: str) -> bool:
     candidate = str(value or "").strip().lower()
     return candidate.startswith(("http://", "https://", "www."))
@@ -124,24 +154,40 @@ def extract_step_params(variables: dict, step_order: int) -> list:
             suffix = key[len(prefix):]
             step_columns[suffix] = str(value) if value else ""
     
-    # If no step-specific columns found, and this is step 1 (common for bulk),
-    # try looking for direct numeric keys ("1", "2", "3") or generic keys
+    # If no step-specific columns found, fall back to FLAT top-level keys.
+    # This supports bulk-enroll / dataset / CSV imports which store flat
+    # variables (e.g. {"name": "priyam"}) with NO step_N_ prefix, and applies
+    # to ALL steps (not just step 1) so steps 2+ are not blank.
     # This supports the Bulk Messaging UI which sends params as {"1": "val", "2": "val"}
-    if not step_columns and step_order == 1:
+    if not step_columns:
         # Check for direct numeric keys
         numeric_params = {}
         for key, value in variables.items():
+            if _is_excluded_flat_key(key):
+                continue
             # If key is digit ("1", "2")
             if key.isdigit():
-                 numeric_params[int(key)] = str(value)
+                 numeric_params[int(key)] = str(value) if value else ""
             # If key is like "param_1" (CSV upload often gives this)
             elif key.startswith("param_") and key[6:].isdigit():
-                 numeric_params[int(key[6:])] = str(value)
-        
+                 numeric_params[int(key[6:])] = str(value) if value else ""
+
         # If we found numeric params, sort by number and return in order
         if numeric_params:
             for i in sorted(numeric_params.keys()):
                 params.append(numeric_params[i])
+            return params
+
+        # Otherwise fall back to flat named keys, in alphabetical order
+        # (predictable ordering, mirroring the step_N_ named path below).
+        flat_columns = {}
+        for key, value in variables.items():
+            if _is_excluded_flat_key(key):
+                continue
+            flat_columns[key] = str(value) if value else ""
+        if flat_columns:
+            for key in sorted(flat_columns.keys()):
+                params.append(flat_columns[key])
             return params
     
     # Otherwise, use named columns in alphabetical order
@@ -179,15 +225,17 @@ def extract_step_params_dict(variables: dict, step_order: int) -> dict:
             param_name = key[len(prefix):]
             params[param_name] = str(value) if value else ""
     
-    # If no step-specific columns found and this is step 1 (common for bulk),
-    # use direct keys from variables
-    if not params and step_order == 1:
+    # If no step-specific columns found, fall back to FLAT top-level keys.
+    # Applies to ALL steps (not just step 1) so bulk-enroll / dataset / CSV
+    # imports that store flat variables (e.g. {"name": "priyam"}) populate
+    # steps 2+ as well. Internal / non-template keys are excluded.
+    if not params:
         for key, value in variables.items():
-            # Skip internal keys
-            if key.startswith("_"):
+            # Skip internal keys and known non-template keys
+            if _is_excluded_flat_key(key):
                 continue
             params[key] = str(value) if value else ""
-            
+
     return params
 
 
@@ -580,15 +628,36 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
         
     else:
         error_msg = result.get("error", "Unknown error")
+        error_code_str = str(result.get("error_code", ""))
         logger.error(f"Drip send failed: {result}")
-        
-        # Check if it's a parameter mismatch error
-        if "132000" in str(result.get("error_code", "")) or "params" in error_msg.lower():
+
+        # Robustly look for any permanent error code in BOTH the error_code
+        # field and the error text (different layers surface it differently).
+        combined_error_text = f"{error_code_str} {str(error_msg)}"
+        matched_permanent_code = next(
+            (code for code in _PERMANENT_WHATSAPP_ERROR_CODES if code in combined_error_text),
+            None,
+        )
+
+        if "132000" in error_code_str or "params" in error_msg.lower():
+            # Template parameter mismatch -> terminal, missing data
             enrollment.status = "blocked_missing_data"
             enrollment.status_reason = f"Template parameter mismatch: {error_msg}"
+            enrollment.next_run_at = None
             logger.warning(f"Enrollment {enrollment.id} blocked - missing data for template")
+        elif matched_permanent_code:
+            # Permanent WhatsApp send error -> terminal failure, do NOT retry.
+            enrollment.status = "failed"
+            enrollment.status_reason = (
+                f"Permanent send error {matched_permanent_code}: {error_msg}"
+            )
+            enrollment.next_run_at = None
+            logger.warning(
+                f"Enrollment {enrollment.id} failed permanently "
+                f"(error {matched_permanent_code}) - will not retry"
+            )
         else:
-            # Other error - retry later
+            # Genuinely transient error (rate-limit/network) - retry later
             enrollment.next_run_at = datetime.now(timezone.utc) + timedelta(hours=1)
             enrollment.status_reason = f"Send failed: {error_msg}"
 

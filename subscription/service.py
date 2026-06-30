@@ -76,12 +76,130 @@ def is_private_slot_user(user: User) -> bool:
     return (getattr(user, "billing_scope", None) or BILLING_SCOPE_GLOBAL) == BILLING_SCOPE_PRIVATE
 
 
+def _is_internal_audience(user: User) -> bool:
+    """True when the user belongs to SocioChat's global (internal) audience.
+
+    A user is internal if they have no ``tenant_id``, OR their tenant is the
+    internal SocioChat tenant (``tenant_code == INTERNAL_TENANT_CODE``, i.e.
+    T0000). End-user (non-internal) tenant members are NOT internal audience.
+    """
+    if not user:
+        return True
+    tenant_id = getattr(user, "tenant_id", None)
+    if not tenant_id:
+        return True
+    from tenant.branding import INTERNAL_TENANT_CODE
+    from tenant.models import Tenant
+
+    tenant = db.session.get(Tenant, tenant_id)
+    if not tenant:
+        return True
+    return (getattr(tenant, "tenant_code", None) or "") == INTERNAL_TENANT_CODE
+
+
+def get_user_plan_rows(user: User) -> list:
+    """Tenant-aware AND private-slot-aware list of SubscriptionPlan rows the user
+    may see/select. Isolation rules:
+
+      * Internal audience (SocioChat / T0000):
+          - global PUBLIC catalog (tenant_id NULL, is_public, is_active); OR
+          - if the user is in the PRIVATE-SLOT pool, the global PRIVATE catalog
+            (tenant_id NULL, plan_scope='private', is_active) — their special
+            plans, shown only to them.
+      * Tenant (non-internal) user:
+          - THEIR tenant's PUBLIC plans (tenant_id == user.tenant_id, is_public);
+            OR
+          - if private-slot, THEIR tenant's PRIVATE plans (plan_scope='private')
+            only.
+
+    A tenant's private plans are never exposed to its regular (global) users, and
+    never to any other tenant.
+    """
+    from subscription.plan_models import SubscriptionPlan
+
+    private = is_private_slot_user(user)
+
+    if _is_internal_audience(user):
+        if private:
+            q = SubscriptionPlan.query.filter(
+                SubscriptionPlan.tenant_id.is_(None),
+                SubscriptionPlan.plan_scope == PLAN_SCOPE_PRIVATE,
+                SubscriptionPlan.is_active.is_(True),
+            )
+        else:
+            q = SubscriptionPlan.query.filter(
+                SubscriptionPlan.tenant_id.is_(None),
+                SubscriptionPlan.is_public.is_(True),
+                SubscriptionPlan.is_active.is_(True),
+            )
+        return q.order_by(SubscriptionPlan.sort_order).all()
+
+    if private:
+        q = SubscriptionPlan.query.filter(
+            SubscriptionPlan.tenant_id == user.tenant_id,
+            SubscriptionPlan.plan_scope == PLAN_SCOPE_PRIVATE,
+            SubscriptionPlan.is_active.is_(True),
+        )
+    else:
+        q = SubscriptionPlan.query.filter(
+            SubscriptionPlan.tenant_id == user.tenant_id,
+            SubscriptionPlan.is_public.is_(True),
+            SubscriptionPlan.is_active.is_(True),
+        )
+    return q.order_by(SubscriptionPlan.sort_order).all()
+
+
+def get_current_subscription_info(user: User) -> dict:
+    """Current-subscription summary for the end-user subscription page: active
+    plan, billing scope, private-slot flag, and expiry dates."""
+    def _iso(dt):
+        return dt.isoformat() if dt else None
+
+    return {
+        "plan_slug": (getattr(user, "plan", None) or "beta") if user else "beta",
+        "effective_plan": get_effective_plan_slug(user),
+        "billing_scope": (getattr(user, "billing_scope", None) or BILLING_SCOPE_GLOBAL),
+        "is_private_slot": is_private_slot_user(user),
+        "subscription_expires_at": _iso(getattr(user, "subscription_expires_at", None)),
+        "beta_expires_at": _iso(getattr(user, "beta_expires_at", None)),
+        "is_expired": _is_subscription_expired(user),
+    }
+
+
+def get_assignable_user_plan_slugs(user: User) -> list:
+    """Plan slugs an end-user may select for themselves (tenant-aware).
+
+    Internal audience also unions the built-in VALID_PLANS so the global
+    SocioChat tiers remain selectable even if not present as DB rows.
+    """
+    slugs = [row.slug for row in get_user_plan_rows(user)]
+    if _is_internal_audience(user):
+        for slug in VALID_PLANS:
+            if slug not in slugs:
+                slugs.append(slug)
+    return slugs
+
+
 def is_plan_assignable_to_user(user: User, plan_slug: str) -> bool:
-    """Validate plan slug for a user based on billing scope."""
+    """Validate plan slug for a user based on billing scope and tenant.
+
+    Internal users keep the existing behavior (VALID_PLANS + global
+    public/private-slot plans). Tenant (non-internal) users may ONLY be
+    assigned plans owned by THEIR tenant (tenant_id == user.tenant_id) — never
+    the global SocioChat catalog.
+    """
     from subscription.plan_models import SubscriptionPlan
 
     if not plan_slug:
         return False
+
+    if not _is_internal_audience(user):
+        row = SubscriptionPlan.query.filter_by(
+            slug=plan_slug,
+            tenant_id=user.tenant_id,
+            is_active=True,
+        ).first()
+        return row is not None
 
     if plan_slug in VALID_PLANS:
         return True
@@ -96,8 +214,18 @@ def is_plan_assignable_to_user(user: User, plan_slug: str) -> bool:
 
 
 def get_assignable_plan_slugs_for_user(user: User) -> list:
-    """Plan slugs admin may assign to this user."""
+    """Plan slugs admin may assign to this user (tenant-aware).
+
+    Internal users => VALID_PLANS + global public/private-slot plans (existing
+    behavior). Tenant (non-internal) users => only THEIR tenant's plans.
+    """
     from subscription.plan_models import SubscriptionPlan
+
+    if not _is_internal_audience(user):
+        rows = SubscriptionPlan.query.filter_by(
+            tenant_id=user.tenant_id, is_active=True
+        ).all()
+        return [row.slug for row in rows]
 
     slugs = list(VALID_PLANS)
     scope = PLAN_SCOPE_PRIVATE if is_private_slot_user(user) else "global"
@@ -147,17 +275,65 @@ def get_user_plan(user: User) -> str:
     return get_effective_plan_slug(user)
 
 
+def _add_months(dt, n):
+    import calendar
+    m = dt.month - 1 + n
+    y = dt.year + m // 12
+    mo = m % 12 + 1
+    d = min(dt.day, calendar.monthrange(y, mo)[1])
+    return dt.replace(year=y, month=mo, day=d)
+
+
+def expiry_from_period(start, billing_period):
+    """End datetime = start + (monthly:1, quarterly:3, yearly:12 months).
+    Returns None for custom/unknown periods (=> no auto-expiry / never expires)."""
+    months = {"monthly": 1, "quarterly": 3, "yearly": 12}.get((billing_period or "").lower())
+    if not months:
+        return None
+    return _add_months(start, months)
+
+
 def load_user_matrix(user) -> dict:
-    """Plan matrix with per-user access overrides applied on top."""
+    """Plan matrix with TENANT and per-user overrides applied on top.
+
+    Override hierarchy (lowest -> highest precedence):
+        system default (constants) -> plan (DB) -> tenant override -> user override
+
+    The tenant override layer is how the Super Admin enables/disables features or
+    changes limits per tenant. It is additive: tenants with no overrides (e.g.
+    the existing T0000 users) behave exactly as before.
+    """
     plan = get_user_plan(user)
     matrix = load_plan_matrix(plan)
     if not user:
         return matrix
+
+    # --- Tenant-level overrides (Super Admin per-tenant feature control) ---
+    tenant_id = getattr(user, "tenant_id", None)
+    if tenant_id:
+        try:
+            from tenant.models import TenantFeatureOverride
+            for ov in TenantFeatureOverride.query.filter_by(tenant_id=tenant_id).all():
+                if ov.feature_key in LIMIT_KEYS:
+                    if ov.limit_value is not None:
+                        matrix[ov.feature_key] = ov.limit_value
+                elif ov.enabled is not None:
+                    matrix[ov.feature_key] = bool(ov.enabled)
+        except Exception:
+            logger.exception("tenant feature override load failed")
+
+    # --- Per-user overrides (most specific layer) ---
+    # Tenant-admins can override a single user's numeric limits (e.g. max
+    # workspaces) in addition to access flags. For LIMIT_KEYS a non-null
+    # limit_value wins; for access features the enabled flag wins.
     from subscription.plan_models import UserFeatureAccess
     for ov in UserFeatureAccess.query.filter_by(user_id=user.id).all():
         if ov.feature_key in LIMIT_KEYS:
-            continue  # access-only overrides
-        matrix[ov.feature_key] = bool(ov.enabled)
+            if ov.limit_value is not None:
+                matrix[ov.feature_key] = ov.limit_value
+            continue
+        if ov.enabled is not None:
+            matrix[ov.feature_key] = bool(ov.enabled)
     return matrix
 
 
@@ -237,23 +413,60 @@ def has_feature(user: User, feature: str) -> bool:
 # Limit Checks
 # =============================================================================
 
+def _tenant_workspace_cap(user) -> Tuple[Optional[int], int]:
+    """White-label LICENSE cap on TOTAL workspaces in the user's tenant.
+
+    Returns ``(cap, used_total)``. ``cap`` is ``None`` when no license applies
+    (e.g. the internal tenant or an unresolved subscription) — callers treat
+    ``None`` as "no tenant-level cap". Fails open on any error so workspace
+    creation never breaks on a lookup glitch.
+    """
+    tenant_id = getattr(user, "tenant_id", None)
+    if not tenant_id:
+        return None, 0
+    try:
+        from tenant.models import TenantSubscription
+        from tenant.tenant_plan_models import TenantPlan
+        sub = TenantSubscription.query.filter_by(tenant_id=tenant_id).first()
+        if not sub or not sub.plan_slug:
+            return None, 0
+        plan = TenantPlan.query.filter_by(slug=sub.plan_slug).first()
+        if not plan:
+            return None, 0
+        used = (Workspace.query.join(User, Workspace.user_id == User.id)
+                .filter(User.tenant_id == tenant_id).count())
+        return plan.max_workspaces, used
+    except Exception:
+        logger.exception("tenant_workspace_cap resolution failed user=%s", getattr(user, "id", None))
+        return None, 0
+
+
 def check_workspace_limit(user: User) -> Tuple[bool, int, int]:
+    """Check whether the user may create another workspace.
+
+    Enforces the effective limit across all three control layers:
+      * per-user limit = ``matrix["workspaces"]`` (plan -> per-tenant override ->
+        per-user override, resolved by ``load_user_matrix``), AND
+      * the white-label tenant LICENSE cap on TOTAL tenant workspaces
+        (``TenantPlan.max_workspaces``).
+    Both must pass. Returns ``(allowed, current_count, limit)`` where the
+    reported numbers reflect the binding constraint.
     """
-    Check if user can create more workspaces.
-    
-    Returns:
-        Tuple of (allowed, current_count, limit)
-    """
-    plan = get_user_plan(user)
-    features = load_plan_matrix(plan)
-    limit = features["workspaces"]
-    
-    if is_unlimited(limit):
-        return True, 0, UNLIMITED
-    
-    current_count = Workspace.query.filter_by(user_id=user.id).count()
-    
-    return current_count < limit, current_count, limit
+    matrix = load_user_matrix(user)
+    per_user_limit = matrix.get("workspaces", 1)
+    user_count = Workspace.query.filter_by(user_id=user.id).count()
+
+    # Layer A — per-user limit (plan / per-tenant override / per-user override)
+    if not is_unlimited(per_user_limit) and user_count >= per_user_limit:
+        return False, user_count, per_user_limit
+
+    # Layer B — white-label license cap on TOTAL tenant workspaces
+    tenant_cap, tenant_used = _tenant_workspace_cap(user)
+    if tenant_cap is not None and not is_unlimited(tenant_cap) and tenant_used >= tenant_cap:
+        return False, tenant_used, tenant_cap
+
+    effective = per_user_limit if not is_unlimited(per_user_limit) else UNLIMITED
+    return True, user_count, effective
 
 
 def check_message_limit(user: User, workspace_id: Optional[int] = None) -> Tuple[bool, int, int]:

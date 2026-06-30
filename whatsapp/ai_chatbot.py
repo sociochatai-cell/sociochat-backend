@@ -39,14 +39,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = (
     os.environ.get("TEXT_MODEL")
     or os.environ.get("GEMINI_MODEL")
-    or "gemini-2.0-flash"
+    or "gemini-3.1-flash-lite"
 )
 
 _MODEL_ALIASES = {
-    "gemini-1.5-flash": "gemini-2.0-flash",
-    "gemini-1.5-pro": "gemini-2.0-flash",
-    "gemini-pro": "gemini-2.0-flash",
-    "gemini-2.0-flash-exp": "gemini-2.0-flash",
+    "gemini-1.5-flash": "gemini-3.1-flash-lite",
+    "gemini-1.5-pro": "gemini-3.1-flash-lite",
+    "gemini-pro": "gemini-3.1-flash-lite",
+    "gemini-2.0-flash-exp": "gemini-3.1-flash-lite",
+    "gemini-2.0-flash": "gemini-3.1-flash-lite",
+    "gemini-2.0-flash-001": "gemini-3.1-flash-lite",
 }
 
 
@@ -142,15 +144,59 @@ KNOWLEDGE RULES (CRITICAL):
 # ============================================================
 
 _genai_client = None
+# Per-tenant API-key clients, cached by tenant Gemini key so a tenant using their
+# own AI billing reuses one client instead of rebuilding it on every call.
+_genai_clients_by_key: Dict[str, Any] = {}
 
 
-def get_genai_client():
+def _get_tenant_genai_client(workspace_id):
+    """Return a GenAI client built from the tenant's own Gemini key, or None.
+
+    Falls back to the shared global client when the tenant has no AI override
+    (so T0000 / unconfigured tenants are byte-identical to before).
+    """
+    try:
+        from tenant.integration import get_tenant_ai_config
+        cfg = get_tenant_ai_config(workspace_id=workspace_id)
+    except Exception as e:
+        logger.warning(f"Tenant AI config resolution failed ({e}); using global client")
+        return None
+
+    # No tenant override → use the existing shared/global client path unchanged.
+    if not cfg.is_custom or not cfg.gemini_api_key:
+        return None
+
+    api_key = cfg.gemini_api_key
+    cached = _genai_clients_by_key.get(api_key)
+    if cached:
+        return cached
+    try:
+        logger.info("Initializing GenAI Client (tenant API key mode)")
+        client = genai.Client(api_key=api_key)
+        _genai_clients_by_key[api_key] = client
+        return client
+    except Exception as e:
+        logger.error(f"Tenant GenAI Client init failed (API key mode): {e}")
+        return None
+
+
+def get_genai_client(workspace_id=None):
     """Get or initialize the GenAI client.
 
     Local dev: set GEMINI_API_KEY (or GOOGLE_API_KEY) — uses Google AI API.
     Production: set GOOGLE_APPLICATION_CREDENTIALS + GCP_PROJECT for Vertex AI.
+
+    When ``workspace_id`` is supplied and that tenant has configured their own
+    Gemini key, a per-tenant client is returned so the tenant is billed on their
+    own AI quota. With no workspace (or no tenant override) the shared global
+    client is used — byte-identical to before.
     """
     global _genai_client
+
+    if workspace_id:
+        tenant_client = _get_tenant_genai_client(workspace_id)
+        if tenant_client is not None:
+            return tenant_client
 
     if _genai_client:
         return _genai_client
@@ -435,13 +481,21 @@ JSON:"""
 INTENT_TYPES = ["greeting", "support", "sales", "info", "complaint", "appointment", "order_status", "payment", "faq", "other"]
 
 
-def classify_intent(message: str, model_name: Optional[str] = None) -> IntentResult:
-    """Classify the intent of a customer message. FAIL-SAFE."""
+def classify_intent(
+    message: str,
+    model_name: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+) -> IntentResult:
+    """Classify the intent of a customer message. FAIL-SAFE.
+
+    Pass ``workspace_id`` to bill the tenant's own Gemini key; omitting it uses
+    the shared global client (byte-identical to before).
+    """
     import time
     start_time = time.time()
-    
+
     try:
-        client = get_genai_client()
+        client = get_genai_client(workspace_id=workspace_id)
         if not client:
             return IntentResult(intent="other", success=False, error="API not configured")
         
@@ -624,7 +678,9 @@ class WhatsAppAIChatbot:
     def _initialize(self):
         """Initialize GenAI Vertex Client."""
         try:
-            self.client = get_genai_client()
+            # Use the tenant's own Gemini key when this chatbot is scoped to a
+            # workspace; falls back to the global client when unset/no override.
+            self.client = get_genai_client(workspace_id=self.config.workspace_id)
             if not self.client:
                 self._init_error = "API not configured"
                 return

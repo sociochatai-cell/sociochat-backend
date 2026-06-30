@@ -528,13 +528,16 @@ def webhook_verify():
     mode = request.args.get("hub.mode", "")
     token = request.args.get("hub.verify_token", "")
     challenge = request.args.get("hub.challenge", "")
-    
-    result = verify_webhook_challenge(mode, token, challenge)
-    
-    if result:
+
+    # Accept the global env verify token OR any tenant's own verify token. The
+    # GET-verify request carries no tenant context, so a tenant using its own
+    # Meta app verifies against ITS stored token. For T0000/unconfigured this is
+    # identical to the env-token comparison done before.
+    from tenant.integration import verify_token_matches_any
+    if mode == "subscribe" and verify_token_matches_any(token):
         logger.info("Webhook verification successful")
-        return result, 200
-    
+        return challenge, 200
+
     logger.warning("Webhook verification failed")
     return "Forbidden", 403
 
@@ -548,16 +551,32 @@ def webhook_receive():
     
     IMPORTANT: Always respond 200 OK immediately, then process.
     """
-    # Verify signature if app secret is configured
+    # Verify signature if app secret is configured.
+    # Use the SAME raw bytes Meta signed (do NOT re-serialize the JSON).
     signature = request.headers.get("X-Hub-Signature-256", "")
-    app_secret = os.getenv("WHATSAPP_APP_SECRET", "")
-    
+    raw_body = request.get_data()
+
+    # Resolve the app secret PER-TENANT by the phone_number_id in the payload.
+    # For T0000/unknown (or when no pid is present) the resolver returns the env
+    # secret, so this is byte-identical to the previous global behavior.
+    pid = None
+    try:
+        _payload_for_sig = request.get_json(silent=True) or {}
+        pid = (
+            _payload_for_sig["entry"][0]["changes"][0]["value"]["metadata"]["phone_number_id"]
+        )
+    except (KeyError, IndexError, TypeError):
+        pid = None
+
+    from tenant.integration import get_tenant_meta_config
+    app_secret = get_tenant_meta_config(phone_number_id=pid).app_secret
+
     if app_secret:
-        if not verify_webhook_signature(request.data, signature, app_secret):
+        if not verify_webhook_signature(raw_body, signature, app_secret):
             logger.warning("Invalid webhook signature")
             # Still return 200 to prevent retries, but log the issue
             return "OK", 200
-    
+
     payload = request.get_json(silent=True)
     
     # DEBUG: Log entire payload - use print to guarantee console output
@@ -858,7 +877,24 @@ def send_flow():
         footer_text = data.get("footer_text", "")
         button_text = data.get("button_text", "Open Form")
         flow_token = data.get("flow_token", f"flow_{to}_{flow_id}")
-        
+
+        # Draft mode lets you send an UNPUBLISHED flow to test recipients
+        # (bypasses the publish/business-verification requirement).
+        mode = (data.get("mode") or "").strip().lower()
+
+        # Resolve the entry screen: explicit param > flow's stored entry screen > WELCOME.
+        screen = (data.get("screen") or "").strip()
+        if not screen:
+            try:
+                from .models import WhatsAppFlow
+                _flow = WhatsAppFlow.query.filter_by(meta_flow_id=str(flow_id)).first()
+                if _flow and _flow.entry_screen_id:
+                    screen = _flow.entry_screen_id
+            except Exception as _se:
+                logger.warning(f"Could not resolve entry screen for flow {flow_id}: {_se}")
+        if not screen:
+            screen = "WELCOME"
+
         # Normalize phone number
         if not to.startswith("+"):
             to = to.lstrip("0")
@@ -895,11 +931,15 @@ def send_flow():
                     "flow_cta": button_text,
                     "flow_action": "navigate",
                     "flow_action_payload": {
-                        "screen": "WELCOME"
+                        "screen": screen
                     }
                 }
             }
         }
+
+        # Send the unpublished/draft flow (for testing before publish).
+        if mode == "draft":
+            interactive_payload["action"]["parameters"]["mode"] = "draft"
         
         # Add footer if provided
         if footer_text:
@@ -2080,7 +2120,7 @@ def generate_ai_insights():
         if not client:
             return jsonify({"success": False, "error": "AI service not configured"}), 503
             
-        model_name = os.environ.get("TEXT_MODEL", "gemini-2.0-flash-001")
+        model_name = os.environ.get("TEXT_MODEL", "gemini-3.1-flash-lite")
         
         prompt = f"""You are Sociovia AI, a WhatsApp Business analytics expert. Be CONCISE and ACTIONABLE.
 
@@ -2948,8 +2988,9 @@ def delete_template(template_id):
         return jsonify({"success": False, "error": token_error}), 400
     
     access_token = account.get_access_token()
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(workspace_id=workspace_id).whatsapp_api_version or "v22.0"
+
     # Find template in database - first try by meta_template_id (string)
     template = WhatsAppTemplate.query.filter_by(
         account_id=account.id,
@@ -3261,7 +3302,7 @@ Return ONLY the cleaned template text. No explanations.
         try:
             from .ai_chatbot import get_genai_client
 
-            text_model = os.environ.get("TEXT_MODEL", "gemini-2.0-flash")
+            text_model = os.environ.get("TEXT_MODEL", "gemini-3.1-flash-lite")
             client = get_genai_client()
             if not client:
                 return jsonify({
@@ -3378,9 +3419,10 @@ def create_template():
     # Update account_id if helper returned a different active account
     account_id = account.id
     access_token = account.get_access_token()
-    
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    
+
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(workspace_id=account.workspace_id).whatsapp_api_version or "v22.0"
+
     # ====== INTENT ENFORCEMENT ======
     # Server-side validation to prevent Marketing disguised as Utility
     try:
@@ -3556,6 +3598,18 @@ def create_template():
                     "type": "FOOTER",
                     "text": comp.get("text", "")
                 })
+            elif comp_type == "BUTTONS":
+                # Sanitize buttons before sending to Meta. FLOW buttons carry a
+                # `flow_token` only at SEND time — Meta rejects it (and any empty
+                # value) during template CREATION with error (#100).
+                clean_buttons = []
+                for btn in comp.get("buttons", []):
+                    btn = dict(btn)
+                    if str(btn.get("type", "")).upper() == "FLOW":
+                        btn.pop("flow_token", None)
+                        btn = {k: v for k, v in btn.items() if v not in ("", None)}
+                    clean_buttons.append(btn)
+                api_components.append({"type": "BUTTONS", "buttons": clean_buttons})
             else:
                 api_components.append(comp)
         
@@ -3685,8 +3739,11 @@ def get_template(template_name: str):
     # Fallback to environment variables
     if not access_token:
         access_token = os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TEMP_TOKEN")
-    
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(
+        workspace_id=(account.workspace_id if account else None)
+    ).whatsapp_api_version or "v22.0"
     
     if not access_token:
         return jsonify({
@@ -4262,8 +4319,9 @@ def register_phone_number(account_id: int):
     # Get optional PIN from request body
     data = request.get_json(silent=True) or {}
     pin = data.get("pin", "123456")  # Default 6-digit PIN
-    
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v24.0")
+
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(workspace_id=account.workspace_id).whatsapp_api_version or "v24.0"
     
     try:
         resp = http_requests.post(
@@ -4451,8 +4509,9 @@ def get_ice_breakers(account_id: int):
         return jsonify({"success": False, "error": token_error}), 400
     
     access_token = account.get_access_token()
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(workspace_id=account.workspace_id).whatsapp_api_version or "v22.0"
+
     try:
         # Get WhatsApp Business Profile with ice breakers
         url = f"https://graph.facebook.com/{api_version}/{account.phone_number_id}/whatsapp_business_profile"
@@ -4544,8 +4603,9 @@ def update_ice_breakers(account_id: int):
             return jsonify({"success": False, "error": f"Ice breaker {i+1} exceeds 80 character limit"}), 400
     
     access_token = account.get_access_token()
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(workspace_id=account.workspace_id).whatsapp_api_version or "v22.0"
+
     try:
         # Build conversational automation payload
         automation_payload = {
@@ -4609,8 +4669,9 @@ def delete_ice_breakers(account_id: int):
         return jsonify({"success": False, "error": token_error}), 400
     
     access_token = account.get_access_token()
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(workspace_id=account.workspace_id).whatsapp_api_version or "v22.0"
+
     try:
         # Clear ice breakers by setting empty array
         url = f"https://graph.facebook.com/{api_version}/{account.phone_number_id}/conversational_automation"
@@ -4665,10 +4726,12 @@ def connect_start():
     if not workspace_id:
         return jsonify({"success": False, "error": "workspace_id is required"}), 400
 
-    # Use existing FB env vars (same as other Meta integrations)
-    app_id = os.getenv("FB_APP_ID")
-    config_id = os.getenv("WHATSAPP_CONFIG_ID")
-    api_version = os.getenv("FB_API_VERSION", "v22.0")
+    # Per-tenant Meta credentials (falls back to env for T0000/unconfigured).
+    from tenant.integration import get_tenant_meta_config
+    cfg = get_tenant_meta_config(workspace_id=workspace_id)
+    app_id = cfg.app_id
+    config_id = cfg.config_id
+    api_version = cfg.fb_api_version or "v22.0"
     
     if not app_id:
         return jsonify({"success": False, "error": "FB_APP_ID not configured"}), 500
@@ -4705,7 +4768,8 @@ def connect_popup():
     # OAuth configuration
     app_id = os.getenv("FB_APP_ID")
     config_id = os.getenv("WHATSAPP_CONFIG_ID")
-    api_version = os.getenv("FB_API_VERSION", "v22.0")
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(workspace_id=workspace_id).fb_api_version or "v22.0"
     redirect_base = os.getenv("OAUTH_REDIRECT_BASE", "https://sociovia-backend-362038465411.europe-west1.run.app")
     redirect_uri = f"{redirect_base.rstrip('/')}/api/whatsapp/connect/callback"
 
@@ -4713,10 +4777,12 @@ def connect_popup():
         return "FB_APP_ID not configured", 500
 
     # WhatsApp-specific scopes for Embedded Signup
+    # catalog_management + business_management are required for product catalog APIs
     scopes = [
         "whatsapp_business_management",
         "whatsapp_business_messaging",
         "business_management",
+        "catalog_management",
     ]
 
     # Build Facebook OAuth URL for WhatsApp Embedded Signup
@@ -4813,10 +4879,13 @@ def connect_exchange():
     if not workspace_id:
         return jsonify({"success": False, "error": "workspace_id is required"}), 400
     
-    app_id = os.getenv("FB_APP_ID")
-    app_secret = os.getenv("FB_APP_SECRET")
-    api_version = os.getenv("FB_API_VERSION", "v22.0")
-    
+    # Per-tenant Meta credentials (falls back to env for T0000/unconfigured).
+    from tenant.integration import get_tenant_meta_config
+    cfg = get_tenant_meta_config(workspace_id=workspace_id)
+    app_id = cfg.app_id
+    app_secret = cfg.app_secret
+    api_version = cfg.fb_api_version or "v22.0"
+
     try:
         # Exchange code for access token (no redirect_uri needed for Embedded Signup)
         token_resp = http_requests.get(
@@ -5076,10 +5145,13 @@ def facebook_oauth_login():
     if not workspace_id:
         return jsonify({"success": False, "error": "workspace_id is required"}), 400
     
-    app_id = os.getenv("FB_APP_ID") or os.getenv("META_APP_ID")
-    app_secret = os.getenv("FB_APP_SECRET") or os.getenv("META_APP_SECRET")
-    api_version = os.getenv("FB_API_VERSION", "v22.0")
-    
+    # Per-tenant Meta credentials (falls back to env for T0000/unconfigured).
+    from tenant.integration import get_tenant_meta_config
+    cfg = get_tenant_meta_config(workspace_id=workspace_id)
+    app_id = cfg.app_id
+    app_secret = cfg.app_secret
+    api_version = cfg.fb_api_version or "v22.0"
+
     if not app_id or not app_secret:
         logger.error("Facebook app credentials not configured")
         return jsonify({"success": False, "error": "Facebook OAuth not configured"}), 500
@@ -5524,12 +5596,14 @@ def connect_callback():
 
     try:
         # Exchange code for access token
-        app_id = os.getenv("FB_APP_ID")
-        app_secret = os.getenv("FB_APP_SECRET")
-        api_version = os.getenv("FB_API_VERSION", "v22.0")
-        redirect_base = os.getenv("OAUTH_REDIRECT_BASE", "https://sociovia-backend-362038465411.europe-west1.run.app")
-        redirect_uri = f"{redirect_base.rstrip('/')}/api/whatsapp/connect/callback"
-        
+        # Per-tenant Meta credentials (falls back to env for T0000/unconfigured).
+        from tenant.integration import get_tenant_meta_config
+        cfg = get_tenant_meta_config(workspace_id=workspace_id)
+        app_id = cfg.app_id
+        app_secret = cfg.app_secret
+        api_version = cfg.fb_api_version or "v22.0"
+        redirect_uri = cfg.redirect_url
+
         import requests as http_requests
         
         # Token exchange

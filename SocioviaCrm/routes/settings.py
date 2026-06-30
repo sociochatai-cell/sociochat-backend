@@ -19,31 +19,23 @@ def _get_workspace_from_request():
 
 
 def _mask_value(name: str, val: str, masked_flag: bool) -> str:
-    """
-    Mask secrets only for UI display (/config only).
-    Masking is currently DISABLED to return the full original value.
-    """
-
-    # If value is empty, return empty string
+    """Mask secrets for UI display so API responses never echo a stored
+    credential back in full. Anything that looks like a key/secret/token/
+    password (or is explicitly flagged) is returned as a short masked form."""
     if not val:
         return ""
 
-    # Convert name to lowercase for checks
-    # name_l = name.lower()
-
-    # Masking logic is DISABLED
-    # must_mask = (
-    #     masked_flag
-    #     or "api_key" in name_l
-    #     or "secret" in name_l
-    #     or "token" in name_l
-    #     or "password" in name_l
-    # )
-
-    # if must_mask:
-    #     return val[:4] + "..." + val[-4:] if len(val) >= 12 else ("*" * len(val))
-
-    # Always return full original value
+    name_l = (name or "").lower()
+    must_mask = (
+        masked_flag
+        or "api_key" in name_l
+        or "secret" in name_l
+        or "token" in name_l
+        or "password" in name_l
+        or "key" in name_l
+    )
+    if must_mask:
+        return val[:4] + "..." + val[-4:] if len(val) >= 12 else ("*" * len(val))
     return val
 
 
@@ -200,3 +192,144 @@ def regenerate_key():
         "key": masked,
         "workspace_id": workspace_id
     }), 200
+
+
+# ------------------------------------
+# Qualify keywords (buying-intent words)
+# ------------------------------------
+
+@bp.route("/qualify-keywords", methods=["GET"])
+def get_qualify_keywords_route():
+    """
+    GET /settings/qualify-keywords?workspace_id=<id>
+    Returns the default + custom qualify keyword rules for a workspace.
+    defaults/custom are lists of objects: {"keyword": str, "status": str}.
+    """
+    workspace_id = _get_workspace_from_request()
+    if not workspace_id:
+        return jsonify({"error": "workspace_id required"}), 400
+
+    try:
+        from SocioviaCrm.qualify_keywords import get_qualify_keywords
+
+        data = get_qualify_keywords(workspace_id)
+
+        return jsonify({
+            "success": True,
+            "defaults": data.get("defaults", []),
+            "custom": data.get("custom", []),
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route("/qualify-keywords", methods=["PUT", "POST"])
+def set_qualify_keywords_route():
+    """
+    PUT /settings/qualify-keywords?workspace_id=<id>
+    Body: { "custom": [{"keyword": "buy", "status": "qualified"}, ...] }
+    Also tolerates the old string shape { "custom": ["word1", "word2"] }
+    (those become {"keyword": <word>, "status": "qualified"}).
+    Replaces the custom qualify keyword rules for a workspace.
+    """
+    workspace_id = _get_workspace_from_request()
+    if not workspace_id:
+        return jsonify({"error": "workspace_id required"}), 400
+
+    try:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "invalid JSON body"}), 400
+
+        raw = payload.get("custom")
+        if raw is None:
+            raw = payload.get("keywords")
+        if not isinstance(raw, list):
+            return jsonify({"error": "custom must be a list"}), 400
+
+        # Normalize to objects {"keyword","status"}. Tolerate the old
+        # list-of-strings shape by defaulting status to "qualified".
+        custom_list = []
+        for item in raw:
+            if isinstance(item, dict):
+                kw = str(item.get("keyword", "")).strip()
+                status = str(item.get("status", "qualified")).strip() or "qualified"
+            else:
+                kw = str(item).strip()
+                status = "qualified"
+            if kw:
+                custom_list.append({"keyword": kw, "status": status})
+
+        from SocioviaCrm.qualify_keywords import set_qualify_keywords
+
+        data = set_qualify_keywords(workspace_id, custom_list)
+
+        return jsonify({
+            "success": True,
+            "defaults": data.get("defaults", []),
+            "custom": data.get("custom", []),
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ------------------------------------
+# AI status classifier config (Phase 3)
+# ------------------------------------
+
+@bp.route("/ai-status-config", methods=["GET"])
+def get_ai_status_config_route():
+    """
+    GET /settings/ai-status-config?workspace_id=<id>
+    Returns the AI lead-status classifier config for a workspace.
+    """
+    workspace_id = _get_workspace_from_request()
+    if not workspace_id:
+        return jsonify({"error": "workspace_id required"}), 400
+
+    try:
+        from SocioviaCrm.ai_status_classifier import get_ai_status_config
+
+        data = get_ai_status_config(workspace_id)
+
+        return jsonify({
+            "success": True,
+            "enabled": data.get("enabled", False),
+            "prompt": data.get("prompt", ""),
+            "default_prompt": data.get("default_prompt", ""),
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route("/ai-status-config", methods=["PUT", "POST"])
+def set_ai_status_config_route():
+    """
+    PUT /settings/ai-status-config?workspace_id=<id>
+    Body: { "enabled": bool, "prompt": str }
+    Updates the AI lead-status classifier config for a workspace.
+    """
+    workspace_id = _get_workspace_from_request()
+    if not workspace_id:
+        return jsonify({"error": "workspace_id required"}), 400
+
+    try:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "invalid JSON body"}), 400
+
+        enabled = payload.get("enabled")
+        prompt = payload.get("prompt")
+
+        from SocioviaCrm.ai_status_classifier import set_ai_status_config
+
+        data = set_ai_status_config(workspace_id, enabled=enabled, prompt=prompt)
+
+        return jsonify({
+            "success": True,
+            "enabled": data.get("enabled", False),
+            "prompt": data.get("prompt", ""),
+            "default_prompt": data.get("default_prompt", ""),
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

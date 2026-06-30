@@ -84,7 +84,7 @@ def init_models():
 
         # ownership / external mapping
         user_id = db.Column(
-            db.String,
+            db.Integer,
             db.ForeignKey("users.id", ondelete="SET NULL"),
             nullable=True,
             index=True,
@@ -238,7 +238,7 @@ def init_models():
             index=True,
         )
         # ✅ NEW: link to user + external meta ID
-        user_id = db.Column(db.String, db.ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+        user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
         external_id = db.Column(db.String, nullable=True, index=True)  # e.g. Meta campaign ID
 
         name = db.Column(db.String(255), nullable=False)

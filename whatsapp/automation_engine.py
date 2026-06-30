@@ -591,7 +591,7 @@ def send_automation_response(
                 "fallback_message": response_config.get(
                     "fallback_message", DEFAULT_HANDOFF_MESSAGE
                 ),
-                "model": response_config.get("model") or os.getenv("TEXT_MODEL", "gemini-2.0-flash"),
+                "model": response_config.get("model") or os.getenv("TEXT_MODEL", "gemini-3.1-flash-lite"),
                 "max_tokens": response_config.get("max_tokens", 1024),
                 "temperature": response_config.get("temperature", 0.3),
                 "context_messages": response_config.get("context_messages", 5),

@@ -4,12 +4,21 @@ from datetime import timedelta
 
 load_dotenv()
 
+# Database URL is REQUIRED — there is NO SQLite fallback. This app runs on PostgreSQL
+# in every environment. If the variable is missing we fail fast at startup instead of
+# silently starting on a throwaway SQLite file (on Cloud Run that filesystem is
+# ephemeral, so a silent fallback would mean data loss).
+_DATABASE_URI = os.getenv("SQLALCHEMY_DATABASE_URI")
+if not _DATABASE_URI:
+    raise RuntimeError(
+        "SQLALCHEMY_DATABASE_URI is not set. Refusing to start without a PostgreSQL "
+        "connection string (the SQLite fallback has been removed). Set "
+        "SQLALCHEMY_DATABASE_URI in your environment / .env to your PostgreSQL URL."
+    )
+
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-in-production")
-    SQLALCHEMY_DATABASE_URI = os.getenv(
-        "SQLALCHEMY_DATABASE_URI",
-          # SQLite default for local dev
-    )
+    SQLALCHEMY_DATABASE_URI = _DATABASE_URI
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
     # SMTP

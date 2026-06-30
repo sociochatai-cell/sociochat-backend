@@ -70,7 +70,11 @@ class WhatsAppService:
             workspace_id: Workspace ID to look up stored account (Phase-2)
         """
         self.db_session = db_session or db.session
-        self.api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+        from tenant.integration import get_tenant_meta_config
+        self.api_version = (
+            get_tenant_meta_config(workspace_id=workspace_id).whatsapp_api_version
+            or "v22.0"
+        )
         
         # Phase-2: Try to get stored account for workspace first
         # BUT: if phone_number_id is explicitly provided, honour it
@@ -981,6 +985,20 @@ class WhatsAppService:
                                                 "text": body_params[0] if body_params else ""
                                             }]
                                         })
+                            # FLOW buttons REQUIRE a button component at send time, or
+                            # Meta rejects with (#131009) "Components sub_type invalid".
+                            # An empty action is valid for NAVIGATE flows (Meta auto-
+                            # generates the flow_token).
+                            elif btn_type == "FLOW":
+                                final_components.append({
+                                    "type": "button",
+                                    "sub_type": "flow",
+                                    "index": str(btn_idx),
+                                    "parameters": [{
+                                        "type": "action",
+                                        "action": {}
+                                    }]
+                                })
         
         # ── Auto-inject parameter_name from template schema (named params) ──
         # If the template schema uses body_text_named_params (e.g. {{name}}, {{email}}),
@@ -2542,7 +2560,8 @@ def send_interactive_message(
             raise ValueError("META_APP_ID or FB_APP_ID environment variable not set")
 
         # Scopes required for BSP/Embedded Signup
-        scopes = "whatsapp_business_management,whatsapp_business_messaging"
+        # business_management + catalog_management are required for product catalog APIs
+        scopes = "whatsapp_business_management,whatsapp_business_messaging,business_management,catalog_management"
         
         return (
             f"https://www.facebook.com/v22.0/dialog/oauth?"
@@ -2555,8 +2574,11 @@ def send_interactive_message(
 
     def connect_account(self, code: str, workspace_id: str):
         """Exchange code for token and store account details."""
-        app_id = os.getenv("META_APP_ID") or os.getenv("FB_APP_ID")
-        app_secret = os.getenv("META_APP_SECRET") or os.getenv("FB_APP_SECRET")
+        # Resolve the tenant's Meta app (env fallback for T0000 / unconfigured).
+        from tenant.integration import get_tenant_meta_config
+        cfg = get_tenant_meta_config(workspace_id=workspace_id)
+        app_id = cfg.app_id or os.getenv("META_APP_ID") or os.getenv("FB_APP_ID")
+        app_secret = cfg.app_secret or os.getenv("META_APP_SECRET") or os.getenv("FB_APP_SECRET")
         base_url = os.getenv("APP_BASE_URL", "https://sociovia-backend-362038465411.europe-west1.run.app").rstrip("/")
         redirect_uri = f"{base_url}/api/whatsapp/connect/callback"
 

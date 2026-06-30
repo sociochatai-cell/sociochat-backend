@@ -166,12 +166,16 @@ def _get_fb_account_for_workspace_user(workspace_id: str, user_id: str) -> Optio
     access_token = acct.access_token
     stored_ad_account_id = getattr(acct, "ad_account_id", None)
     final_ad_account_id = stored_ad_account_id
-    
+
+    # Per-tenant Graph API version (env / module default for T0000 / unconfigured).
+    from tenant.integration import get_tenant_meta_config
+    _api_version = get_tenant_meta_config(workspace_id=workspace_id).fb_api_version or FB_API_VERSION
+
     # NEW: Verify stored ad_account_id is accessible OR discover one if missing
     if not stored_ad_account_id:
         current_app.logger.info("No ad_account_id stored for workspace_id=%s. Attempting discovery.", workspace_id)
         try:
-            discovered = discover_ad_accounts_for_token(access_token)
+            discovered = discover_ad_accounts_for_token(access_token, api_version=_api_version)
             if discovered and len(discovered) > 0:
                 final_ad_account_id = discovered[0]
                 current_app.logger.info("Discovered ad_account_id=%s for workspace_id=%s", final_ad_account_id, workspace_id)
@@ -181,7 +185,7 @@ def _get_fb_account_for_workspace_user(workspace_id: str, user_id: str) -> Optio
             current_app.logger.warning("Failed to discover ad accounts for workspace_id=%s: %s", workspace_id, e)
     else:
         # Verify stored ad_account_id is accessible
-        GRAPH = f"https://graph.facebook.com/{FB_API_VERSION}"
+        GRAPH = f"https://graph.facebook.com/{_api_version}"
         verify_url = f"{GRAPH}/act_{stored_ad_account_id}"
         try:
             resp = requests.get(verify_url, params={"access_token": access_token}, timeout=5)
@@ -197,7 +201,7 @@ def _get_fb_account_for_workspace_user(workspace_id: str, user_id: str) -> Optio
                 )
                 # Try to discover an accessible account
                 try:
-                    discovered = discover_ad_accounts_for_token(access_token)
+                    discovered = discover_ad_accounts_for_token(access_token, api_version=_api_version)
                     if discovered and len(discovered) > 0:
                         final_ad_account_id = discovered[0]
                         current_app.logger.info(

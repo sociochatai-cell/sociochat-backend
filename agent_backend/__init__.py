@@ -17,9 +17,14 @@ from flask import request, jsonify
 
 
 def require_admin_only(f):
-    """Stub decorator — allows all requests through (no admin check)."""
+    """Require an authenticated principal (logged-in user OR platform admin).
+    Rejects anonymous callers — previously this was a no-op stub that let anyone
+    through. (Per-account ownership scoping is a separate, follow-up hardening.)"""
     @wraps(f)
     def decorated(*args, **kwargs):
+        from auth_core import authenticated_user_id, authenticated_admin_id
+        if authenticated_user_id() is None and authenticated_admin_id() is None:
+            return jsonify({"success": False, "error": "authentication_required"}), 401
         return f(*args, **kwargs)
     return decorated
 

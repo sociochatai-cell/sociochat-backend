@@ -126,11 +126,14 @@ class InteractiveAutomationEngine:
         """
         Find an active automation that matches the incoming message.
         """
-        # Get all active automations for this account
-        print(f"   Querying automations: account_id={self.account_id}, workspace_id='{self.workspace_id}'")
-        
+        # Workspace-scoped matching: an active automation in this workspace can fire
+        # for any of the workspace's WhatsApp numbers. We intentionally do NOT filter
+        # by account_id, because the "active account" is often stale/mismatched and
+        # automations belong to the workspace, not a single number. (This still only
+        # runs for messages that actually arrived on this workspace's accounts.)
+        print(f"   Querying automations: workspace_id='{self.workspace_id}' (account_id={self.account_id}, not filtered)")
+
         automations = WhatsAppVisualAutomation.query.filter_by(
-            account_id=self.account_id,
             workspace_id=self.workspace_id,
             is_active=True,
             status="active"
@@ -206,7 +209,7 @@ class InteractiveAutomationEngine:
             if edge.get("source") == trigger_id:
                 target_id = edge.get("target")
                 for node in nodes:
-                    if node.get("id") == target_id and node.get("type") in ("message", "template", "input", "api", "end"):
+                    if node.get("id") == target_id and node.get("type") in ("message", "template", "input", "api", "end", "set_status"):
                         first_node = node
                         break
                 break
@@ -243,6 +246,8 @@ class InteractiveAutomationEngine:
             return self._execute_api_node(automation, first_node, from_phone, state)
         elif first_type == "end":
             return self._handle_end_node(automation, first_node, from_phone, state)
+        elif first_type == "set_status":
+            return self._dispatch_node(automation, first_node, from_phone, state)
         else:
             return self._send_node_message(
                 automation, first_node, from_phone, state
@@ -451,7 +456,20 @@ class InteractiveAutomationEngine:
         if next_node.get("type") == "end":
             state.complete()
             db.session.commit()
-            
+
+            # CRM: qualify lead on flow completion (forward-only, idempotent, never raises)
+            try:
+                from SocioviaCrm.lead_ingest import advance_lead_status
+                advance_lead_status(
+                    workspace_id=automation.workspace_id,
+                    phone=state.phone_number,
+                    target_status="qualified",
+                    reason="Completed automation flow",
+                    db_session=db.session,
+                )
+            except Exception as e:
+                logger.warning(f"[interactive_engine] CRM advance_lead_status failed on flow completion: {e}")
+
             # Send end message if configured
             end_message = next_node.get("data", {}).get("message")
             if end_message:
@@ -472,6 +490,11 @@ class InteractiveAutomationEngine:
         if next_node.get("type") == "api":
             db.session.commit()
             return self._execute_api_node(automation, next_node, from_phone, state)
+
+        # Check if this is a silent set_status node - set/advance lead status
+        if next_node.get("type") == "set_status":
+            db.session.commit()
+            return self._dispatch_node(automation, next_node, from_phone, state)
 
         db.session.commit()
 
@@ -1091,6 +1114,8 @@ class InteractiveAutomationEngine:
             return self._send_input_question(automation, node, to_phone, state)
         if node_type == "api":
             return self._execute_api_node(automation, node, to_phone, state)
+        if node_type == "set_status":
+            return self._handle_set_status_node(automation, node, to_phone, state)
         return self._send_node_message(automation, node, to_phone, state)
 
     def _handle_end_node(
@@ -1104,6 +1129,20 @@ class InteractiveAutomationEngine:
         state.advance_to_node(node.get("id"))
         state.complete()
         db.session.commit()
+
+        # CRM: qualify lead on flow completion (forward-only, idempotent, never raises)
+        try:
+            from SocioviaCrm.lead_ingest import advance_lead_status
+            advance_lead_status(
+                workspace_id=automation.workspace_id,
+                phone=state.phone_number,
+                target_status="qualified",
+                reason="Completed automation flow",
+                db_session=db.session,
+            )
+        except Exception as e:
+            logger.warning(f"[interactive_engine] CRM advance_lead_status failed on flow completion: {e}")
+
         end_message = node.get("data", {}).get("message")
         if end_message:
             variables = self._resolve_flow_variables(automation, to_phone, state)
@@ -1307,6 +1346,89 @@ class InteractiveAutomationEngine:
             state.complete()
             db.session.commit()
             return {"success": api_result.success, "completed": True, "api_node": True}
+
+        state.advance_to_node(next_node_id)
+        db.session.commit()
+        return self._dispatch_node(automation, next_node, to_phone, state)
+
+    def _handle_set_status_node(
+        self,
+        automation: WhatsAppVisualAutomation,
+        node: Dict[str, Any],
+        to_phone: str,
+        state: WhatsAppConversationState,
+    ) -> Dict[str, Any]:
+        """
+        Silent "Set Status" node: update the CRM lead's lifecycle status when a
+        customer's flow reaches this node, then continue the flow WITHOUT sending
+        any WhatsApp message (modeled on _execute_api_node's silent precedent).
+
+        Node contract (with the frontend):
+            node.type == "set_status"
+            node.data = {
+                "status": "new" | "contacted" | "qualified",
+                "mode": "advance" | "set",
+            }
+            - mode "advance" (default): forward-only via advance_lead_status.
+            - mode "set": exact set (MAY downgrade) via set_lead_status.
+        """
+        node_id = node.get("id")
+        state.advance_to_node(node_id)
+        state.last_user_message_at = datetime.now(timezone.utc)
+        db.session.commit()
+
+        node_data = node.get("data", {}) or {}
+        target = node_data.get("status")
+        mode = node_data.get("mode", "advance")
+
+        # CRM lead status update - best-effort, never breaks the flow.
+        try:
+            from SocioviaCrm.lead_ingest import advance_lead_status, set_lead_status
+            if mode == "set":
+                set_lead_status(
+                    workspace_id=automation.workspace_id,
+                    phone=state.phone_number,
+                    external_id=str(state.conversation_id),
+                    target_status=target,
+                    reason="Set by flow node",
+                    db_session=db.session,
+                )
+            else:
+                advance_lead_status(
+                    workspace_id=automation.workspace_id,
+                    phone=state.phone_number,
+                    external_id=str(state.conversation_id),
+                    target_status=target,
+                    reason="Advanced by flow node",
+                    db_session=db.session,
+                )
+        except Exception as e:
+            logger.warning(
+                f"[interactive_engine] set_status node CRM update failed "
+                f"(mode={mode}, target={target}): {e}"
+            )
+
+        # Continue the flow exactly like the API node does (silent passthrough).
+        next_node_id = self._get_default_next_node_id(
+            automation, node_id, source_handle="output"
+        )
+
+        if not next_node_id:
+            state.complete()
+            db.session.commit()
+            return {
+                "success": True,
+                "automation_id": automation.id,
+                "node_id": node_id,
+                "set_status_node": True,
+                "completed": True,
+            }
+
+        next_node = self._get_node_by_id(state, next_node_id)
+        if not next_node:
+            state.complete()
+            db.session.commit()
+            return {"success": True, "completed": True, "set_status_node": True}
 
         state.advance_to_node(next_node_id)
         db.session.commit()

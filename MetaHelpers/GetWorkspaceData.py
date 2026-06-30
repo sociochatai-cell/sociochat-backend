@@ -117,8 +117,9 @@ def get_social_accounts_for_workspace_user(workspace_id: Any, user_id: Any) -> L
         return []
 
 
-def discover_ad_accounts_for_token(access_token: str, timeout=8) -> List[str]:
-    url = f"https://graph.facebook.com/{FB_API_VERSION}/me/adaccounts"
+def discover_ad_accounts_for_token(access_token: str, timeout=8, api_version: Optional[str] = None) -> List[str]:
+    api_version = api_version or FB_API_VERSION
+    url = f"https://graph.facebook.com/{api_version}/me/adaccounts"
     try:
         resp = requests.get(url, params={"access_token": access_token}, timeout=timeout)
         j = resp.json()
@@ -156,7 +157,7 @@ def build_ad_account_path(raw_account_id: str) -> str:
 class FacebookTokenError(Exception):
     pass
 
-def call_meta_insights(ad_account_id: str, access_token: str, params: Dict[str, Any], timeout=30) -> List[Dict[str, Any]]:
+def call_meta_insights(ad_account_id: str, access_token: str, params: Dict[str, Any], timeout=30, api_version: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Calls /{ad_account}/insights — ensures the account path is prefixed with 'act_'.
     Returns aggregated rows (handles paging).
@@ -166,7 +167,8 @@ def call_meta_insights(ad_account_id: str, access_token: str, params: Dict[str, 
     except Exception:
         acct_path = ad_account_id
 
-    url = f"{BASE_URL}/{acct_path}/insights"
+    base_url = f"https://graph.facebook.com/{api_version}" if api_version else BASE_URL
+    url = f"{base_url}/{acct_path}/insights"
     safe_params = {k: ("***" if k == "access_token" else v) for k, v in params.items()}
     current_app.logger.debug("Calling Meta insights for %s params=%s", acct_path, safe_params)
 
@@ -458,6 +460,13 @@ def consolidated_campaigns():
     ]
     params_common["fields"] = ",".join(fields)
 
+    # Per-tenant Graph API version (falls back to env / module default for
+    # T0000 / unconfigured / when no workspace_id is supplied).
+    from tenant.integration import get_tenant_meta_config
+    tenant_api_version = (
+        get_tenant_meta_config(workspace_id=ws_raw).fb_api_version or FB_API_VERSION
+    )
+
     social_accounts = []
 
     # meta_only mode: use provided access_token and discover accounts directly
@@ -466,7 +475,7 @@ def consolidated_campaigns():
         if not access_token:
             return jsonify({"error": "meta_only requires access_token query param"}), 400
         # Discover adaccounts for this token
-        discovered = discover_ad_accounts_for_token(access_token)
+        discovered = discover_ad_accounts_for_token(access_token, api_version=tenant_api_version)
         if not discovered:
             return jsonify({"error": "no_ad_accounts_found_for_token"}), 404
         # Build a synthetic social_accounts list (single entry)
@@ -505,7 +514,7 @@ def consolidated_campaigns():
         # Discover ad accounts from token first (preferred)
         discovered_accounts = []
         try:
-            discovered_accounts = discover_ad_accounts_for_token(access_token)
+            discovered_accounts = discover_ad_accounts_for_token(access_token, api_version=tenant_api_version)
         except Exception as e:
             current_app.logger.debug("Auto-discovery of ad accounts failed for social_id %s: %s", social_id, e, exc_info=True)
             discovered_accounts = []
@@ -534,7 +543,7 @@ def consolidated_campaigns():
             params = dict(params_common)
             params["access_token"] = access_token
             try:
-                rows = call_meta_insights(ad_account_id=acct_id, access_token=access_token, params=params)
+                rows = call_meta_insights(ad_account_id=acct_id, access_token=access_token, params=params, api_version=tenant_api_version)
                 if rows:
                     all_rows.extend(rows)
                 accounts_used.append({"social_id": social_id, "ad_account_id": acct_id, "page_id": page_id})
