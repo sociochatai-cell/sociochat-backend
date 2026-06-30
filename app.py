@@ -470,6 +470,16 @@ with app.app_context():
 
     db.create_all()
 
+    # WhatsApp schema patch: add new ORM columns to EXISTING whatsapp_accounts (+ operational
+    # tables) that create_all() cannot add on an already-provisioned (prod) DB. Idempotent;
+    # effectively a no-op on a fresh DB where create_all already built the full schema.
+    try:
+        from core.whatsapp_schema_patch import ensure_whatsapp_accounts_orm_columns
+        ensure_whatsapp_accounts_orm_columns(db.engine)
+        logger.info("WhatsApp accounts ORM schema patch ensured")
+    except Exception as e:
+        logger.warning(f"WhatsApp schema patch skipped: {e}")
+
     # Appointment-reminder columns on existing FlowOS tables (idempotent).
     # create_all() won't ALTER existing tables, so add the new columns here.
     try:

@@ -88,7 +88,13 @@ class WhatsAppAccountService:
 
     def get_oauth_url(self, workspace_id: str) -> str:
         """Generate the Meta Embedded Signup URL."""
-        app_id = os.getenv("META_APP_ID") or os.getenv("FB_APP_ID")
+        try:
+            from tenant.integration import get_tenant_meta_config
+            _cfg = get_tenant_meta_config(workspace_id=workspace_id)
+        except Exception:
+            _cfg = None
+        app_id = (getattr(_cfg, "app_id", None) if _cfg else None) or os.getenv("META_APP_ID") or os.getenv("FB_APP_ID")
+        api_ver = (getattr(_cfg, "whatsapp_api_version", None) if _cfg else None) or os.getenv("WHATSAPP_API_VERSION") or os.getenv("FB_API_VERSION", "v22.0")
         base_url = os.getenv("APP_BASE_URL", "https://sociovia-backend-362038465411.europe-west1.run.app").rstrip("/")
         redirect_uri = f"{base_url}/api/whatsapp/connect/callback"
 
@@ -98,7 +104,7 @@ class WhatsAppAccountService:
         scopes = "whatsapp_business_management,whatsapp_business_messaging,business_management"
 
         return (
-            f"https://www.facebook.com/v22.0/dialog/oauth?"
+            f"https://www.facebook.com/{api_ver}/dialog/oauth?"
             f"client_id={app_id}&"
             f"redirect_uri={redirect_uri}&"
             f"state={workspace_id}&"
@@ -108,14 +114,20 @@ class WhatsAppAccountService:
 
     def connect_account(self, code: str, workspace_id: str):
         """Exchange code for token and store account details."""
-        app_id = os.getenv("META_APP_ID") or os.getenv("FB_APP_ID")
-        app_secret = os.getenv("META_APP_SECRET") or os.getenv("FB_APP_SECRET")
+        try:
+            from tenant.integration import get_tenant_meta_config
+            _cfg = get_tenant_meta_config(workspace_id=workspace_id)
+        except Exception:
+            _cfg = None
+        app_id = (getattr(_cfg, "app_id", None) if _cfg else None) or os.getenv("META_APP_ID") or os.getenv("FB_APP_ID")
+        app_secret = (getattr(_cfg, "app_secret", None) if _cfg else None) or os.getenv("META_APP_SECRET") or os.getenv("FB_APP_SECRET")
+        api_ver = (getattr(_cfg, "whatsapp_api_version", None) if _cfg else None) or os.getenv("WHATSAPP_API_VERSION") or os.getenv("FB_API_VERSION", "v22.0")
         base_url = os.getenv("APP_BASE_URL", "https://sociovia-backend-362038465411.europe-west1.run.app").rstrip("/")
         redirect_uri = f"{base_url}/api/whatsapp/connect/callback"
 
         # 1. Exchange code for User Access Token
         token_url = (
-            f"https://graph.facebook.com/v22.0/oauth/access_token?"
+            f"https://graph.facebook.com/{api_ver}/oauth/access_token?"
             f"client_id={app_id}&"
             f"client_secret={app_secret}&"
             f"redirect_uri={redirect_uri}&"
@@ -129,8 +141,6 @@ class WhatsAppAccountService:
             raise Exception(f"Token exchange failed: {data['error'].get('message')}")
 
         access_token = data["access_token"]
-
-        api_ver = os.getenv("WHATSAPP_API_VERSION") or os.getenv("FB_API_VERSION", "v22.0")
 
         from .meta_asset_discovery import DiscoveryAmbiguousError, resolve_binding_for_auto_connect
 
