@@ -1,0 +1,40 @@
+# Local dev infrastructure for the merged SocioChat backend (Phase 1 / Option B).
+# Brings up Postgres (app DB), Redis (job queue for the separate whatsapp-worker),
+# and Qdrant (RAG knowledge base vector store).
+#   docker compose -f docker-compose.dev.yml up -d
+services:
+  postgres:
+    image: postgres:16
+    container_name: sociochat-pg
+    environment:
+      POSTGRES_USER: sociochat
+      POSTGRES_PASSWORD: sociochat
+      POSTGRES_DB: sociochat
+    ports:
+      - "5432:5432"
+    volumes:
+      - sociochat_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sociochat"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: sociochat-redis
+    ports:
+      - "6379:6379"
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: sociochat-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - sociochat_qdrant:/qdrant/storage
+
+volumes:
+  sociochat_pg:
+  sociochat_qdrant:
