@@ -32,11 +32,8 @@ def _get_api_version() -> str:
 def _get_account_and_token():
     """
     Look up WhatsAppAccount by account_id or workspace_id from query params or JSON body.
-
-    A workspace_id (or account_id) is REQUIRED — there is no global fallback to
-    "the first active account" (that would leak data across tenants). The current
-    logged-in user must own the resolved account's workspace; otherwise the
-    request is rejected. Returns (account, access_token).
+    Falls back to the first active account if neither is supplied.
+    Returns (account, access_token).
     Raises ValueError with a descriptive message on failure.
     """
     from .models import WhatsAppAccount
@@ -45,49 +42,15 @@ def _get_account_and_token():
     account_id = data.get("account_id") or request.args.get("account_id")
     workspace_id = data.get("workspace_id") or request.args.get("workspace_id")
 
-    # Resolve the authenticated user defensively. If tenant context is somehow
-    # unavailable we still enforce the required-param + no-global-fallback rules
-    # below; only the ownership assertion is softened when no user is resolved.
-    current_user = None
-    try:
-        from tenant.context import get_current_user
-        current_user = get_current_user()
-    except Exception:  # pragma: no cover - tenant context import/lookup failure
-        current_user = None
-
-    def _assert_owned(ws_id):
-        """Reject the request if a user is resolved but does not own ws_id.
-
-        ``ws_id`` is the account's (String) workspace_id; ``user_owns_workspace``
-        performs the safe String->int cast internally and returns False on a
-        bad/None value, so a non-numeric or NULL workspace_id is treated as
-        "not owned" rather than crashing.
-        """
-        if current_user is None:
-            return
-        try:
-            from tenant.context import user_owns_workspace
-            owned = user_owns_workspace(current_user, ws_id)
-        except Exception:  # pragma: no cover - defensive
-            owned = False
-        if not owned:
-            raise ValueError("forbidden: workspace not owned by current user")
-
     if account_id:
         account = WhatsAppAccount.query.filter_by(id=account_id, is_active=True).first()
-        if account:
-            _assert_owned(account.workspace_id)
     elif workspace_id:
-        _assert_owned(str(workspace_id))
-        account = WhatsAppAccount.query.filter_by(
-            workspace_id=str(workspace_id),
-            is_active=True,
-        ).first()
+        account = WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).first()
     else:
-        raise ValueError("workspace_id is required")
+        account = WhatsAppAccount.query.filter_by(is_active=True).first()
 
     if not account:
-        raise ValueError("No active WhatsApp account found for this workspace")
+        raise ValueError("No active WhatsApp account found")
 
     token = account.get_access_token()
     if not token:
@@ -123,22 +86,12 @@ def list_connected_catalogs():
 
     if not resp.ok:
         err = data.get("error", {})
-        logger.error(
-            "[CATALOG] connected-catalogs FAILED | HTTP %s | url=%s | waba_id=%s | "
-            "account_id=%s | meta_response=%s",
-            resp.status_code, url, account.waba_id, account.id, data,
-        )
-        print(f"[CATALOG ERROR] connected-catalogs -> HTTP {resp.status_code} | "
-              f"url={url} | waba_id={account.waba_id} | body={data}")
-        payload = {
+        logger.warning("Meta catalog list error: %s", data)
+        return jsonify({
             "success": False,
             "error": err.get("message") or "Meta API error",
             "meta_error": err,
-        }
-        if err.get("code") in (100, 200):
-            payload["needs_permission"] = True
-            payload["missing_scopes"] = ["catalog_management", "business_management"]
-        return jsonify(payload), resp.status_code
+        }), resp.status_code
 
     return jsonify({
         "success": True,
@@ -183,22 +136,11 @@ def list_available_catalogs():
 
     if not resp.ok:
         err = data.get("error", {})
-        logger.error(
-            "[CATALOG] available-catalogs FAILED | HTTP %s | url=%s | business_id=%s | "
-            "account_id=%s | meta_response=%s",
-            resp.status_code, url, business_id, account.id, data,
-        )
-        print(f"[CATALOG ERROR] available-catalogs -> HTTP {resp.status_code} | "
-              f"url={url} | business_id={business_id} | body={data}")
-        payload = {
+        return jsonify({
             "success": False,
             "error": err.get("message") or "Meta API error",
             "meta_error": err,
-        }
-        if err.get("code") in (100, 200):
-            payload["needs_permission"] = True
-            payload["missing_scopes"] = ["catalog_management", "business_management"]
-        return jsonify(payload), resp.status_code
+        }), resp.status_code
 
     return jsonify({
         "success": True,
@@ -243,13 +185,6 @@ def connect_catalog():
 
     if not resp.ok:
         err = resp_data.get("error", {})
-        logger.error(
-            "[CATALOG] connect FAILED | HTTP %s | url=%s | waba_id=%s | catalog_id=%s | "
-            "account_id=%s | meta_response=%s",
-            resp.status_code, url, account.waba_id, catalog_id, account.id, resp_data,
-        )
-        print(f"[CATALOG ERROR] connect -> HTTP {resp.status_code} | url={url} | "
-              f"waba_id={account.waba_id} | catalog_id={catalog_id} | body={resp_data}")
         return jsonify({
             "success": False,
             "error": err.get("message") or "Failed to connect catalog",
@@ -262,33 +197,6 @@ def connect_catalog():
         "message": "Catalog connected successfully",
         "catalog_id": catalog_id,
     })
-
-
-# ── Set Meta Business Manager ID (manual) ─────────────────────────────────────
-
-@catalog_bp.route("/catalogs/business-id", methods=["POST"])
-def set_business_id():
-    """Manually set the Meta Business Manager ID on the WhatsApp account.
-
-    The Business ID is normally captured automatically during the WhatsApp
-    connect flow. For connections where it wasn't (manual token / limited
-    scopes), this lets an admin paste it so 'owned catalogs' lookups work.
-    """
-    body = request.get_json(silent=True) or {}
-    business_id = str(body.get("business_id", "")).strip()
-    if not business_id:
-        return jsonify({"success": False, "error": "business_id is required"}), 422
-
-    try:
-        account, _token = _get_account_and_token()
-    except ValueError as e:
-        return jsonify({"success": False, "error": str(e)}), 400
-
-    from models import db
-    account.meta_business_id = business_id
-    db.session.commit()
-    logger.info("Set meta_business_id=%s on WhatsApp account %s", business_id, account.id)
-    return jsonify({"success": True, "meta_business_id": business_id})
 
 
 # ── Create new catalog ────────────────────────────────────────────────────────
@@ -582,15 +490,11 @@ def proxy_catalog_product_image():
     GET /api/whatsapp/catalogs/product-image?url=...&product_id=...&workspace_id=...
     """
     from flask import Response
-    try:
-        from .order_enrichment import (
-            _fetch_product_by_id,
-            _sanitize_catalog_image_url,
-            fetch_catalog_image_bytes,
-        )
-    except Exception as exc:  # ImportError or missing symbols — fail clean, not 500
-        logger.error("Product-image proxy unavailable (order_enrichment import failed): %s", exc)
-        return jsonify({"success": False, "error": "image proxy unavailable"}), 503
+    from .order_enrichment import (
+        _fetch_product_by_id,
+        _sanitize_catalog_image_url,
+        fetch_catalog_image_bytes,
+    )
 
     image_url = (request.args.get("url") or "").strip()
     product_id = (request.args.get("product_id") or "").strip()
@@ -654,36 +558,9 @@ def list_catalog_products(catalog_id: str):
             "meta_error": err,
         }), resp.status_code
 
-    # Follow pagination: accumulate every page's data, capped to avoid loops.
-    products = list(data.get("data", []) or [])
-    MAX_PAGES = 20
-    MAX_PRODUCTS = 1000
-    pages_fetched = 1
-    next_url = (data.get("paging", {}) or {}).get("next")
-    while next_url and pages_fetched < MAX_PAGES and len(products) < MAX_PRODUCTS:
-        try:
-            page_resp = http_requests.get(
-                next_url,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=15,
-            )
-            page_data = page_resp.json() if page_resp.content else {}
-        except Exception as exc:
-            logger.warning("Catalog products pagination stopped (page %s): %s", pages_fetched + 1, exc)
-            break
-        if not page_resp.ok:
-            logger.warning("Catalog products pagination non-OK (page %s): %s", pages_fetched + 1, page_data)
-            break
-        products.extend(page_data.get("data", []) or [])
-        pages_fetched += 1
-        next_url = (page_data.get("paging", {}) or {}).get("next")
-
-    if len(products) > MAX_PRODUCTS:
-        products = products[:MAX_PRODUCTS]
-
     return jsonify({
         "success": True,
-        "products": products,
+        "products": data.get("data", []),
     })
 
 

@@ -8,6 +8,7 @@ Provides clean input validation and error messages.
 
 import re
 from typing import Dict, Any, List, Optional, Tuple
+from urllib.parse import urlparse, unquote
 
 # Phone number validation regex (E.164 without +)
 PHONE_REGEX = re.compile(r"^\d{10,15}$")
@@ -130,6 +131,7 @@ def validate_template_message(data: Dict[str, Any]) -> Tuple[str, str, str, Opti
     header_image_url = data.get("header_image_url")
     header_video_url = data.get("header_video_url")
     header_document_url = data.get("header_document_url")
+    header_document_filename = data.get("header_document_filename")
     header_text = data.get("header_text")
     
     # Process Header (Image/Video/Document/Text)
@@ -145,9 +147,21 @@ def validate_template_message(data: Dict[str, Any]) -> Tuple[str, str, str, Opti
             "parameters": [{"type": "video", "video": {"link": header_video_url}}]
         }
     elif header_document_url:
+        document_param = {"link": header_document_url}
+        filename_value = str(header_document_filename).strip() if header_document_filename else ""
+        if not filename_value:
+            try:
+                parsed_path = urlparse(str(header_document_url)).path
+                inferred = unquote(parsed_path.split("/")[-1]).strip()
+                if inferred:
+                    filename_value = inferred
+            except Exception:
+                filename_value = ""
+        if filename_value:
+            document_param["filename"] = filename_value
         header_comp = {
             "type": "header",
-            "parameters": [{"type": "document", "document": {"link": header_document_url}}]
+            "parameters": [{"type": "document", "document": document_param}]
         }
     elif header_text:
         header_comp = {
@@ -288,19 +302,19 @@ def validate_interactive_buttons(data: Dict[str, Any]) -> Tuple[str, str, List[D
         if not btn_title:
             raise ValidationError(f"buttons[{i}].title", "Button title is required", "required")
         
-        if len(btn_title) > 20:
-            raise ValidationError(f"buttons[{i}].title", "Button title too long. Maximum 20 characters.", "max_length")
+        if len(btn_title) > 100:
+            raise ValidationError(f"buttons[{i}].title", "Button title too long. Maximum 100 characters.", "max_length")
         
         validated_buttons.append({"id": btn_id, "title": btn_title})
     
     header = interactive.get("header") or data.get("header")
     footer = interactive.get("footer") or data.get("footer")
     
-    if header and len(header) > 60:
-        raise ValidationError("header", "Header too long. Maximum 60 characters.", "max_length")
+    if header and len(header) > 100:
+        raise ValidationError("header", "Header too long. Maximum 100 characters.", "max_length")
     
-    if footer and len(footer) > 60:
-        raise ValidationError("footer", "Footer too long. Maximum 60 characters.", "max_length")
+    if footer and len(footer) > 100:
+        raise ValidationError("footer", "Footer too long. Maximum 100 characters.", "max_length")
     
     return to, body_text, validated_buttons, header, footer
 
@@ -329,8 +343,8 @@ def validate_interactive_list(data: Dict[str, Any]) -> Tuple[str, str, str, List
     
     button_text = interactive.get("button") or data.get("button_text", "Options")
     
-    if len(button_text) > 20:
-        raise ValidationError("button_text", "Button text too long. Maximum 20 characters.", "max_length")
+    if len(button_text) > 100:
+        raise ValidationError("button_text", "Button text too long. Maximum 100 characters.", "max_length")
     
     sections = interactive.get("sections") or data.get("sections", [])
     
@@ -345,12 +359,30 @@ def validate_interactive_list(data: Dict[str, Any]) -> Tuple[str, str, str, List
         if not isinstance(section, dict):
             raise ValidationError(f"sections[{i}]", "Section must be an object", "invalid_type")
         
+        # Validate section title
+        section_title = section.get("title", "")
+        if section_title and len(section_title) > 100:
+            raise ValidationError(f"sections[{i}].title", "Section title too long. Maximum 100 characters.", "max_length")
+        
         rows = section.get("rows", [])
         if not rows:
             raise ValidationError(f"sections[{i}].rows", "Section must have at least one row", "required")
         
         if len(rows) > 10:
             raise ValidationError(f"sections[{i}].rows", "Maximum 10 rows per section", "max_count")
+        
+        # Validate each row
+        for j, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise ValidationError(f"sections[{i}].rows[{j}]", "Row must be an object", "invalid_type")
+            
+            row_title = row.get("title", "")
+            if row_title and len(row_title) > 100:
+                raise ValidationError(f"sections[{i}].rows[{j}].title", "Row title too long. Maximum 100 characters.", "max_length")
+            
+            row_description = row.get("description", "")
+            if row_description and len(row_description) > 200:
+                raise ValidationError(f"sections[{i}].rows[{j}].description", "Row description too long. Maximum 200 characters.", "max_length")
     
     header = interactive.get("header") or data.get("header")
     footer = interactive.get("footer") or data.get("footer")

@@ -16,102 +16,254 @@ Endpoints:
 """
 
 import logging
+import os
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify, g
 import requests as http_requests
 
-from models import db
+logger = logging.getLogger(__name__)
+
+from shared_models import db, Workspace, User
 from .models import WhatsAppFlow, WhatsAppAccount
-from .flow_validator import validate_flow_json, generate_sample_flow, sanitize_flow_json
-from .flow_access import require_flow_access, require_account_access, validate_flow_account_match
+from .flow_validator import validate_flow_json, generate_sample_flow
+from .flow_access import (
+    require_flow_access,
+    require_account_access,
+    validate_flow_account_match,
+    normalize_flow_category,
+)
 from .token_helper import get_account_with_token
 from subscription.service import check_flow_limit
-from subscription.decorators import require_feature
-from models import Workspace, User
-
-logger = logging.getLogger(__name__)
 
 # Create blueprint
 flow_bp = Blueprint("flows", __name__, url_prefix="/api/whatsapp/flows")
 
 
-# ------------------------------------------------------------------ #
-# Meta flow category mapping
-# ------------------------------------------------------------------ #
-# Meta's WhatsApp Flow create API only accepts a fixed enum of categories.
-# Our internal/template categories (leads, booking, feedback, support, custom,
-# and the legacy LEAD_GEN/SURVEY/BOOKING/FEEDBACK/CUSTOM) are NOT valid Meta
-# values, so we map them here. Unknown values fall back to "OTHER".
-# Valid Meta values: SIGN_UP, SIGN_IN, APPOINTMENT_BOOKING, LEAD_GENERATION,
-# SHOPPING, CONTACT_US, CUSTOMER_SUPPORT, SURVEY, OTHER.
-_META_FLOW_CATEGORIES = {
-    "SIGN_UP", "SIGN_IN", "APPOINTMENT_BOOKING", "LEAD_GENERATION",
-    "SHOPPING", "CONTACT_US", "CUSTOMER_SUPPORT", "SURVEY", "OTHER",
-}
-_META_CATEGORY_ALIASES = {
-    "LEADS": "LEAD_GENERATION",
-    "LEAD": "LEAD_GENERATION",
-    "LEAD_GEN": "LEAD_GENERATION",
-    "LEADGEN": "LEAD_GENERATION",
-    "LEAD_GENERATION": "LEAD_GENERATION",
-    "BOOKING": "APPOINTMENT_BOOKING",
-    "APPOINTMENT": "APPOINTMENT_BOOKING",
-    "APPOINTMENT_BOOKING": "APPOINTMENT_BOOKING",
-    "FEEDBACK": "SURVEY",
-    "SURVEY": "SURVEY",
-    "SUPPORT": "CUSTOMER_SUPPORT",
-    "CUSTOMER_SUPPORT": "CUSTOMER_SUPPORT",
-    "HELP": "CUSTOMER_SUPPORT",
-    "SIGNUP": "SIGN_UP",
-    "SIGN_UP": "SIGN_UP",
-    "REGISTER": "SIGN_UP",
-    "SIGNIN": "SIGN_IN",
-    "SIGN_IN": "SIGN_IN",
-    "LOGIN": "SIGN_IN",
-    "SHOPPING": "SHOPPING",
-    "SHOP": "SHOPPING",
-    "CONTACT": "CONTACT_US",
-    "CONTACT_US": "CONTACT_US",
-    "CUSTOM": "OTHER",
-    "OTHER": "OTHER",
-}
+def _flow_uses_data_endpoint(flow_json: dict) -> bool:
+    """Return True when the flow JSON expects Meta to call our data endpoint."""
+    if not isinstance(flow_json, dict):
+        return False
+
+    if flow_json.get("data_api_version"):
+        return True
+
+    for screen in flow_json.get("screens", []) or []:
+        if isinstance(screen, dict) and screen.get("data_api_version"):
+            return True
+
+    return False
 
 
-def _to_meta_category(raw: str) -> str:
-    """Normalize an internal/template category to a valid Meta flow category."""
-    key = (raw or "").strip().upper().replace(" ", "_").replace("-", "_")
-    if key in _META_FLOW_CATEGORIES:
-        return key
-    return _META_CATEGORY_ALIASES.get(key, "OTHER")
+def _meta_graph_error(error_data: dict) -> dict:
+    """Return the nested ``error`` object from a Graph API JSON body."""
+    return (error_data or {}).get("error") or {}
 
 
-def _find_meta_flow_by_name(waba_id: str, access_token: str, name: str) -> dict | None:
-    """Find an existing Meta flow on this WABA whose name matches `name`.
-
-    Used to reconcile a "Flow name is not unique" (subcode 4016019) error: an
-    earlier interrupted publish can leave an orphaned flow on Meta that the local
-    record never linked to. Returns the Meta flow dict (id/name/status) or None.
-    """
+def _safe_response_json(response: http_requests.Response) -> dict:
+    """Parse a Graph API response body without raising on empty/invalid JSON."""
     try:
-        resp = http_requests.get(
-            f"https://graph.facebook.com/v18.0/{waba_id}/flows",
-            headers={"Authorization": f"Bearer {access_token}"},
-            params={"fields": "id,name,status", "limit": 200},
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            logger.warning(
-                "Meta flows list failed while reconciling name=%r: %s",
-                name, resp.text[:300],
-            )
-            return None
-        target = (name or "").strip().lower()
-        for mf in resp.json().get("data", []):
-            if str(mf.get("name", "")).strip().lower() == target:
-                return mf
+        return response.json()
     except Exception:
-        logger.exception("Error listing Meta flows for reconciliation")
-    return None
+        return {}
+
+
+def _response_for_meta_flow_create_error(error_data: dict):
+    """
+    Map Meta ``POST /{waba-id}/flows`` failures to Sociovia error codes.
+
+    Meta often uses ``code`` 100 for unrelated validation issues; do **not**
+    treat every 100 as missing Flows capability.
+    """
+    err = _meta_graph_error(error_data)
+    msg_l = (err.get("message") or "").lower()
+    user_msg = err.get("error_user_msg") or err.get("message") or "Unknown error"
+    user_title_l = (err.get("error_user_title") or "").lower()
+    user_l = (err.get("error_user_msg") or "").lower()
+    code = err.get("code")
+    sub = err.get("error_subcode")
+
+    # Flow name collides with another flow on the same WABA (very common).
+    if (
+        sub == 4016019
+        or ("unique" in user_l and "name" in user_l)
+        or "not unique" in user_title_l
+    ):
+        return (
+            {
+                "success": False,
+                "error": "flow_name_not_unique",
+                "message": err.get("error_user_msg")
+                or (
+                    "A flow with this name already exists on this WhatsApp Business Account. "
+                    "Rename the flow in Sociovia or delete/rename the duplicate in WhatsApp Manager."
+                ),
+                "meta_error": err,
+            },
+            400,
+        )
+
+    if code == 139000 or "integrity" in msg_l:
+        return (
+            {
+                "success": False,
+                "error": "business_not_verified",
+                "message": "Business verification required. Complete verification in Meta Business Manager to publish flows.",
+                "action_url": "https://business.facebook.com/settings/whatsapp-business-accounts",
+                "meta_error": err,
+            },
+            400,
+        )
+
+    # Actual Flows product / permission issues (keep narrow to avoid false positives).
+    if (
+        "flow" in msg_l
+        and (
+            "capability" in msg_l
+            or "does not have access" in msg_l
+            or ("permission" in msg_l and "manage" in msg_l)
+        )
+    ) or "flows feature" in msg_l:
+        return (
+            {
+                "success": False,
+                "error": "flows_not_enabled",
+                "message": "Flows may not be enabled for this WhatsApp Business Account, or the token lacks required Flow permissions. Check Meta Business Manager and reconnect the app.",
+                "meta_error": err,
+            },
+            400,
+        )
+
+    if "token" in msg_l or "session has expired" in msg_l:
+        return (
+            {
+                "success": False,
+                "error": "token_invalid",
+                "message": "Access token is invalid or expired. Please reconnect your WhatsApp Business Account.",
+                "meta_error": err,
+            },
+            400,
+        )
+
+    return (
+        {
+            "success": False,
+            "error": "meta_api_error",
+            "message": f"Failed to create flow on Meta: {err.get('message', user_msg)}",
+            "meta_error": err,
+        },
+        400,
+    )
+
+
+def _resolve_public_base_url() -> str:
+    """Prefer the active request host so live tunnel publishes use the reachable URL."""
+    candidates = [
+        (request.host_url or "").strip(),
+        (os.getenv("APP_BASE_URL") or "").strip(),
+        (os.getenv("PUBLIC_APP_BASE_URL") or "").strip(),
+    ]
+
+    for candidate in candidates:
+        if candidate.lower().startswith(("http://", "https://")):
+            return candidate.rstrip("/")
+
+    return ""
+
+
+_FIELD_COMPONENT_TYPES = {
+    "TextInput",
+    "TextArea",
+    "Dropdown",
+    "RadioButtonsGroup",
+    "CheckboxGroup",
+    "DatePicker",
+}
+
+
+def _valid_flow_field_name(name: object) -> bool:
+    if not isinstance(name, str) or not name:
+        return False
+    first = name[0]
+    return (first.isalpha() or first == "_") and all(
+        ch.isalnum() or ch == "_" for ch in name
+    )
+
+
+def _field_data_type(component: dict) -> str:
+    return "array" if component.get("type") == "CheckboxGroup" else "string"
+
+
+def _collect_screen_fields(screen: dict) -> dict:
+    fields = {}
+    children = ((screen.get("layout") or {}).get("children") or [])
+    for component in children:
+        if not isinstance(component, dict):
+            continue
+        if component.get("type") in _FIELD_COMPONENT_TYPES:
+            name = component.get("name")
+            if _valid_flow_field_name(name):
+                fields[name] = _field_data_type(component)
+    return fields
+
+
+def normalize_flow_submission_payloads(flow_json: dict) -> dict:
+    """
+    Ensure Flow navigation/complete actions carry collected form values forward.
+
+    Without a Footer payload, Meta can send an nfm_reply that only contains
+    {"flow_token": "unused"}, leaving the inbox with no submitted fields.
+    """
+    if not isinstance(flow_json, dict):
+        return flow_json
+
+    screens = flow_json.get("screens")
+    if not isinstance(screens, list):
+        return flow_json
+
+    prior_fields = {}
+    for screen in screens:
+        if not isinstance(screen, dict):
+            continue
+
+        if prior_fields:
+            existing_data = screen.get("data") if isinstance(screen.get("data"), dict) else {}
+            data = dict(existing_data)
+            for field_name, field_type in prior_fields.items():
+                data.setdefault(
+                    field_name,
+                    {"type": field_type, "__example__": "Example"},
+                )
+            screen["data"] = data
+
+        current_fields = _collect_screen_fields(screen)
+        children = ((screen.get("layout") or {}).get("children") or [])
+
+        for component in children:
+            if not isinstance(component, dict) or component.get("type") != "Footer":
+                continue
+
+            action = component.get("on-click-action")
+            if not isinstance(action, dict):
+                continue
+
+            action_name = str(action.get("name") or "").lower()
+            if action_name not in {"navigate", "complete"}:
+                continue
+
+            payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+            payload = dict(payload)
+
+            for field_name in prior_fields:
+                payload.setdefault(field_name, f"${{data.{field_name}}}")
+            for field_name in current_fields:
+                payload.setdefault(field_name, f"${{form.{field_name}}}")
+
+            if payload:
+                action["payload"] = payload
+
+        prior_fields.update(current_fields)
+
+    return flow_json
 
 
 # ============================================================
@@ -119,7 +271,6 @@ def _find_meta_flow_by_name(waba_id: str, access_token: str, name: str) -> dict 
 # ============================================================
 
 @flow_bp.route("", methods=["POST"])
-@require_feature("whatsapp_flows")
 def create_flow():
     """
     Create a new draft flow.
@@ -138,7 +289,7 @@ def create_flow():
     # Required fields
     account_id = data.get("account_id")
     name = data.get("name")
-    category = data.get("category", "CUSTOM")
+    category = normalize_flow_category(data.get("category", "OTHER"))
     
     if not account_id:
         return jsonify({"success": False, "error": "account_id is required"}), 400
@@ -177,13 +328,13 @@ def create_flow():
     if not flow_json:
         # Generate sample flow based on category
         flow_json = generate_sample_flow(category)
+    flow_json = normalize_flow_submission_payloads(flow_json)
     
-    # Determine entry screen and sanitize IDs for Meta compatibility
+    # Determine entry screen
     entry_screen_id = data.get("entry_screen_id")
     if not entry_screen_id:
         screens = flow_json.get("screens", [])
         entry_screen_id = screens[0].get("id") if screens else "WELCOME"
-    flow_json, entry_screen_id = sanitize_flow_json(flow_json, entry_screen_id)
     
     # Check for duplicate name (same account, same version)
     existing = WhatsAppFlow.query.filter_by(
@@ -193,19 +344,8 @@ def create_flow():
     ).first()
     
     if existing:
-        # Make create idempotent for DRAFTs: a retried create (e.g. an orphan
-        # draft left by a frontend bug) should not 409. Return the existing
-        # draft as a success so the frontend adopts its id and switches to PUT
-        # on the next save. Only a non-draft (PUBLISHED/DEPRECATED) is a real
-        # name conflict and still returns 409.
-        if existing.status == "DRAFT":
-            return jsonify({
-                "success": True,
-                "flow": existing.to_dict(),
-                "message": "Existing draft flow returned"
-            }), 200
         return jsonify({
-            "success": False,
+            "success": False, 
             "error": f"Flow with name '{name}' already exists"
         }), 409
     
@@ -216,6 +356,7 @@ def create_flow():
         category=category.upper(),
         flow_version=1,
         flow_json=flow_json,
+        schema_version=str((flow_json or {}).get("version") or "5.0"),
         entry_screen_id=entry_screen_id,
         status="DRAFT",
     )
@@ -312,11 +453,12 @@ def update_flow(flow_id: int):
     if "name" in data:
         flow.name = data["name"]
     if "category" in data:
-        flow.category = data["category"].upper()
+        flow.category = normalize_flow_category(data["category"])
     if "flow_json" in data:
-        entry = data.get("entry_screen_id", flow.entry_screen_id)
-        flow.flow_json, flow.entry_screen_id = sanitize_flow_json(data["flow_json"], entry)
-    elif "entry_screen_id" in data:
+        normalized_flow_json = normalize_flow_submission_payloads(data["flow_json"])
+        flow.flow_json = normalized_flow_json
+        flow.schema_version = str((normalized_flow_json or {}).get("version") or flow.schema_version)
+    if "entry_screen_id" in data:
         flow.entry_screen_id = data["entry_screen_id"]
     
     flow.updated_at = datetime.now(timezone.utc)
@@ -377,28 +519,15 @@ def publish_flow(flow_id: int):
     5. Mark as PUBLISHED (immutable)
     
     Returns specific error types for UI feedback:
-    - token_expired: Token needs refresh
+    - token_expired / token_invalid: Token needs refresh
     - business_not_verified: Business verification required
-    - flows_not_enabled: WABA doesn't have Flows capability
+    - flows_not_enabled: Flows product/permission issues (narrow detection)
+    - flow_name_not_unique: Meta subcode 4016019 — duplicate flow name on WABA
     - validation_failed: Flow JSON validation errors
-    - meta_api_error: Meta API returned an error
+    - meta_api_error: Other Meta Graph errors (see ``meta_error``)
     """
     flow = g.flow
-    
-    # === Step 1.5: Get account with valid token (centralized) ===
-    account, token_error = get_account_with_token(flow.account_id)
-    if token_error:
-        return jsonify({
-            "success": False,
-            "error": "token_missing",
-            "message": token_error
-        }), 400
-    
-    # Update flow to use the valid account if different
-    if account.id != flow.account_id:
-        flow.account_id = account.id
-        db.session.commit()
-    
+
     if not flow.can_publish():
         return jsonify({
             "success": False,
@@ -406,149 +535,91 @@ def publish_flow(flow_id: int):
             "message": f"Flow cannot be published. Current status: {flow.status}",
             "status": flow.status
         }), 400
-    
-    # === Step 1: Sanitize + validate flow JSON (v7.3 schema) ===
-    flow.flow_json, flow.entry_screen_id = sanitize_flow_json(
-        flow.flow_json,
-        flow.entry_screen_id,
-    )
+
+    flow.flow_json = normalize_flow_submission_payloads(flow.flow_json)
+    flow.schema_version = str((flow.flow_json or {}).get("version") or flow.schema_version)
     db.session.commit()
 
+    # === Step 1: Validate flow JSON (v7.3 schema) ===
     validation = validate_flow_json(flow.flow_json, flow.entry_screen_id)
     if not validation.valid:
+        validation_data = validation.to_dict()
         return jsonify({
             "success": False,
             "error": "validation_failed",
             "message": "Flow validation failed",
-            "validation": validation.to_dict(),
-            "errors": validation.to_dict().get("errors", [])
+            "validation": validation_data,
+            "errors": validation_data.get("errors", [])
         }), 400
-    
-    # === Step 2: Get access token (already validated by helper) ===
+
+    # === Step 2: Get account with valid token (centralized) ===
+    account, token_error = get_account_with_token(flow.account_id)
+    if token_error:
+        return jsonify({
+            "success": False,
+            "error": "token_missing",
+            "message": token_error
+        }), 400
+
+    # Update flow to use the valid account if different
+    if account.id != flow.account_id:
+        flow.account_id = account.id
+        db.session.commit()
+
     access_token = account.get_access_token()
     
     try:
         import json
         import time
+        api_version = os.getenv("WHATSAPP_API_VERSION", "v18.0")
+        graph_base = f"https://graph.facebook.com/{api_version}"
+
+        create_payload = {
+            "name": flow.name,
+            "categories": [normalize_flow_category(flow.category)],
+        }
+
+        if _flow_uses_data_endpoint(flow.flow_json):
+            if not account.has_flow_keys():
+                return jsonify({
+                    "success": False,
+                    "error": "flow_keys_missing",
+                    "message": "Flow encryption keys are not configured for this WhatsApp account.",
+                }), 400
+
+            public_base_url = _resolve_public_base_url()
+            if not public_base_url:
+                return jsonify({
+                    "success": False,
+                    "error": "endpoint_uri_missing",
+                    "message": "Unable to determine a public base URL for the flow endpoint.",
+                }), 400
+
+            create_payload["endpoint_uri"] = (
+                f"{public_base_url}/api/whatsapp/flows/endpoint/{account.waba_id}"
+            )
         
-        # === Step 3: Create flow on Meta (or adopt an existing same-named flow) ===
-        meta_category = _to_meta_category(flow.category)
-        meta_flow_id = None
+        # === Step 3: Create flow on Meta ===
         create_response = http_requests.post(
-            f"https://graph.facebook.com/v18.0/{account.waba_id}/flows",
+            f"{graph_base}/{account.waba_id}/flows",
             headers={"Authorization": f"Bearer {access_token}"},
-            json={
-                "name": flow.name,
-                "categories": [meta_category],
-            },
+            json=create_payload,
             timeout=30
         )
-
-        if create_response.status_code == 200:
-            meta_flow_id = create_response.json().get("id")
-        else:
-            error_data = create_response.json()
-            err = error_data.get("error", {}) if isinstance(error_data, dict) else {}
-            error_msg = err.get("message", "Unknown error")
-            error_code = err.get("code", 0)
-            error_subcode = err.get("error_subcode")
-            # Meta hides the real reason behind a generic "Invalid parameter"
-            # message; the human detail is in error_user_title / error_user_msg.
-            user_title = err.get("error_user_title") or ""
-            user_msg = err.get("error_user_msg") or ""
-            detail = " ".join(p for p in (error_msg, user_title, user_msg) if p).strip()
-            # Surface the FULL Meta error in the server log (the werkzeug line
-            # only shows the bare 400). Helps diagnose category/name/permission.
-            logger.warning(
-                "Meta flow create failed (waba=%s, name=%r, category=%r->%r): "
-                "status=%s code=%s subcode=%s | full_error=%s",
-                account.waba_id, flow.name, flow.category, meta_category,
-                create_response.status_code, error_code, error_subcode,
-                json.dumps(err),
-            )
-
-            # Map Meta errors to user-friendly error types. Match against the
-            # COMBINED detail (message + error_user_title + error_user_msg) since
-            # code 100 is Meta's GENERIC "invalid parameter" (bad category,
-            # duplicate name, ...) — do NOT treat it as "flows not enabled".
-            msg_l = detail.lower()
-            name_conflict = (
-                error_subcode == 4016019
-                or "not unique" in msg_l
-                or "already exists" in msg_l
-                or "name is already" in msg_l
-            )
-            if name_conflict:
-                # An earlier interrupted publish left a flow with this name on
-                # Meta that we never linked. Adopt it instead of failing.
-                existing = _find_meta_flow_by_name(account.waba_id, access_token, flow.name)
-                if existing and existing.get("id"):
-                    meta_flow_id = str(existing["id"])
-                    existing_status = (existing.get("status") or "").upper()
-                    logger.info(
-                        "Adopting existing Meta flow id=%s status=%s for local flow %s (%r)",
-                        meta_flow_id, existing_status, flow.id, flow.name,
-                    )
-                    if existing_status == "PUBLISHED":
-                        # Already live on Meta — just link it locally.
-                        flow.meta_flow_id = meta_flow_id
-                        flow.status = "PUBLISHED"
-                        flow.published_at = datetime.now(timezone.utc)
-                        db.session.commit()
-                        return jsonify({
-                            "success": True,
-                            "flow": flow.to_dict(),
-                            "message": "This flow already existed and was published on Meta — linked it to your account.",
-                            "meta_flow_id": meta_flow_id,
-                        })
-                    # DRAFT/other → fall through to upload JSON + publish on this id.
-                else:
-                    return jsonify({
-                        "success": False,
-                        "error": "duplicate_name",
-                        "message": f'A flow named "{flow.name}" already exists on Meta and could not be linked automatically. Rename this flow and try again.',
-                        "meta_error": err,
-                    }), 400
-            elif "permission" in msg_l or "not enabled" in msg_l or "capability" in msg_l:
-                return jsonify({
-                    "success": False,
-                    "error": "flows_not_enabled",
-                    "message": "Flows capability is not enabled for this WhatsApp Business Account. Contact Meta Business Support to request access.",
-                    "meta_error": err
-                }), 400
-            elif "integrity" in msg_l or "verification" in msg_l or error_code == 139000:
-                return jsonify({
-                    "success": False,
-                    "error": "business_not_verified",
-                    "message": "Business verification required. Complete verification in Meta Business Manager to publish flows.",
-                    "action_url": "https://business.facebook.com/settings/whatsapp-business-accounts",
-                    "meta_error": err
-                }), 400
-            elif "token" in msg_l or "session" in msg_l or "expired" in msg_l:
-                return jsonify({
-                    "success": False,
-                    "error": "token_invalid",
-                    "message": "Access token is invalid or expired. Please reconnect your WhatsApp Business Account.",
-                    "meta_error": err
-                }), 400
-            else:
-                return jsonify({
-                    "success": False,
-                    "error": "meta_api_error",
-                    "message": f"Failed to create flow on Meta: {detail}",
-                    "meta_error": err
-                }), 400
-
-        if not meta_flow_id:
-            return jsonify({
-                "success": False,
-                "error": "meta_api_error",
-                "message": "Could not create or locate the flow on Meta. Please try again.",
-            }), 400
+        
+        if create_response.status_code != 200:
+            try:
+                error_data = create_response.json()
+            except Exception:
+                error_data = {}
+            payload, status = _response_for_meta_flow_create_error(error_data)
+            return jsonify(payload), status
+        
+        meta_flow_id = create_response.json().get("id")
         
         # === Step 4: Upload flow JSON as asset ===
         asset_response = http_requests.post(
-            f"https://graph.facebook.com/v18.0/{meta_flow_id}/assets",
+            f"{graph_base}/{meta_flow_id}/assets",
             headers={"Authorization": f"Bearer {access_token}"},
             files={"file": ("flow.json", json.dumps(flow.flow_json), "application/json")},
             data={"name": "flow.json", "asset_type": "FLOW_JSON"},
@@ -556,86 +627,55 @@ def publish_flow(flow_id: int):
         )
         
         if asset_response.status_code != 200:
-            error_data = asset_response.json()
-            a_err = error_data.get("error", {}) if isinstance(error_data, dict) else {}
-            a_detail = " ".join(p for p in (
-                a_err.get("message", ""),
-                a_err.get("error_user_title", ""),
-                a_err.get("error_user_msg", ""),
-            ) if p).strip() or "Unknown error"
-            logger.warning(
-                "Meta flow asset upload failed (flow_id=%s meta_flow_id=%s): "
-                "status=%s subcode=%s | full_error=%s",
-                flow.id, meta_flow_id, asset_response.status_code,
-                a_err.get("error_subcode"), json.dumps(a_err),
-            )
+            error_data = _safe_response_json(asset_response)
+            error_msg = error_data.get("error", {}).get("message", "Unknown error")
             return jsonify({
                 "success": False,
                 "error": "json_upload_failed",
-                "message": f"Failed to upload flow JSON: {a_detail}",
+                "message": f"Failed to upload flow JSON: {error_msg}",
                 "meta_flow_id": meta_flow_id,
-                "meta_error": a_err
+                "meta_error": error_data.get("error", {})
             }), 400
         
         # === Step 5: Publish the flow ===
         publish_response = http_requests.post(
-            f"https://graph.facebook.com/v18.0/{meta_flow_id}/publish",
+            f"{graph_base}/{meta_flow_id}/publish",
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=30
         )
         
         if publish_response.status_code != 200:
-            error_data = publish_response.json()
-            p_err = error_data.get("error", {}) if isinstance(error_data, dict) else {}
-            p_msg = p_err.get("message", "Unknown error")
-            p_title = p_err.get("error_user_title") or ""
-            p_user = p_err.get("error_user_msg") or ""
-            p_detail = " ".join(p for p in (p_msg, p_title, p_user) if p).strip() or "Unknown error"
-            p_l = p_detail.lower()
-            # Surface the full Meta publish error (validation detail lives in
-            # error_user_msg — e.g. invalid flow JSON, missing endpoint, etc.).
-            logger.warning(
-                "Meta flow publish failed (flow_id=%s meta_flow_id=%s): "
-                "status=%s subcode=%s | full_error=%s",
-                flow.id, meta_flow_id, publish_response.status_code,
-                p_err.get("error_subcode"), json.dumps(p_err),
-            )
-
+            error_data = _safe_response_json(publish_response)
+            error_msg = error_data.get("error", {}).get("message", "Unknown error")
+            
             # Check for specific blocking reasons
-            if "integrity" in p_l or "verification" in p_l:
+            if "integrity" in error_msg.lower():
                 return jsonify({
                     "success": False,
                     "error": "business_not_verified",
-                    "message": (
-                        "Meta blocked publishing: your WhatsApp Business Account doesn't meet "
-                        "Meta's integrity requirements yet. Complete Business Verification in "
-                        "Meta Business Manager (Business Settings → Security Center) and ensure "
-                        "your number's display name is approved. The flow itself is valid — you "
-                        "can keep testing it as a draft until verification is approved."
-                    ),
-                    "action_url": "https://business.facebook.com/settings/security",
+                    "message": "Cannot publish: Business verification is required. Complete verification in Meta Business Manager.",
+                    "action_url": "https://business.facebook.com/settings/whatsapp-business-accounts",
                     "meta_flow_id": meta_flow_id,
-                    "meta_error": p_err
+                    "meta_error": error_data.get("error", {})
                 }), 400
-            elif "quality" in p_l:
+            elif "quality" in error_msg.lower():
                 return jsonify({
                     "success": False,
                     "error": "message_quality_low",
                     "message": "Cannot publish: Message quality is too low. Send more high-quality messages to improve your score.",
                     "meta_flow_id": meta_flow_id,
-                    "meta_error": p_err
+                    "meta_error": error_data.get("error", {})
                 }), 400
             else:
                 return jsonify({
                     "success": False,
                     "error": "publish_failed",
-                    "message": f"Failed to publish flow: {p_detail}",
+                    "message": f"Failed to publish flow: {error_msg}",
                     "meta_flow_id": meta_flow_id,
-                    "meta_error": p_err
+                    "meta_error": error_data.get("error", {})
                 }), 400
         
         # === Success - update flow record ===
-        from datetime import datetime, timezone
         flow.meta_flow_id = meta_flow_id
         flow.status = "PUBLISHED"
         flow.published_at = datetime.now(timezone.utc)
@@ -659,6 +699,13 @@ def publish_flow(flow_id: int):
             "success": False,
             "error": "network_error",
             "message": f"Network error while publishing: {str(e)}"
+        }), 500
+    except Exception as e:
+        logger.exception("Unexpected error publishing flow %s", flow_id)
+        return jsonify({
+            "success": False,
+            "error": "publish_internal_error",
+            "message": f"Unexpected error while publishing: {str(e)}"
         }), 500
 
 
@@ -706,6 +753,8 @@ def clone_flow(flow_id: int):
     
     # Clone the flow
     new_flow = flow.clone()
+    new_flow.flow_json = normalize_flow_submission_payloads(new_flow.flow_json)
+    new_flow.schema_version = str((new_flow.flow_json or {}).get("version") or new_flow.schema_version)
     
     # Optionally customize from request
     data = request.get_json() or {}
@@ -754,6 +803,7 @@ def validate_flow():
             "error": "flow_json is required"
         }), 400
     
+    flow_json = normalize_flow_submission_payloads(flow_json)
     validation = validate_flow_json(flow_json, entry_screen_id)
     
     return jsonify({
@@ -802,10 +852,10 @@ def get_flow_templates():
         "success": True,
         "templates": [
             {
-                "category": "LEAD_GEN",
+                "category": "LEAD_GENERATION",
                 "name": "Lead Capture",
                 "description": "Collect name, email, and phone",
-                "flow_json": generate_sample_flow("LEAD_GEN")
+                "flow_json": generate_sample_flow("LEAD_GENERATION")
             },
             {
                 "category": "SURVEY",

@@ -13,25 +13,57 @@ Endpoints:
 """
 
 import logging
-from flask import Blueprint, jsonify, request
+import os
 from functools import wraps
-from rate_limit.decorator import rate_limit
+from flask import Blueprint, jsonify, request
+from .http_rate_limit import rate_limit
 
-from models import db
+from shared_models import db
 from .automation_models import WhatsAppAutomationRule
-from .models import WhatsAppAccount
+from .models import WhatsAppAccount, upsert_whatsapp_bot_settings_shadow
 from .ai_chatbot import (
-    generate_ai_response,
     DEFAULT_SYSTEM_PROMPT,
-    DEFAULT_HANDOFF_MESSAGE,
-    build_business_system_prompt,
-    normalize_fallback_message,
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    get_bot_config,
+    prepare_automation_ai,
+    create_ai_chatbot,
 )
 
 logger = logging.getLogger(__name__)
 
 # Blueprint for AI routes
 ai_bp = Blueprint('whatsapp_ai', __name__, url_prefix='/api/whatsapp/accounts')
+
+
+def _get_ai_rule_for_account(workspace_id: str, account_id: int) -> WhatsAppAutomationRule | None:
+    """
+    Return the newest AI chat rule and auto-disable older duplicates.
+    """
+    rules = (
+        WhatsAppAutomationRule.query.filter_by(
+            workspace_id=workspace_id,
+            account_id=account_id,
+            rule_type="ai_chat",
+        )
+        .order_by(WhatsAppAutomationRule.id.desc())
+        .all()
+    )
+    if not rules:
+        return None
+
+    primary = rules[0]
+    if len(rules) > 1:
+        for duplicate in rules[1:]:
+            if duplicate.is_active or duplicate.status != "paused":
+                duplicate.is_active = False
+                duplicate.status = "paused"
+        logger.warning(
+            "Found %s duplicate ai_chat rules for account %s; kept rule %s active",
+            len(rules) - 1,
+            account_id,
+            primary.id,
+        )
+    return primary
 
 
 # ============================================================
@@ -84,38 +116,40 @@ def get_ai_config(account_id: int, account: WhatsAppAccount, workspace_id: str):
     """
     try:
         # Find the AI_CHAT rule for this account
-        ai_rule = WhatsAppAutomationRule.query.filter_by(
-            workspace_id=workspace_id,
-            account_id=account.id,
-            rule_type="ai_chat"
-        ).first()
+        ai_rule = _get_ai_rule_for_account(workspace_id, account.id)
         
         if not ai_rule:
             # Return default config if no AI rule exists
+            bot = get_bot_config(account)
             return jsonify({
                 "enabled": False,
                 "system_prompt": DEFAULT_SYSTEM_PROMPT,
                 "fallback_message": "I'm sorry, I couldn't process your request. A team member will assist you soon.",
-                "max_tokens": 1024,
+                "max_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
                 "temperature": 0.7,
                 "context_messages": 5,
                 "priority": 999,  # Low priority (AI is usually fallback)
+                "ai_model": bot.get("ai_model"),
+                "knowledge_base_id": bot.get("kb_id"),
             }), 200
         
         # Extract config from the rule
         response_config = ai_rule.response_config or {}
+        bot = get_bot_config(account)
         
         return jsonify({
             "enabled": ai_rule.is_active,
             "rule_id": ai_rule.id,
             "system_prompt": response_config.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
             "fallback_message": response_config.get("fallback_message", "I'm sorry, I couldn't process your request."),
-            "max_tokens": response_config.get("max_tokens", 1024),
+            "max_tokens": response_config.get("max_tokens", DEFAULT_MAX_OUTPUT_TOKENS),
             "temperature": response_config.get("temperature", 0.7),
             "context_messages": response_config.get("context_messages", 5),
             "priority": ai_rule.priority,
             "trigger_count": ai_rule.trigger_count,
             "last_triggered_at": ai_rule.last_triggered_at.isoformat() + "Z" if ai_rule.last_triggered_at else None,
+            "ai_model": bot.get("ai_model") or response_config.get("model"),
+            "knowledge_base_id": bot.get("kb_id") or response_config.get("knowledge_base_id"),
         }), 200
         
     except Exception as e:
@@ -134,7 +168,7 @@ def update_ai_config(account_id: int, account: WhatsAppAccount, workspace_id: st
             "enabled": true,
             "system_prompt": "...",
             "fallback_message": "...",
-            "max_tokens": 1024,
+            "max_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
             "temperature": 0.7,
             "context_messages": 5
         }
@@ -143,11 +177,7 @@ def update_ai_config(account_id: int, account: WhatsAppAccount, workspace_id: st
         data = request.get_json() or {}
         
         # Find or create AI rule
-        ai_rule = WhatsAppAutomationRule.query.filter_by(
-            workspace_id=workspace_id,
-            account_id=account.id,
-            rule_type="ai_chat"
-        ).first()
+        ai_rule = _get_ai_rule_for_account(workspace_id, account.id)
         
         if not ai_rule:
             # Create new AI rule
@@ -164,7 +194,7 @@ def update_ai_config(account_id: int, account: WhatsAppAccount, workspace_id: st
                 response_config={
                     "system_prompt": data.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
                     "fallback_message": data.get("fallback_message", "I'm sorry, I couldn't process your request."),
-                    "max_tokens": data.get("max_tokens", 1024),
+                    "max_tokens": data.get("max_tokens", DEFAULT_MAX_OUTPUT_TOKENS),
                     "temperature": data.get("temperature", 0.7),
                     "context_messages": data.get("context_messages", 5),
                 },
@@ -198,6 +228,17 @@ def update_ai_config(account_id: int, account: WhatsAppAccount, workspace_id: st
             
             logger.info(f"Updated AI chatbot config for account {account.id}")
         
+        rc = ai_rule.response_config or {}
+        upsert_whatsapp_bot_settings_shadow(
+            account,
+            ai_enabled=ai_rule.is_active,
+            ai_model=rc.get("model"),
+            temperature=rc.get("temperature"),
+            max_tokens=rc.get("max_tokens"),
+            prompt_override=rc.get("system_prompt"),
+            knowledge_base_id=rc.get("knowledge_base_id"),
+        )
+
         db.session.commit()
         
         return jsonify({
@@ -238,34 +279,21 @@ def test_ai_response(account_id: int, account: WhatsAppAccount, workspace_id: st
         if not message:
             return jsonify({"error": "Message is required"}), 400
         
-        # Get AI config for this account
-        ai_rule = WhatsAppAutomationRule.query.filter_by(
-            workspace_id=workspace_id,
-            account_id=account.id,
-            rule_type="ai_chat"
-        ).first()
+        # Get AI config for this account (automation rule + bot_settings slice)
+        ai_rule = _get_ai_rule_for_account(workspace_id, account.id)
         
-        system_prompt = build_business_system_prompt(
-            account.custom_name or account.verified_name
-        )
-        fallback_message = DEFAULT_HANDOFF_MESSAGE
+        rc = dict(ai_rule.response_config) if ai_rule and ai_rule.response_config else {}
+        rc["use_rag"] = use_rag
+        prep = prepare_automation_ai(account, rc)
+        if not prep["run"]:
+            return jsonify({
+                "success": False,
+                "error": "AI is disabled at account/bot_settings level",
+                "message": prep["fallback_message"],
+            }), 200
         
-        if ai_rule and ai_rule.response_config:
-            system_prompt = ai_rule.response_config.get("system_prompt", system_prompt)
-            fallback_message = normalize_fallback_message(
-                ai_rule.response_config.get("fallback_message", fallback_message)
-            )
-        
-        # Generate test response with RAG integration
-        result = generate_ai_response(
-            message=message,
-            system_prompt=system_prompt,
-            context=context,
-            fallback_message=fallback_message,
-            workspace_id=workspace_id,
-            use_rag=use_rag,
-            business_name=account.custom_name or account.verified_name,
-        )
+        chatbot = create_ai_chatbot(prep["config"])
+        result = chatbot.generate_response(message=message, context=context)
         
         return jsonify({
             "success": result.success,
@@ -287,11 +315,7 @@ def test_ai_response(account_id: int, account: WhatsAppAccount, workspace_id: st
 def enable_ai(account_id: int, account: WhatsAppAccount, workspace_id: str):
     """Quick endpoint to enable AI chatbot."""
     try:
-        ai_rule = WhatsAppAutomationRule.query.filter_by(
-            workspace_id=workspace_id,
-            account_id=account.id,
-            rule_type="ai_chat"
-        ).first()
+        ai_rule = _get_ai_rule_for_account(workspace_id, account.id)
         
         if not ai_rule:
             # Create default AI rule
@@ -308,7 +332,7 @@ def enable_ai(account_id: int, account: WhatsAppAccount, workspace_id: str):
                 response_config={
                     "system_prompt": DEFAULT_SYSTEM_PROMPT,
                     "fallback_message": "I'm sorry, I couldn't process your request. A team member will assist you soon.",
-                    "max_tokens": 1024,
+                    "max_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
                     "temperature": 0.7,
                     "context_messages": 5,
                 },
@@ -318,6 +342,17 @@ def enable_ai(account_id: int, account: WhatsAppAccount, workspace_id: str):
         else:
             ai_rule.is_active = True
             ai_rule.status = "active"
+
+        rc = ai_rule.response_config or {}
+        upsert_whatsapp_bot_settings_shadow(
+            account,
+            ai_enabled=True,
+            ai_model=rc.get("model"),
+            temperature=rc.get("temperature"),
+            max_tokens=rc.get("max_tokens"),
+            prompt_override=rc.get("system_prompt"),
+            knowledge_base_id=rc.get("knowledge_base_id"),
+        )
         
         db.session.commit()
         
@@ -338,15 +373,12 @@ def enable_ai(account_id: int, account: WhatsAppAccount, workspace_id: str):
 def disable_ai(account_id: int, account: WhatsAppAccount, workspace_id: str):
     """Quick endpoint to disable AI chatbot."""
     try:
-        ai_rule = WhatsAppAutomationRule.query.filter_by(
-            workspace_id=workspace_id,
-            account_id=account.id,
-            rule_type="ai_chat"
-        ).first()
+        ai_rule = _get_ai_rule_for_account(workspace_id, account.id)
         
         if ai_rule:
             ai_rule.is_active = False
             ai_rule.status = "paused"
+            upsert_whatsapp_bot_settings_shadow(account, ai_enabled=False)
             db.session.commit()
         
         return jsonify({
@@ -491,7 +523,7 @@ Original message: {message}
 Rewritten message:"""
 
         response = client.models.generate_content(
-            model="gemini-3.1-flash-lite",
+            model=os.environ.get("TEXT_MODEL") or os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash",
             contents=prompt,
             config=GenerateContentConfig(
                 max_output_tokens=256,

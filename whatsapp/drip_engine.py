@@ -5,44 +5,13 @@ import os
 import uuid
 from datetime import datetime, timezone, timedelta
 from flask import current_app, has_app_context, has_request_context, request
-from sqlalchemy import text
-from models import db
-from shared_models import WhatsAppLinkTracking
+from sqlalchemy import text, or_
+from shared_models import db, WhatsAppLinkTracking
 from .models import WhatsAppAccount
 from .drip_models import WhatsAppDripCampaign, WhatsAppDripStep, WhatsAppDripEnrollment
 from .services import WhatsAppService
 
 logger = logging.getLogger(__name__)
-
-
-# Internal / non-template keys that must NOT be used as flat template params
-# when falling back from missing step_N_-prefixed keys.
-_NON_TEMPLATE_FLAT_KEYS = {
-    "tracking_link",
-    "header_image_url",
-    "header_video_url",
-    "header_document_url",
-    "header_text",
-}
-
-
-def _is_excluded_flat_key(key: str) -> bool:
-    """A flat variable key that should be excluded from template-param fallback."""
-    if key is None:
-        return True
-    if str(key).startswith("_"):
-        return True
-    return str(key).strip().lower() in _NON_TEMPLATE_FLAT_KEYS
-
-
-# Permanent WhatsApp Cloud API send error codes. When the send fails with one of
-# these, retrying will never succeed, so the enrollment is marked failed and
-# next_run_at is cleared (no further retries).
-_PERMANENT_WHATSAPP_ERROR_CODES = {
-    "131008", "131009", "131026", "131047", "131051",
-    "132000", "132001", "132005", "132007", "132012",
-    "132015", "132016", "132068", "132069", "100",
-}
 
 
 def _is_url_like(value: str) -> bool:
@@ -72,26 +41,40 @@ def _truthy(value, default: bool = True) -> bool:
 
 def _is_media_variable_key(key: str) -> bool:
     normalized = str(key or "").strip().lower()
-    return normalized in {"header_image_url", "header_video_url", "header_document_url"}
+    return normalized in {
+        "header_image_url",
+        "header_video_url",
+        "header_document_url",
+    }
 
 
 def _tracking_base_url() -> str:
     candidates = []
+
+    # Prefer request host when available so devtunnel/proxy hosts are picked automatically.
     if has_request_context():
         candidates.append((request.host_url or "").strip())
+
     if has_app_context():
-        candidates.extend([
-            str(current_app.config.get("APP_BASE_URL") or "").strip(),
-            str(current_app.config.get("PUBLIC_APP_BASE_URL") or "").strip(),
-        ])
-    candidates.extend([
-        (os.getenv("APP_BASE_URL") or "").strip(),
-        (os.getenv("PUBLIC_APP_BASE_URL") or "").strip(),
-    ])
+        candidates.extend(
+            [
+                str(current_app.config.get("APP_BASE_URL") or "").strip(),
+                str(current_app.config.get("PUBLIC_APP_BASE_URL") or "").strip(),
+            ]
+        )
+
+    candidates.extend(
+        [
+            (os.getenv("APP_BASE_URL") or "").strip(),
+            (os.getenv("PUBLIC_APP_BASE_URL") or "").strip(),
+        ]
+    )
+
     for candidate in candidates:
         if candidate.lower().startswith(("http://", "https://")):
             return candidate.rstrip("/")
-    return "http://localhost:5000"
+
+    return "https://sociovia.com"
 
 
 def _build_tracking_redirect_url(tracking_id: str) -> str:
@@ -101,15 +84,18 @@ def _build_tracking_redirect_url(tracking_id: str) -> str:
 def _extract_target_url_from_variables(variables: dict, phone_number: str, fallback_message: str = "") -> str:
     if not variables:
         variables = {}
+
     for key in ("target_url", "url", "link", "website", "website_url", "landing_url"):
         value = variables.get(key)
         if isinstance(value, str) and _is_url_like(value):
             return _normalized_url(value)
+
     for key, value in variables.items():
         if _is_media_variable_key(key):
             continue
         if isinstance(value, str) and _is_url_like(value):
             return _normalized_url(value)
+
     wa_url = f"https://wa.me/{phone_number}"
     if fallback_message:
         from urllib.parse import quote
@@ -120,14 +106,17 @@ def _extract_target_url_from_variables(variables: dict, phone_number: str, fallb
 def _inject_tracking_link_into_variables(variables: dict, short_link: str) -> dict:
     updated = dict(variables or {})
     updated["tracking_link"] = short_link
+
     for key in ("link", "url", "target_url", "website", "website_url", "landing_url"):
         if key in updated:
             updated[key] = short_link
+
     for key, value in list(updated.items()):
         if _is_media_variable_key(key):
             continue
         if isinstance(value, str) and _is_url_like(value):
             updated[key] = short_link
+
     return updated
 
 
@@ -154,40 +143,24 @@ def extract_step_params(variables: dict, step_order: int) -> list:
             suffix = key[len(prefix):]
             step_columns[suffix] = str(value) if value else ""
     
-    # If no step-specific columns found, fall back to FLAT top-level keys.
-    # This supports bulk-enroll / dataset / CSV imports which store flat
-    # variables (e.g. {"name": "priyam"}) with NO step_N_ prefix, and applies
-    # to ALL steps (not just step 1) so steps 2+ are not blank.
+    # If no step-specific columns found, and this is step 1 (common for bulk),
+    # try looking for direct numeric keys ("1", "2", "3") or generic keys
     # This supports the Bulk Messaging UI which sends params as {"1": "val", "2": "val"}
-    if not step_columns:
+    if not step_columns and step_order == 1:
         # Check for direct numeric keys
         numeric_params = {}
         for key, value in variables.items():
-            if _is_excluded_flat_key(key):
-                continue
             # If key is digit ("1", "2")
             if key.isdigit():
-                 numeric_params[int(key)] = str(value) if value else ""
+                 numeric_params[int(key)] = str(value)
             # If key is like "param_1" (CSV upload often gives this)
             elif key.startswith("param_") and key[6:].isdigit():
-                 numeric_params[int(key[6:])] = str(value) if value else ""
-
+                 numeric_params[int(key[6:])] = str(value)
+        
         # If we found numeric params, sort by number and return in order
         if numeric_params:
             for i in sorted(numeric_params.keys()):
                 params.append(numeric_params[i])
-            return params
-
-        # Otherwise fall back to flat named keys, in alphabetical order
-        # (predictable ordering, mirroring the step_N_ named path below).
-        flat_columns = {}
-        for key, value in variables.items():
-            if _is_excluded_flat_key(key):
-                continue
-            flat_columns[key] = str(value) if value else ""
-        if flat_columns:
-            for key in sorted(flat_columns.keys()):
-                params.append(flat_columns[key])
             return params
     
     # Otherwise, use named columns in alphabetical order
@@ -225,17 +198,15 @@ def extract_step_params_dict(variables: dict, step_order: int) -> dict:
             param_name = key[len(prefix):]
             params[param_name] = str(value) if value else ""
     
-    # If no step-specific columns found, fall back to FLAT top-level keys.
-    # Applies to ALL steps (not just step 1) so bulk-enroll / dataset / CSV
-    # imports that store flat variables (e.g. {"name": "priyam"}) populate
-    # steps 2+ as well. Internal / non-template keys are excluded.
-    if not params:
+    # If no step-specific columns found and this is step 1 (common for bulk),
+    # use direct keys from variables
+    if not params and step_order == 1:
         for key, value in variables.items():
-            # Skip internal keys and known non-template keys
-            if _is_excluded_flat_key(key):
+            # Skip internal keys
+            if key.startswith("_"):
                 continue
             params[key] = str(value) if value else ""
-
+            
     return params
 
 
@@ -319,7 +290,23 @@ def process_drip_campaigns():
 
 def trigger_campaign_now(campaign_id):
     logger.info(f"___TRIGGER_CAMPAIGN_NOW called for ID {campaign_id}___")
+    lock_conn = None
+    lock_id = int(os.getenv("WHATSAPP_DRIP_DB_LOCK_ID", "947531"))
     try:
+        # Reuse the same advisory lock as the interval scheduler so send-now and
+        # periodic runners cannot process the same enrollments concurrently.
+        lock_conn = db.engine.connect()
+        got_lock = lock_conn.execute(
+            text("SELECT pg_try_advisory_lock(:lock_id)"),
+            {"lock_id": lock_id},
+        ).scalar()
+        if not got_lock:
+            logger.info(
+                "[DRIP_TRIGGER] Skipping immediate trigger for campaign %s because drip lock is busy",
+                campaign_id,
+            )
+            return
+
         from .drip_models import WhatsAppDripCampaign, WhatsAppDripEnrollment
         campaign = (
             WhatsAppDripCampaign.query
@@ -329,6 +316,28 @@ def trigger_campaign_now(campaign_id):
         )
         if not campaign:
             logger.error(f"Campaign {campaign_id} not found or already being processed")
+            return
+
+        from .capabilities import broadcast_capability_check
+
+        bc = broadcast_capability_check(campaign.account_id)
+        if not bc.ok:
+            logger.warning(
+                "[DRIP_TRIGGER] Skipping campaign %s: broadcast capability denied (%s)",
+                campaign_id,
+                bc.message,
+            )
+            return
+
+        from .warmup_enforcement import warmup_denial_drip
+
+        wd = warmup_denial_drip(campaign.account_id, db.session)
+        if wd:
+            logger.warning(
+                "[DRIP_TRIGGER] Skipping campaign %s: warmup drip denied (%s)",
+                campaign_id,
+                wd.message,
+            )
             return
 
         # If it was scheduled, mark it running
@@ -348,11 +357,21 @@ def trigger_campaign_now(campaign_id):
             # If it's drafted or something else, we might still want to commit the lock release if we checked it
             db.session.commit()
 
-        # Fetch IDs and process individually to avoid the 'commit releases all' lock issue
-        enrollments = WhatsAppDripEnrollment.query.filter_by(
-            campaign_id=campaign_id,
-            status="active"
-        ).all()
+        now = datetime.now(timezone.utc)
+        # Process only due rows. This prevents overlap with the minute scheduler
+        # from re-sending the same recipient in a send-now burst.
+        enrollments = (
+            WhatsAppDripEnrollment.query
+            .filter(
+                WhatsAppDripEnrollment.campaign_id == campaign_id,
+                WhatsAppDripEnrollment.status == "active",
+                or_(
+                    WhatsAppDripEnrollment.next_run_at.is_(None),
+                    WhatsAppDripEnrollment.next_run_at <= now,
+                ),
+            )
+            .all()
+        )
         
         enrollment_ids = [e.id for e in enrollments]
         logger.info(f"Found {len(enrollment_ids)} active enrollments for campaign {campaign_id}")
@@ -379,6 +398,15 @@ def trigger_campaign_now(campaign_id):
         logger.exception(f"Error triggering campaign {campaign_id}: {e}")
         db.session.rollback()
     finally:
+        try:
+            if lock_conn is not None:
+                lock_conn.execute(
+                    text("SELECT pg_advisory_unlock(:lock_id)"),
+                    {"lock_id": lock_id},
+                )
+                lock_conn.close()
+        except Exception:
+            logger.debug("[DRIP_TRIGGER] advisory unlock failed", exc_info=True)
         db.session.remove()
 
 
@@ -389,11 +417,54 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
         logger.info(f"DRIP ENGINE - Skipping enrollment {enrollment.id} because status is {enrollment.status}")
         return
 
+    # Defensive Check 2: Verify next_run_at is actually due to prevent double-processing from race conditions
+    if enrollment.next_run_at:
+        now = datetime.now(timezone.utc)
+        next_run = enrollment.next_run_at
+        if next_run.tzinfo is None:
+            next_run = next_run.replace(tzinfo=timezone.utc)
+        if next_run > now:
+            logger.info(f"DRIP ENGINE - Skipping enrollment {enrollment.id} because next_run_at {next_run} is in the future (current time: {now})")
+            return
+
+
     campaign = WhatsAppDripCampaign.query.get(enrollment.campaign_id)
     if not campaign or campaign.status not in ["active", "running"]:
         # Pause enrollment if campaign paused/deleted
         enrollment.status = "paused"
         enrollment.status_reason = f"Campaign status {campaign.status} not active/running"
+        return
+
+    from .capabilities import broadcast_capability_check
+
+    bc = broadcast_capability_check(campaign.account_id)
+    if not bc.ok:
+        enrollment.status = "paused"
+        enrollment.status_reason = (bc.message or "broadcast_capability_denied")[:2000]
+        return
+
+    from .warmup_enforcement import warmup_denial_drip
+
+    wd = warmup_denial_drip(campaign.account_id, db.session)
+    if wd:
+        enrollment.status = "paused"
+        enrollment.status_reason = (wd.message or "warmup_drip_denied")[:2000]
+        return
+
+    # Check Safe Mode suppression
+    from .models import WhatsAppAccount
+    account = WhatsAppAccount.query.get(campaign.account_id)
+    if not account:
+        logger.error(f"Account {campaign.account_id} not found for drip {campaign.id}")
+        enrollment.status = "failed"
+        enrollment.status_reason = f"Account {campaign.account_id} not found"
+        return
+        
+    from .safe_mode_engine import is_risk_allowed, RiskClass
+    if not is_risk_allowed(account, RiskClass.VERY_HIGH):
+        enrollment.status = "paused"
+        enrollment.status_reason = f"Suppressed due to active operational mode ({account.operational_mode})"
+        logger.info(f"DRIP ENGINE - Enrollment {enrollment.id} paused by Safe Mode Engine ({account.operational_mode})")
         return
 
     # Determine next step
@@ -412,42 +483,57 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
          campaign.completed_count = (campaign.completed_count or 0) + 1
          return
 
-    # Get account for sending
-    account = WhatsAppAccount.query.get(campaign.account_id)
-    if not account:
-        logger.error(f"Account {campaign.account_id} not found for drip {campaign.id}")
-        enrollment.status = "failed"
-        enrollment.status_reason = f"Account {campaign.account_id} not found"
+    # Deduplication/Idempotency check to prevent duplicate message dispatch
+    from .drip_models import WhatsAppSendIdempotency
+    dedup_key = f"drip_enrollment_{enrollment.id}_step_{step.step_order}"
+    try:
+        # Use a SAVEPOINT/nested-transaction to attempt idempotency key insert
+        db.session.begin_nested()
+        idem = WhatsAppSendIdempotency(dedup_key=dedup_key)
+        db.session.add(idem)
+        db.session.flush() # Force SQL execution to trigger unique key check immediately
+    except Exception as ie:
+        db.session.rollback() # Rollback only the sub-transaction savepoint
+        logger.warning(f"DRIP ENGINE - Skipping enrollment {enrollment.id} step {step.step_order} due to idempotency hit (dedup_key: {dedup_key})")
         return
+
     
     # Extract template parameters from variables
     variables = dict(enrollment.variables or {})
-    logger.info(f"DRIP ENGINE - Enrollment {enrollment.id} Variables: {json.dumps(variables) if variables else 'None'}")
+    logger.info(f"DRIP ENGINE - Enrollment {enrollment.id} Variables: {json.dumps(variables) if variables else 'None'}") # DEBUG LOG
 
     enable_tracking_url = _truthy(variables.get("__enable_tracking_url"), default=True)
+    tracking_record = None
+    tracking_id = None
+    redirect_link = None
+
     if enable_tracking_url:
+        # Generate per-recipient tracking identity and redirect link for this send attempt.
         tracking_id = f"clk_{uuid.uuid4().hex[:16]}"
         redirect_link = _build_tracking_redirect_url(tracking_id)
         target_url = _extract_target_url_from_variables(variables, enrollment.phone_number)
         variables = _inject_tracking_link_into_variables(variables, redirect_link)
         enrollment.tracking_id = tracking_id
-        db.session.add(WhatsAppLinkTracking(
+
+        tracking_record = WhatsAppLinkTracking(
             workspace_id=str(campaign.workspace_id),
             account_id=campaign.account_id,
-            source="bulk" if campaign.trigger_type == "manual" else "drip",
-            source_type="bulk_campaign" if campaign.trigger_type == "manual" else "drip_campaign",
+            source="bulk",
+            source_type="bulk_campaign",
             tracking_id=tracking_id,
             phone_number=enrollment.phone_number,
             name=(variables.get("name") or variables.get("full_name") or variables.get("first_name")),
             template_name=step.template_name,
             campaign_name=campaign.name,
             target_url=target_url,
-            utm_source=campaign.trigger_type or "drip",
+            utm_source="bulk",
             utm_campaign=campaign.name,
             click_count=0,
-        ))
+        )
+        db.session.add(tracking_record)
     else:
         enrollment.tracking_id = None
+
     enrollment.variables = variables
     
     # Check if template uses named parameters
@@ -547,6 +633,18 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
                         if target_param not in final_named_params:
                             final_named_params[target_param] = val
                             used_raw_keys.add(key)
+
+        if enable_tracking_url and redirect_link:
+            # Replace any URL-like value regardless of placeholder name.
+            for expected_name, value in list(final_named_params.items()):
+                if isinstance(value, str) and _is_url_like(value):
+                    final_named_params[expected_name] = redirect_link
+
+            # Also force common link/url placeholder names to tracking link.
+            for expected_name in expected_params:
+                lower_name = expected_name.lower()
+                if any(token in lower_name for token in ("link", "url", "track")):
+                    final_named_params[expected_name] = redirect_link
         
         logger.info(f"Step {step.step_order} PARAM MAPPING: Raw={raw_step_params.keys()} -> Expected={expected_params} -> Final={final_named_params}")
         
@@ -566,6 +664,12 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
     else:
         # POSITIONAL PARAMETERS LOGIC (Legacy)
         params = extract_step_params(variables, step.step_order)
+
+        if enable_tracking_url and redirect_link:
+            # For positional templates, replace all URL-like params with tracking link.
+            for idx, p in enumerate(params):
+                if isinstance(p, str) and _is_url_like(p):
+                    params[idx] = redirect_link
         logger.info(f"Step {step.step_order} POSITIONAL params extracted: {params}")
         
         if params:
@@ -573,6 +677,43 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
             body_parameters = [{"type": "text", "text": str(p)} for p in params]
             components.append({"type": "body", "parameters": body_parameters})
     
+    # STRICT RUNTIME PARAMETER VALIDATION
+    missing_vars = []
+    if is_named_template and template_record:
+        # Check named params
+        for name in expected_params:
+            val = final_named_params.get(name)
+            if val is None or str(val).strip() == "":
+                missing_vars.append(name)
+    else:
+        # Check positional params
+        expected_count = template_record.variable_count if template_record else 0
+        if len(params) < expected_count:
+            for idx in range(len(params) + 1, expected_count + 1):
+                missing_vars.append(f"param_{idx}")
+        for idx, p in enumerate(params):
+            if p is None or str(p).strip() == "":
+                missing_vars.append(f"param_{idx + 1}")
+
+    if missing_vars:
+        logger.warning(f"DRIP ENGINE - Enrollment {enrollment.id} step {step.step_order} blocked due to missing parameters: {missing_vars}")
+        enrollment.failed = True
+        enrollment.status = "blocked_missing_data"
+        enrollment.status_reason = f"Required template parameters are missing: {', '.join(missing_vars)}"
+        
+        # Check for campaign completion since this finishes the enrollment
+        total = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign.id).count()
+        finished = WhatsAppDripEnrollment.query.filter(
+            WhatsAppDripEnrollment.campaign_id == campaign.id,
+            WhatsAppDripEnrollment.status.in_(["completed", "failed", "blocked_missing_data"])
+        ).count()
+        if finished >= total and total > 0:
+            campaign.status = "completed"
+            logger.info(f"Campaign {campaign.id} COMPLETED (All {total} enrollments finished due to parameter missing)")
+            
+        db.session.commit()
+        return
+
     # Store what we're sending for audit
     enrollment.last_sent_params = {
         "step": step.step_order,
@@ -593,6 +734,15 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
     )
     
     if result.get("success"):
+        now = datetime.now(timezone.utc)
+        enrollment.message_id = result.get("wamid")
+        enrollment.sent = True
+        enrollment.sent_at = now
+        enrollment.failed = False
+
+        if tracking_record:
+            tracking_record.wamid = enrollment.message_id
+
         # Advance state
         enrollment.current_step_order = step.step_order
         enrollment.status_reason = None  # Clear any previous error
@@ -604,7 +754,7 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
         ).first()
         
         if next_next_step:
-            enrollment.next_run_at = datetime.now(timezone.utc) + timedelta(seconds=next_next_step.delay_seconds)
+            enrollment.next_run_at = next_next_step.get_next_run_at()
         else:
             # No next step, mark complete
             enrollment.status = "completed"
@@ -628,36 +778,22 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
         
     else:
         error_msg = result.get("error", "Unknown error")
-        error_code_str = str(result.get("error_code", ""))
         logger.error(f"Drip send failed: {result}")
-
-        # Robustly look for any permanent error code in BOTH the error_code
-        # field and the error text (different layers surface it differently).
-        combined_error_text = f"{error_code_str} {str(error_msg)}"
-        matched_permanent_code = next(
-            (code for code in _PERMANENT_WHATSAPP_ERROR_CODES if code in combined_error_text),
-            None,
-        )
-
-        if "132000" in error_code_str or "params" in error_msg.lower():
-            # Template parameter mismatch -> terminal, missing data
+        enrollment.failed = True
+        
+        # Check if it's a parameter mismatch error
+        if "132000" in str(result.get("error_code", "")) or "params" in error_msg.lower():
             enrollment.status = "blocked_missing_data"
             enrollment.status_reason = f"Template parameter mismatch: {error_msg}"
-            enrollment.next_run_at = None
             logger.warning(f"Enrollment {enrollment.id} blocked - missing data for template")
-        elif matched_permanent_code:
-            # Permanent WhatsApp send error -> terminal failure, do NOT retry.
-            enrollment.status = "failed"
-            enrollment.status_reason = (
-                f"Permanent send error {matched_permanent_code}: {error_msg}"
-            )
-            enrollment.next_run_at = None
-            logger.warning(
-                f"Enrollment {enrollment.id} failed permanently "
-                f"(error {matched_permanent_code}) - will not retry"
-            )
         else:
-            # Genuinely transient error (rate-limit/network) - retry later
+            # Other error - retry later. Release the idempotency claim inserted before
+            # the send, otherwise the scheduled retry hits the existing dedup key and the
+            # step is skipped forever (enrollment stays 'active' but never advances).
+            try:
+                db.session.delete(idem)
+            except Exception:
+                logger.exception(f"Failed to release idempotency key {dedup_key} for retry")
             enrollment.next_run_at = datetime.now(timezone.utc) + timedelta(hours=1)
             enrollment.status_reason = f"Send failed: {error_msg}"
 
@@ -669,26 +805,46 @@ def check_scheduled_campaigns():
     """
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
+        # Atomically claim due campaigns using SKIP LOCKED
         sql = text("""
-            UPDATE whatsapp_drip_campaigns
+            UPDATE whatsapp_drip_campaigns 
             SET status = 'running', trigger_value = NULL, updated_at = NOW()
             WHERE id IN (
-                SELECT id FROM whatsapp_drip_campaigns
-                WHERE status = 'scheduled' AND trigger_type = 'manual' AND trigger_value <= :now
-                FOR UPDATE SKIP LOCKED
+                SELECT id FROM whatsapp_drip_campaigns 
+                WHERE status = 'scheduled' AND trigger_type = 'manual' AND trigger_value <= :now 
+                FOR UPDATE SKIP LOCKED 
                 LIMIT 100
-            )
+            ) 
             RETURNING id;
         """)
+        
         result = db.session.execute(sql, {"now": now_iso}).fetchall()
         db.session.commit()
+        
         campaign_ids = [row[0] for row in result]
-        for cid in campaign_ids:
-            logger.info("Scheduler: activated scheduled campaign %s", cid)
-            trigger_campaign_now(cid)
+
+        use_queue = (os.getenv("DRIP_SCHEDULE_USE_QUEUE") or "").strip().lower() in {"1", "true", "yes", "on"}
+        if use_queue:
+            from core.queue.manager import enqueue_job
+
+            for cid in campaign_ids:
+                try:
+                    enqueue_job("whatsapp-drip-trigger-campaign", {"campaign_id": cid})
+                except Exception as qe:
+                    logger.warning(
+                        "Queue enqueue failed for campaign %s, falling back to inline trigger: %s",
+                        cid,
+                        qe,
+                    )
+                    trigger_campaign_now(cid)
+        else:
+            for cid in campaign_ids:
+                logger.info(f"Cloud Scheduler: Activated scheduled campaign {cid}")
+                trigger_campaign_now(cid)
+
         return campaign_ids
     except Exception as e:
-        logger.exception("Error checking scheduled campaigns: %s", e)
+        logger.exception(f"Error checking scheduled campaigns: {e}")
         db.session.rollback()
         return []
 

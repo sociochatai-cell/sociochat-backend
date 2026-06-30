@@ -10,9 +10,11 @@ Multi-tenant: All automations scoped by workspace_id and account_id.
 
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
-from models import db
+from shared_models import db
 from sqlalchemy import Index, JSON, Text
 from sqlalchemy.orm.attributes import flag_modified
+
+from . import flow_variables
 
 
 class WhatsAppVisualAutomation(db.Model):
@@ -49,6 +51,12 @@ class WhatsAppVisualAutomation(db.Model):
     
     # Viewport state (for restoring canvas position)
     viewport = db.Column(JSON, nullable=True)  # {x, y, zoom}
+
+    # Per-flow {{placeholder}} values (API tokens, URLs, etc.) — stored in DB, not env
+    variables = db.Column(JSON, nullable=False, default=dict)
+
+    # Runtime config: variableDefaults, optional global buttonCaptureRules
+    flow_config = db.Column(JSON, nullable=False, default=dict)
     
     # Status
     status = db.Column(db.String(32), default="draft")  # draft, active, paused
@@ -66,8 +74,9 @@ class WhatsAppVisualAutomation(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, *, mask_secrets: bool = True) -> Dict[str, Any]:
         """Convert to dictionary for API response."""
+        raw_variables = self.variables if isinstance(self.variables, dict) else {}
         return {
             "id": self.id,
             "workspaceId": self.workspace_id,
@@ -76,12 +85,15 @@ class WhatsAppVisualAutomation(db.Model):
             "description": self.description,
             "triggerType": self.trigger_type,
             "triggerConfig": self.trigger_config,
-            "variables": self.variables,
-            "flowConfig": self.flow_config,
-            "flow_config": self.flow_config,
             "nodes": self.nodes,
             "edges": self.edges,
             "viewport": self.viewport,
+            "variables": (
+                flow_variables.mask_variables_for_response(raw_variables)
+                if mask_secrets
+                else dict(raw_variables)
+            ),
+            "flowConfig": self.flow_config if isinstance(self.flow_config, dict) else {},
             "status": self.status,
             "isActive": self.is_active,
             "triggerCount": self.trigger_count,
@@ -108,41 +120,6 @@ class WhatsAppVisualAutomation(db.Model):
         """Increment trigger count and update last triggered time."""
         self.trigger_count = (self.trigger_count or 0) + 1
         self.last_triggered_at = datetime.now(timezone.utc)
-
-    # -- Flow Variables & Config (additive, no migration) ---------------
-    # Flow-level variables (API tokens, URLs) and flow_config are stored
-    # inside the existing trigger_config JSON column under reserved keys so
-    # no schema migration is required.
-    _VARIABLES_KEY = "_flow_variables"
-    _FLOW_CONFIG_KEY = "_flow_config"
-
-    @property
-    def variables(self) -> Dict[str, Any]:
-        """Per-flow variables (e.g. {"flow_api_token": "..."})."""
-        cfg = self.trigger_config if isinstance(self.trigger_config, dict) else {}
-        value = cfg.get(self._VARIABLES_KEY)
-        return value if isinstance(value, dict) else {}
-
-    @variables.setter
-    def variables(self, value: Optional[Dict[str, Any]]) -> None:
-        cfg = dict(self.trigger_config) if isinstance(self.trigger_config, dict) else {}
-        cfg[self._VARIABLES_KEY] = value if isinstance(value, dict) else {}
-        self.trigger_config = cfg
-        flag_modified(self, "trigger_config")
-
-    @property
-    def flow_config(self) -> Dict[str, Any]:
-        """Per-flow config, e.g. {"variableDefaults": {...}, "buttonCaptureRules": [...]}."""
-        cfg = self.trigger_config if isinstance(self.trigger_config, dict) else {}
-        value = cfg.get(self._FLOW_CONFIG_KEY)
-        return value if isinstance(value, dict) else {}
-
-    @flow_config.setter
-    def flow_config(self, value: Optional[Dict[str, Any]]) -> None:
-        cfg = dict(self.trigger_config) if isinstance(self.trigger_config, dict) else {}
-        cfg[self._FLOW_CONFIG_KEY] = value if isinstance(value, dict) else {}
-        self.trigger_config = cfg
-        flag_modified(self, "trigger_config")
 
 
 class WhatsAppAutomationNode(db.Model):
@@ -264,11 +241,14 @@ class WhatsAppConversationState(db.Model):
         self.is_active = False
         self.completed_at = datetime.now(timezone.utc)
         self.updated_at = datetime.now(timezone.utc)
+        sd = dict(self.state_data or {})
+        sd.pop("pending_api_buttons", None)
+        sd.pop("waiting_for_input", None)
+        sd.pop("current_field", None)
+        self.state_data = sd
+        flag_modified(self, "state_data")
 
-    # -- Input Flow Helpers (additive) ----------------------------------
-    # Collected input fields, field order (for corrections), and the
-    # waiting-for-input flag are all stored inside the existing state_data
-    # JSON column - no schema migration required.
+    # ── Input Flow Helpers ─────────────────────────────────────────
 
     def set_collected_field(self, field: str, value) -> None:
         """Store a collected input field value."""

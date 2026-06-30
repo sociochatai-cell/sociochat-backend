@@ -64,6 +64,15 @@ def scheduler_tick():
         logger.error(f"Error processing due enrollments during tick: {e}")
         results["drip_enrollments_error"] = str(e)
 
+    # 3b. Usage/billing events (replaces always-on whatsapp-usage-consumer)
+    try:
+        from monolith_integration.usage_consumer import poll_usage_events_for_scheduler
+
+        results["usage_events_poll"] = poll_usage_events_for_scheduler()
+    except Exception as e:
+        logger.warning("usage events poll during scheduler tick: %s", e)
+        results["usage_events_poll_error"] = str(e)
+
     # 4. Advisory: mark expired Embedded Signup onboarding sessions (no disconnects)
     try:
         from whatsapp.onboarding_session_manager import sweep_expired_sessions
@@ -95,44 +104,15 @@ def scheduler_tick():
         logger.warning("safe mode engine tick: %s", e)
         results["safe_mode_evaluations_error"] = str(e)
 
-    # 7. Auto-sync Google Sheet drip campaigns (enroll newly added rows)
+    # 7. Authoritative teardown of abandoned interactive-flow states (the 24h timeout is
+    #    otherwise LAZY) + expire stale agent pauses so handed-off chats return to the bot.
     try:
-        from whatsapp.drip_models import WhatsAppDripCampaign
-        from whatsapp.drip_routes import sync_sheet_campaign_internal
+        from whatsapp.interactive_automation_engine import sweep_stale_flow_states
 
-        sheet_campaigns = WhatsAppDripCampaign.query.filter(
-            WhatsAppDripCampaign.trigger_type == "google_sheet_row",
-            WhatsAppDripCampaign.status == "active",
-            WhatsAppDripCampaign.sheet_id.isnot(None),
-        ).all()
-
-        sheet_sync_stats = {
-            "campaigns": len(sheet_campaigns),
-            "synced": 0,
-            "enrolled": 0,
-            "errors": 0,
-        }
-        for campaign in sheet_campaigns:
-            try:
-                sync_result = sync_sheet_campaign_internal(campaign.id)
-                if sync_result.get("success"):
-                    sheet_sync_stats["synced"] += 1
-                    sheet_sync_stats["enrolled"] += sync_result.get("enrolled", 0) or 0
-                else:
-                    sheet_sync_stats["errors"] += 1
-                    logger.warning(
-                        "Sheet sync failed for campaign %s: %s",
-                        campaign.id,
-                        sync_result.get("error"),
-                    )
-            except Exception as inner_e:
-                sheet_sync_stats["errors"] += 1
-                logger.warning("Sheet sync raised for campaign %s: %s", campaign.id, inner_e)
-
-        results["sheet_syncs"] = sheet_sync_stats
+        results["flow_state_sweep"] = sweep_stale_flow_states(limit=200)
     except Exception as e:
-        logger.warning("sheet sync tick: %s", e)
-        results["sheet_syncs_error"] = str(e)
+        logger.warning("flow-state sweep during scheduler tick: %s", e)
+        results["flow_state_sweep_error"] = str(e)
 
     logger.info(f"[SCHEDULER TICK] Completed. Results: {results}")
     

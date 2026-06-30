@@ -13,7 +13,7 @@ from typing import Dict, Any, Optional, Callable
 import logging
 import asyncio
 
-from models import db
+from shared_models import db
 from whatsapp.visual_automation_models import WhatsAppVisualAutomation, WhatsAppConversationState
 from whatsapp.conversation_state_engine import ConversationStateEngine
 from whatsapp.template_node_executor import TemplateNodeExecutor

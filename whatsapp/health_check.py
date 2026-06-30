@@ -19,7 +19,7 @@ import requests
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
 
-from models import db
+from shared_models import db
 from .models import WhatsAppAccount
 from .encryption import decrypt_token
 
@@ -82,59 +82,89 @@ def validate_access_token(access_token: str) -> Tuple[bool, str, Dict]:
         return False, "No access token provided", {}
     
     try:
-        # Debug token to check validity and expiration
-        url = f"{META_GRAPH_API}/debug_token"
-        params = {
-            "input_token": access_token,
-            "access_token": access_token  # Self-inspection
-        }
-        
-        response = requests.get(url, params=params, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json().get("data", {})
-            
+        # First verify the token can access /me (works for user/system-user tokens)
+        me_resp = requests.get(
+            f"{META_GRAPH_API}/me",
+            params={"fields": "id,name", "access_token": access_token},
+            timeout=10,
+        )
+
+        if me_resp.status_code != 200:
+            me_error = me_resp.json().get("error", {})
+            return False, me_error.get("message", "Token validation failed"), {
+                "error_code": me_error.get("code"),
+                "error_subcode": me_error.get("error_subcode"),
+                "error_type": me_error.get("type"),
+            }
+
+        me_data = me_resp.json()
+
+        # Then try /debug_token for richer metadata (requires app owner/developer context)
+        debug_resp = requests.get(
+            f"{META_GRAPH_API}/debug_token",
+            params={
+                "input_token": access_token,
+                "access_token": access_token,
+            },
+            timeout=10,
+        )
+
+        if debug_resp.status_code == 200:
+            data = debug_resp.json().get("data", {})
             is_valid = data.get("is_valid", False)
             expires_at = data.get("expires_at", 0)
             app_id = data.get("app_id")
-            
-            # Check expiration
+
             if expires_at and expires_at > 0:
                 expiry_time = datetime.fromtimestamp(expires_at, tz=timezone.utc)
                 now = datetime.now(timezone.utc)
-                
+
                 if expiry_time < now:
                     return False, "Token has expired", {
                         "expired_at": expiry_time.isoformat(),
-                        "error_code": "TOKEN_EXPIRED"
+                        "error_code": "TOKEN_EXPIRED",
+                        "actor_id": me_data.get("id"),
+                        "actor_name": me_data.get("name"),
                     }
-                
-                # Warn if expiring soon (within 7 days)
+
                 days_until_expiry = (expiry_time - now).days
                 if days_until_expiry < 7:
                     return True, f"Token expires in {days_until_expiry} days", {
                         "expires_at": expiry_time.isoformat(),
                         "days_until_expiry": days_until_expiry,
-                        "warning": "TOKEN_EXPIRING_SOON"
+                        "warning": "TOKEN_EXPIRING_SOON",
+                        "app_id": app_id,
+                        "scopes": data.get("scopes", []),
+                        "actor_id": me_data.get("id"),
+                        "actor_name": me_data.get("name"),
                     }
-            
+
             if is_valid:
                 return True, "Token is valid", {
                     "app_id": app_id,
                     "expires_at": expires_at,
-                    "scopes": data.get("scopes", [])
+                    "scopes": data.get("scopes", []),
+                    "actor_id": me_data.get("id"),
+                    "actor_name": me_data.get("name"),
                 }
-            else:
-                return False, data.get("error", {}).get("message", "Token is invalid"), {
-                    "error_code": "TOKEN_INVALID"
-                }
-        else:
-            error = response.json().get("error", {})
-            return False, error.get("message", "Token validation failed"), {
-                "error_code": error.get("code"),
-                "error_subcode": error.get("error_subcode")
+
+            return False, data.get("error", {}).get("message", "Token is invalid"), {
+                "error_code": "TOKEN_INVALID",
+                "actor_id": me_data.get("id"),
+                "actor_name": me_data.get("name"),
             }
-            
+
+        # /debug_token may fail for non-app-owner users even when token itself works.
+        debug_error = debug_resp.json().get("error", {})
+        return True, "Token is valid (limited introspection)", {
+            "warning": "TOKEN_DEBUG_RESTRICTED",
+            "debug_message": debug_error.get("message"),
+            "debug_error_code": debug_error.get("code"),
+            "debug_error_subcode": debug_error.get("error_subcode"),
+            "actor_id": me_data.get("id"),
+            "actor_name": me_data.get("name"),
+        }
+
     except requests.exceptions.Timeout:
         return False, "Meta API timeout during token validation", {"error_code": "TIMEOUT"}
     except requests.exceptions.RequestException as e:
@@ -213,13 +243,9 @@ def subscribe_waba_to_webhooks(waba_id: str, access_token: str) -> Tuple[bool, s
     # - message_template_quality_update: template quality score changes
     # - template_category_update: template category changes
     # - message_echoes: messages sent from mobile (coexistence)
-    subscribed_fields = [
-        "messages",
-        "message_template_status_update",
-        "message_template_quality_update",
-        "template_category_update",
-        "message_echoes",
-    ]
+    from .provisioning_types import FULL_WEBHOOK_FIELDS
+
+    subscribed_fields = list(FULL_WEBHOOK_FIELDS)
     
     try:
         url = f"{META_GRAPH_API}/{waba_id}/subscribed_apps"
@@ -283,6 +309,7 @@ def check_phone_number_quality(phone_number_id: str, access_token: str) -> Tuple
             quality = data.get("quality_rating", "UNKNOWN")
             messaging_limit = data.get("messaging_limit_tier", "UNKNOWN")
             name_status = data.get("name_status", "UNKNOWN")
+            phone_status = str(data.get("status", "UNKNOWN")).upper()
             
             details = {
                 "display_phone_number": data.get("display_phone_number"),
@@ -290,8 +317,15 @@ def check_phone_number_quality(phone_number_id: str, access_token: str) -> Tuple
                 "quality_rating": quality,
                 "messaging_limit_tier": messaging_limit,
                 "name_status": name_status,
-                "status": data.get("status")
+                "status": phone_status
             }
+
+            if phone_status in {"DISCONNECTED", "UNREGISTERED", "OFFLINE"}:
+                return HealthStatus.CRITICAL, f"Phone number status is {phone_status}", {
+                    **details,
+                    "error_code": "PHONE_DISCONNECTED",
+                    "action_required": "Reconnect/register this number in WhatsApp Manager (Cloud API)",
+                }
             
             # Determine health status based on quality
             if quality == "GREEN":
@@ -386,6 +420,37 @@ def perform_health_check(account_id: int, auto_fix: bool = True) -> Dict[str, An
         )
     
     results.append(token_result)
+
+    # ============================================================
+    # Check 1b: Messaging send permission (partner WABAs need System User)
+    # ============================================================
+    if token_valid and account.phone_number_id:
+        from .connection_path import verify_messaging_send_access
+
+        send_check = verify_messaging_send_access(
+            access_token, account.phone_number_id, account.waba_id
+        )
+        if send_check.get("can_send"):
+            send_result = HealthCheckResult(
+                name="messaging_send_permission",
+                status=HealthStatus.HEALTHY,
+                message="Token can send messages for this phone number",
+                details=send_check.get("details") or {},
+            )
+        else:
+            send_result = HealthCheckResult(
+                name="messaging_send_permission",
+                status=HealthStatus.CRITICAL,
+                message=send_check.get("error", "Cannot send messages with this token"),
+                details={
+                    **(send_check.get("details") or {}),
+                    "hints": send_check.get("hints", []),
+                    "error_code": send_check.get("error_code"),
+                },
+                auto_fix_available=False,
+            )
+            overall_status = HealthStatus.CRITICAL
+        results.append(send_result)
     
     # Only continue checks if token is valid
     if not token_valid:

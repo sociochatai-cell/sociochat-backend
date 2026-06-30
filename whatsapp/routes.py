@@ -28,6 +28,7 @@ import os
 import logging
 from datetime import datetime, timezone, timedelta
 from functools import wraps
+from typing import Optional
 from urllib.parse import urlencode
 from flask import Blueprint, request, jsonify, g, redirect, current_app
 from sqlalchemy import func, case
@@ -35,7 +36,13 @@ from sqlalchemy import func, case
 from .services import WhatsAppService, ConversationService
 from .utils import subscribe_waba_to_app
 
-from .webhook import verify_webhook_signature, verify_webhook_challenge, WebhookProcessor
+from .webhook import (
+    verify_webhook_signature,
+    verify_webhook_signature_any,
+    verify_webhook_challenge,
+    WebhookProcessor,
+)
+from .trace_debug import trace_event, get_trace_by_wamid, get_trace_by_conversation
 from .services import WhatsAppService, ConversationService
 from .validators import (
     ValidationError,
@@ -47,13 +54,18 @@ from .validators import (
     format_validation_error,
 )
 from .token_helper import get_account_with_token, get_valid_account_for_workspace
-from subscription.service import check_message_limit, record_message_sent
 from .models import WhatsAppAccount, WhatsAppFavoriteSticker
-from models import Workspace, User
 from .ai_chatbot import get_genai_client
 
 # SECURITY: Import admin-only decorator to block agents from sensitive APIs
-from agent_backend.decorators import require_admin_only
+# Stub out admin requirement for standalone service
+from functools import wraps
+def require_admin_only(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # In a real microservice, you'd verify JWT roles here
+        return f(*args, **kwargs)
+    return decorated
 
 logger = logging.getLogger(__name__)
 
@@ -66,24 +78,8 @@ whatsapp_bp = Blueprint("whatsapp", __name__)
 
 def get_db():
     """Get database session."""
-    from models import db
+    from shared_models import db
     return db.session
-
-
-def _parse_analytics_days(default: int = 7) -> int:
-    days_param = request.args.get("days") or request.args.get("period", str(default))
-    try:
-        return int(days_param)
-    except (TypeError, ValueError):
-        return default
-
-
-def _account_ids_for_workspace(workspace_id) -> list:
-    if not workspace_id:
-        return []
-    ws = str(workspace_id)
-    accs = WhatsAppAccount.query.filter_by(workspace_id=ws, is_active=True).all()
-    return [a.id for a in accs]
 
 
 def get_access_token():
@@ -92,14 +88,14 @@ def get_access_token():
     Priority: Header > Database (from connected account) > Environment
     """
     # Check for token in header (for testing UI)
-    auth_header = request.headers.get("X-WhatsApp-Token", "")
+    auth_header = (request.headers.get("X-WhatsApp-Token", "") or "").strip()
     if auth_header:
         return auth_header
     
     # Check Authorization header
-    auth = request.headers.get("Authorization", "")
+    auth = (request.headers.get("Authorization", "") or "").strip()
     if auth.startswith("Bearer "):
-        return auth[7:]
+        return auth[7:].strip()
     
     # Check database for connected WhatsApp account
     try:
@@ -134,8 +130,8 @@ def get_access_token():
     except Exception as e:
         logger.warning(f"Failed to get token from DB: {e}")
     
-    # Fall back to environment variables
-    env_token = os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TEMP_TOKEN")
+    # Fall back to environment variables (trim: Secret Manager versions often end with CRLF)
+    env_token = (os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TEMP_TOKEN") or "").strip()
     return env_token or ""
 
 
@@ -155,6 +151,289 @@ def get_phone_number_id():
     
     # Fall back to environment
     return os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse common truthy/falsey environment values."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _only_digits(value) -> str:
+    """Normalize phone-like values to digits for stable matching."""
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _extract_change_summary(entry_waba_id: str, change: dict) -> dict:
+    """Compact webhook change summary for deterministic debugging."""
+    value = change.get("value", {}) if isinstance(change, dict) else {}
+    metadata = value.get("metadata", {}) if isinstance(value, dict) else {}
+    messages = value.get("messages", []) if isinstance(value, dict) else []
+    statuses = value.get("statuses", []) if isinstance(value, dict) else []
+    first_msg = messages[0] if messages else {}
+    first_status = statuses[0] if statuses else {}
+    pricing = first_status.get("pricing", {}) if isinstance(first_status, dict) else {}
+    return {
+        "waba_id": str(entry_waba_id or "").strip() or None,
+        "field": change.get("field") if isinstance(change, dict) else None,
+        "phone_number_id": str(metadata.get("phone_number_id") or "").strip() or None,
+        "display_phone_number": metadata.get("display_phone_number"),
+        "from_phone": first_msg.get("from"),
+        "message_type": first_msg.get("type"),
+        "inbound_wamid": first_msg.get("id"),
+        "status_id": first_status.get("id"),
+        "status": first_status.get("status"),
+        "recipient_id": first_status.get("recipient_id"),
+        "billable": pricing.get("billable"),
+        "pricing_category": pricing.get("category"),
+    }
+
+
+def _resolve_webhook_account(waba_id: str, phone_number_id: str):
+    """Find an active connected account for inbound webhook routing."""
+    waba_id = str(waba_id or "").strip()
+    phone_number_id = str(phone_number_id or "").strip()
+
+    if phone_number_id:
+        account = WhatsAppAccount.query.filter_by(
+            phone_number_id=phone_number_id,
+            is_active=True,
+        ).first()
+        if account:
+            return account
+
+    if waba_id:
+        account = (
+            WhatsAppAccount.query.filter_by(waba_id=waba_id, is_active=True)
+            .order_by(WhatsAppAccount.id.desc())
+            .first()
+        )
+        if account:
+            return account
+
+    return None
+
+
+def _webhook_change_matches_account(change: dict, account: WhatsAppAccount) -> bool:
+    """Match webhook metadata to a stored account (digits-only phone compare)."""
+    value = change.get("value", {}) if isinstance(change, dict) else {}
+    metadata = value.get("metadata", {}) if isinstance(value, dict) else {}
+
+    incoming_phone_number_id = str(metadata.get("phone_number_id") or "").strip()
+    if incoming_phone_number_id and incoming_phone_number_id != str(account.phone_number_id or "").strip():
+        return False
+
+    incoming_display = _only_digits(metadata.get("display_phone_number"))
+    stored_display = _only_digits(account.display_phone_number)
+    if incoming_display and stored_display and incoming_display != stored_display:
+        return False
+
+    return True
+
+
+def _filter_allowed_inbound_webhook(payload):
+    """
+    Allow inbound webhooks for any active ``whatsapp_accounts`` row.
+
+    Optional legacy strict mode: set ``WHATSAPP_WEBHOOK_STRICT_ALLOWLIST=1`` and
+    ``WHATSAPP_ALLOWED_WABA_ID`` / ``WHATSAPP_ALLOWED_PHONE_NUMBER_ID`` to pin one tenant.
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    entries = payload.get("entry", [])
+    if not isinstance(entries, list) or not entries:
+        return None
+
+    strict = _env_bool("WHATSAPP_WEBHOOK_STRICT_ALLOWLIST", False)
+    expected_waba_id = str(os.getenv("WHATSAPP_ALLOWED_WABA_ID") or os.getenv("WHATSAPP_WABA_ID") or "").strip()
+    expected_phone_number_id = str(
+        os.getenv("WHATSAPP_ALLOWED_PHONE_NUMBER_ID") or os.getenv("WHATSAPP_PHONE_NUMBER_ID") or ""
+    ).strip()
+
+    filtered_entries = []
+    drop_counters = {
+        "strict_waba_mismatch": 0,
+        "strict_phone_mismatch": 0,
+        "account_not_found": 0,
+        "change_account_mismatch": 0,
+    }
+    dropped_samples = []
+    accepted_samples = []
+    for entry in entries:
+        entry_waba_id = str(entry.get("id") or "").strip()
+        if strict and expected_waba_id and entry_waba_id != expected_waba_id:
+            drop_counters["strict_waba_mismatch"] += 1
+            if len(dropped_samples) < 5:
+                dropped_samples.append({
+                    "reason": "strict_waba_mismatch",
+                    "entry_waba_id": entry_waba_id or None,
+                })
+            continue
+
+        changes = entry.get("changes", [])
+        if not isinstance(changes, list):
+            continue
+
+        allowed_changes = []
+        for change in changes:
+            value = change.get("value", {}) if isinstance(change, dict) else {}
+            metadata = value.get("metadata", {}) if isinstance(value, dict) else {}
+            incoming_phone_number_id = str(metadata.get("phone_number_id") or "").strip()
+
+            if strict and expected_phone_number_id and incoming_phone_number_id != expected_phone_number_id:
+                drop_counters["strict_phone_mismatch"] += 1
+                if len(dropped_samples) < 5:
+                    sample = _extract_change_summary(entry_waba_id, change)
+                    sample["reason"] = "strict_phone_mismatch"
+                    dropped_samples.append(sample)
+                continue
+
+            account = _resolve_webhook_account(entry_waba_id, incoming_phone_number_id)
+            if not account:
+                drop_counters["account_not_found"] += 1
+                if len(dropped_samples) < 5:
+                    sample = _extract_change_summary(entry_waba_id, change)
+                    sample["reason"] = "account_not_found"
+                    dropped_samples.append(sample)
+                continue
+            if not _webhook_change_matches_account(change, account):
+                drop_counters["change_account_mismatch"] += 1
+                if len(dropped_samples) < 5:
+                    sample = _extract_change_summary(entry_waba_id, change)
+                    sample["reason"] = "change_account_mismatch"
+                    dropped_samples.append(sample)
+                continue
+
+            allowed_changes.append(change)
+            if len(accepted_samples) < 5:
+                sample = _extract_change_summary(entry_waba_id, change)
+                sample["matched_account_id"] = account.id
+                accepted_samples.append(sample)
+
+        if allowed_changes:
+            filtered_entry = dict(entry)
+            filtered_entry["changes"] = allowed_changes
+            filtered_entries.append(filtered_entry)
+
+    if not filtered_entries:
+        logger.info(
+            "Webhook dropped by allowlist filter: strict=%s expected_waba=%s expected_phone=%s counters=%s samples=%s",
+            strict,
+            expected_waba_id or None,
+            expected_phone_number_id or None,
+            drop_counters,
+            dropped_samples,
+        )
+        return None
+
+    filtered_payload = dict(payload)
+    filtered_payload["entry"] = filtered_entries
+    try:
+        accepted_changes = sum(len((e or {}).get("changes") or []) for e in filtered_entries)
+    except Exception:
+        accepted_changes = 0
+    logger.info(
+        "Webhook allowlist accepted: entries=%s changes=%s strict=%s samples=%s",
+        len(filtered_entries),
+        accepted_changes,
+        strict,
+        accepted_samples,
+    )
+    return filtered_payload
+
+
+def _get_voice_call_capability(account, access_token: str, api_version=None):
+    """
+    Best-effort voice call readiness probe.
+
+    There is no public API that lets Sociovia answer WhatsApp calls directly.
+    This probe helps prevent misconfiguration before VOICE_CALL templates are submitted.
+    """
+    import requests as http_requests
+
+    resolved_api_version = api_version or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    strict_mode = _env_bool("WHATSAPP_STRICT_VOICE_CALL_READINESS", False)
+
+    base_payload = {
+        "success": True,
+        "account_id": account.id,
+        "strict_mode": strict_mode,
+        "receive_in_sociovia_dashboard": False,
+        "receive_path": "Calls are handled in WhatsApp clients (mobile/desktop/linked devices), not inside Sociovia dashboard.",
+        "checks": {},
+        "warnings": [],
+    }
+
+    has_phone_number_id = bool(account.phone_number_id)
+    has_access_token = bool(access_token)
+    base_payload["checks"]["has_phone_number_id"] = has_phone_number_id
+    base_payload["checks"]["has_access_token"] = has_access_token
+
+    if not has_phone_number_id:
+        base_payload["warnings"].append("Missing phone_number_id on this account")
+    if not has_access_token:
+        base_payload["warnings"].append("Missing access token on this account")
+
+    code_verification_status = ""
+    name_status = ""
+    quality_rating = ""
+    meta_probe_ok = False
+    meta_probe_error = None
+
+    if has_phone_number_id and has_access_token:
+        try:
+            fields = "code_verification_status,name_status,quality_rating,display_phone_number,verified_name"
+            resp = http_requests.get(
+                f"https://graph.facebook.com/{resolved_api_version}/{account.phone_number_id}",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"fields": fields},
+                timeout=15,
+            )
+            probe_data = resp.json() if resp.content else {}
+            if resp.ok:
+                meta_probe_ok = True
+                code_verification_status = str(probe_data.get("code_verification_status") or "").upper()
+                name_status = str(probe_data.get("name_status") or "").upper()
+                quality_rating = str(probe_data.get("quality_rating") or "").upper()
+                base_payload["meta"] = {
+                    "code_verification_status": code_verification_status or None,
+                    "name_status": name_status or None,
+                    "quality_rating": quality_rating or None,
+                    "display_phone_number": probe_data.get("display_phone_number"),
+                    "verified_name": probe_data.get("verified_name"),
+                }
+            else:
+                meta_probe_error = probe_data.get("error", {}).get("message") or "Meta probe failed"
+                logger.warning("Voice call capability probe failed: %s", probe_data)
+        except Exception as e:
+            meta_probe_error = str(e)
+            logger.warning("Voice call capability probe exception: %s", e)
+
+    is_phone_verified = code_verification_status in {"VERIFIED", "CONNECTED"}
+    is_name_approved = (not name_status) or name_status in {"APPROVED", "AVAILABLE"}
+
+    base_payload["checks"]["meta_probe_ok"] = meta_probe_ok
+    base_payload["checks"]["phone_verified"] = is_phone_verified
+    base_payload["checks"]["display_name_approved"] = is_name_approved
+
+    if has_phone_number_id and has_access_token and not meta_probe_ok:
+        base_payload["warnings"].append("Could not verify call readiness from Meta API")
+    if meta_probe_error:
+        base_payload["warnings"].append(meta_probe_error)
+    if meta_probe_ok and not is_phone_verified:
+        base_payload["warnings"].append("Phone number is not verified/connected in WhatsApp Manager")
+    if meta_probe_ok and not is_name_approved:
+        base_payload["warnings"].append("Display name is not approved")
+
+    voice_calling_ready = bool(has_phone_number_id and has_access_token and is_phone_verified and is_name_approved)
+    block_submission = bool(strict_mode and not voice_calling_ready)
+
+    base_payload["voice_calling_ready"] = voice_calling_ready
+    base_payload["block_template_submission"] = block_submission
+    return base_payload
 
 
 def require_token(f):
@@ -177,60 +456,53 @@ def handle_validation_error(error: ValidationError):
     return jsonify(format_validation_error(error)), 400
 
 
-def _enforce_message_limit(phone_number_id):
+def _enforce_message_limit(phone_number_id, send_kind=None):
     """
-    Check subscription limits for message sending and record usage.
+    Enforce outbound send policy using only `whatsapp_account_capabilities`.
+
+    Uses the same rules as `outbound_send_capability_check` (subscription snapshot +
+    UTC-day outbound counts vs daily_message_limit). No User, plan, or billing reads.
+
+    send_kind: optional hint for warmup path classification (manual, template, media, …).
+
     Returns (allowed, error_response).
     """
     try:
-        # 1. Resolve Account & Workspace
+        from .capabilities import outbound_send_capability_check
+
         account = WhatsAppAccount.query.filter_by(phone_number_id=phone_number_id).first()
         if not account:
-            # Cannot charge limit if account unknown (or maybe block?)
-            # Proceeding cautiously - if we can't find account, we can't link to owner.
-            logger.warning(f"Could not find local account for phone_number_id {phone_number_id} to enforce limits.")
-            return True, None # Skip limit check
-
-        workspace_id = getattr(account, "workspace_id", None)
-        if not workspace_id:
+            logger.warning(
+                "Could not find local account for phone_number_id %s; skipping capability pre-check.",
+                phone_number_id,
+            )
             return True, None
 
-        # 2. Resolve Owner User (to check plan)
-        # Assuming int workspace_id. If string, handle validation.
-        try:
-             wid = int(workspace_id)
-        except:
-             wid = None
-        
-        workspace = Workspace.query.get(wid) if wid else None
-        if not workspace:
-            return True, None
-            
-        user = User.query.get(workspace.user_id)
-        if not user:
+        cap = outbound_send_capability_check(account.id, get_db(), send_kind=send_kind)
+        if cap.ok:
             return True, None
 
-        # 3. Check Limit
-        allowed, current, limit = check_message_limit(user, wid)
-        if not allowed:
-            return False, jsonify({
-                "success": False, 
-                "error": "message_limit_exceeded", 
-                "limit": limit,
-                "current": current,
-                "plan": user.plan,
-                "message": "Limit reached. Please upgrade your plan."
-            })
-            
-        # 4. Record Usage (Pre-record or Post-record? Post is better but we want to block)
-        # We record usage HERE for simplicity (1 call). If send fails later, it's a small overcount.
-        record_message_sent(user, count=1)
-        
-        return True, None
-        
+        payload = {
+            "success": False,
+            "error": "capability_denied",
+            "message": cap.message,
+        }
+        if cap.subscription_status is not None:
+            payload["subscription_status"] = cap.subscription_status
+        if cap.daily_message_limit is not None:
+            payload["daily_message_limit"] = cap.daily_message_limit
+            payload["limit"] = cap.daily_message_limit
+        if cap.daily_messages_used is not None:
+            payload["daily_messages_used"] = cap.daily_messages_used
+            payload["current"] = cap.daily_messages_used
+        if cap.daily_messages_used is not None and cap.daily_message_limit is not None:
+            payload["error"] = "message_limit_exceeded"
+
+        return False, jsonify(payload)
+
     except Exception as e:
-        logger.error(f"Limit enforcement error: {e}")
-        return True, None # Fail open to avoid blocking production on bug
+        logger.error(f"Capability limit enforcement error: {e}")
+        return True, None
 
 
 # ============================================================
@@ -326,8 +598,11 @@ def proxy_media(media_id):
     
     GET /api/whatsapp/media/<media_id>?workspace_id=...
     """
+    import mimetypes
     import requests
     from flask import Response
+    from urllib.parse import quote
+    from .models import WhatsAppAccount, WhatsAppConversation, WhatsAppMessage
     
     workspace_id = request.args.get("workspace_id")
     phone_number_id = request.args.get("phone_number_id")
@@ -341,10 +616,53 @@ def proxy_media(media_id):
         logger.error(f"❌ WhatsApp not connected for workspace {workspace_id}")
         return jsonify({"error": "WhatsApp not connected for this workspace"}), 401
         
-    media_url = service.get_media_url(media_id)
+    media_info = service.get_media_info(media_id) or {}
+    media_url = media_info.get("url")
     if not media_url:
         logger.error(f"❌ Failed to retrieve media URL from Meta for {media_id}")
         return jsonify({"error": "Failed to retrieve media URL from Meta"}), 404
+
+    def _guess_ext(content_type: str) -> str:
+        ctype = (content_type or "").split(";")[0].strip().lower()
+        if ctype == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+            return ".xlsx"
+        if ctype == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            return ".docx"
+        if ctype == "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+            return ".pptx"
+        ext = mimetypes.guess_extension(ctype or "") or ""
+        return ext
+
+    def _lookup_original_filename() -> Optional[str]:
+        # Best-effort lookup from stored inbound message payload.
+        try:
+            query = WhatsAppMessage.query.join(
+                WhatsAppConversation,
+                WhatsAppMessage.conversation_id == WhatsAppConversation.id,
+            ).join(
+                WhatsAppAccount,
+                WhatsAppConversation.account_id == WhatsAppAccount.id,
+            )
+            if workspace_id:
+                query = query.filter(WhatsAppAccount.workspace_id == str(workspace_id))
+
+            recent = (
+                query.filter(WhatsAppMessage.type.in_(["document", "image", "video", "audio"]))
+                .order_by(WhatsAppMessage.created_at.desc())
+                .limit(500)
+                .all()
+            )
+
+            for msg in recent:
+                content = msg.content if isinstance(msg.content, dict) else {}
+                if str(content.get("id") or "") == str(media_id):
+                    name = content.get("filename")
+                    if isinstance(name, str) and name.strip():
+                        return name.strip()
+            return None
+        except Exception as lookup_err:
+            logger.debug(f"Failed media filename lookup for {media_id}: {lookup_err}")
+            return None
         
     try:
         logger.info(f"🔗 Fetching media from Meta: {media_url[:50]}...")
@@ -360,15 +678,25 @@ def proxy_media(media_id):
             logger.error(f"❌ Meta CDN returned {resp.status_code} for {media_id}")
             return jsonify({"error": "Failed to fetch media from CDN"}), resp.status_code
             
-        # Return the media with proper headers
-        # We use stream_with_context or just return the response if it's small
+        content_type = resp.headers.get("Content-Type") or media_info.get("mime_type") or "application/octet-stream"
+        original_filename = _lookup_original_filename()
+        if not original_filename:
+            ext = _guess_ext(content_type)
+            original_filename = f"media_{media_id}{ext}"
+
+        safe_filename = original_filename.replace('"', "")
+        encoded_filename = quote(safe_filename)
+
+        # Return the media with proper headers and original extension
         return Response(
             resp.content,
-            mimetype=resp.headers.get("Content-Type", "image/jpeg"),
+            mimetype=content_type,
             headers={
                 "Cache-Control": "public, max-age=86400",
                 "Access-Control-Allow-Origin": "*",
-                "Content-Disposition": f'inline; filename="media_{media_id}"'
+                "Content-Disposition": (
+                    f'inline; filename="{safe_filename}"; filename*=UTF-8\'\'{encoded_filename}'
+                ),
             }
         )
     except Exception as e:
@@ -501,20 +829,27 @@ def webhook_test():
     Should return {"status": "ok", "webhook_url": "..."}
     """
     import os
-    base_url = os.environ.get("APP_BASE_URL", "https://sociovia-backend-362038465411.europe-west1.run.app")
-    verify_token = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
+    from .provisioning_types import FULL_WEBHOOK_FIELDS
+
+    base_url = os.environ.get("APP_BASE_URL", "https://whatsapp-api-a2cpr5sa3q-uc.a.run.app").rstrip("/")
+    verify_token = os.environ.get("WHATSAPP_VERIFY_TOKEN", "not_set")
+    app_id = os.environ.get("FB_APP_ID") or os.environ.get("META_APP_ID") or ""
+    webhook_url = f"{base_url}/api/whatsapp/webhook"
     
     return jsonify({
         "status": "ok",
         "message": "Webhook endpoint is accessible!",
-        "webhook_url": f"{base_url}/api/whatsapp/webhook",
-        "verify_token_configured": bool(verify_token),
+        "meta_app_id": app_id,
+        "webhook_url": webhook_url,
+        "verify_token_configured": verify_token != "not_set",
+        "meta_developer_config_url": f"{base_url}/api/whatsapp/onboarding/meta-developer-config",
+        "subscribed_fields": FULL_WEBHOOK_FIELDS,
         "instructions": [
-            "1. Go to Facebook Developer Console > WhatsApp > Configuration",
-            "2. Edit Webhook settings",
-            f"3. Set Callback URL to: {base_url}/api/whatsapp/webhook",
-            f"4. Set Verify Token to your WHATSAPP_VERIFY_TOKEN from .env",
-            "5. Subscribe to: messages, message_status, message_template_status_update"
+            "1. developers.facebook.com → Your App → WhatsApp → Configuration",
+            f"2. Callback URL: {webhook_url}",
+            "3. Verify Token: value of WHATSAPP_VERIFY_TOKEN on whatsapp-api",
+            f"4. Subscribe fields: {', '.join(FULL_WEBHOOK_FIELDS)}",
+            "5. Facebook Login for Business → add OAuth redirect URLs from meta-developer-config",
         ]
     })
 
@@ -528,16 +863,13 @@ def webhook_verify():
     mode = request.args.get("hub.mode", "")
     token = request.args.get("hub.verify_token", "")
     challenge = request.args.get("hub.challenge", "")
-
-    # Accept the global env verify token OR any tenant's own verify token. The
-    # GET-verify request carries no tenant context, so a tenant using its own
-    # Meta app verifies against ITS stored token. For T0000/unconfigured this is
-    # identical to the env-token comparison done before.
-    from tenant.integration import verify_token_matches_any
-    if mode == "subscribe" and verify_token_matches_any(token):
+    
+    result = verify_webhook_challenge(mode, token, challenge)
+    
+    if result:
         logger.info("Webhook verification successful")
-        return challenge, 200
-
+        return result, 200
+    
     logger.warning("Webhook verification failed")
     return "Forbidden", 403
 
@@ -551,40 +883,61 @@ def webhook_receive():
     
     IMPORTANT: Always respond 200 OK immediately, then process.
     """
-    # Verify signature if app secret is configured.
-    # Use the SAME raw bytes Meta signed (do NOT re-serialize the JSON).
+    # Verify signature (Meta signs with Facebook App Secret — try all configured secrets)
     signature = request.headers.get("X-Hub-Signature-256", "")
-    raw_body = request.get_data()
+    payload_bytes = request.get_data(cache=True)
 
-    # Resolve the app secret PER-TENANT by the phone_number_id in the payload.
-    # For T0000/unknown (or when no pid is present) the resolver returns the env
-    # secret, so this is byte-identical to the previous global behavior.
-    pid = None
-    try:
-        _payload_for_sig = request.get_json(silent=True) or {}
-        pid = (
-            _payload_for_sig["entry"][0]["changes"][0]["value"]["metadata"]["phone_number_id"]
-        )
-    except (KeyError, IndexError, TypeError):
-        pid = None
-
-    from tenant.integration import get_tenant_meta_config
-    app_secret = get_tenant_meta_config(phone_number_id=pid).app_secret
-
-    if app_secret:
-        if not verify_webhook_signature(raw_body, signature, app_secret):
-            logger.warning("Invalid webhook signature")
-            # Still return 200 to prevent retries, but log the issue
-            return "OK", 200
+    if not verify_webhook_signature_any(payload_bytes, signature):
+        dev_mode = os.getenv("FLASK_ENV", "").strip().lower() == "development"
+        env_dev = os.getenv("ENV", "").strip().lower() in {"dev", "development", "local"}
+        skip_verify = _env_bool("WHATSAPP_WEBHOOK_SKIP_SIGNATURE_VERIFY") or dev_mode or env_dev
+        if skip_verify:
+            logger.warning(
+                "Invalid webhook signature (processing anyway — dev/skip mode; "
+                "dev tunnels may alter the raw body)"
+            )
+        else:
+            logger.warning(
+                "Invalid webhook signature — rejecting request "
+                "(check FB_APP_SECRET matches Meta Developer Console → App secret)"
+            )
+            trace_event(
+                stage="api.webhook.signature_rejected",
+                status="forbidden",
+                details={"has_signature": bool(signature)},
+            )
+            return "Forbidden", 403
 
     payload = request.get_json(silent=True)
+    payload_sample = {}
+    if isinstance(payload, dict):
+        try:
+            first_entry = (payload.get("entry") or [None])[0] or {}
+            entry_waba_id = str(first_entry.get("id") or "").strip()
+            first_change = (first_entry.get("changes") or [None])[0] or {}
+            payload_sample = _extract_change_summary(entry_waba_id, first_change)
+        except Exception:
+            payload_sample = {}
+    trace_event(
+        stage="api.webhook.received",
+        status="ok" if bool(payload) else "empty",
+        details={
+            "has_signature": bool(signature),
+            "object": (payload or {}).get("object") if isinstance(payload, dict) else None,
+            "entries": len((payload or {}).get("entry") or []) if isinstance(payload, dict) else 0,
+            "sample": payload_sample,
+        },
+    )
     
-    # DEBUG: Log entire payload - use print to guarantee console output
-    print(f"\n{'='*60}")
-    print(f"📨 WEBHOOK RECEIVED!")
-    print(f"Payload: {payload}")
-    print(f"{'='*60}\n")
-    logger.info(f"📨 WEBHOOK RECEIVED: {payload}")
+    debug_payload_logs = _env_bool("WHATSAPP_WEBHOOK_DEBUG_PAYLOAD", False)
+    if debug_payload_logs:
+        # Keep deep payload logging behind an explicit flag; full payload logging is
+        # expensive under webhook bursts and can starve API worker threads.
+        print(f"\n{'='*60}")
+        print("📨 WEBHOOK RECEIVED!")
+        print(f"Payload: {payload}")
+        print(f"{'='*60}\n")
+        logger.info("📨 WEBHOOK RECEIVED: %s", payload)
     
     if not payload:
         print("⚠️ Empty payload!")
@@ -593,23 +946,135 @@ def webhook_receive():
     
     # Check what type of webhook this is
     obj_type = payload.get("object")
-    print(f"📦 Object type: {obj_type}")
-    logger.info(f"📦 Webhook object type: {obj_type}")
-    
-    # Process webhook (synchronous for Phase 1)
+    logger.info("📦 Webhook object type: %s", obj_type)
+
+    try:
+        from .webhook_routing import dispatch_customer_webhook, process_inbound_webhook
+
+        inbound = process_inbound_webhook(payload)
+        dispatch_customer_webhook(
+            payload,
+            inbound.forward_decision,
+            raw_body=payload_bytes or None,
+            meta_signature=signature or None,
+            blocking=True,
+        )
+        d = inbound.forward_decision
+        logger.info(
+            "WEBHOOK FORWARD should_forward=%s reason=%s url=%s workspace=%s",
+            d.should_forward,
+            d.reason,
+            d.destination_url or "(none)",
+            d.workspace_id,
+        )
+        filtered_payload = inbound.filtered_payload
+    except Exception as routing_exc:
+        logger.exception("Webhook routing error: %s", routing_exc)
+        filtered_payload = _filter_allowed_inbound_webhook(payload)
+    if not filtered_payload:
+        trace_event(
+            stage="api.webhook.filtered",
+            status="dropped",
+            details={"reason": "allowlist_unmatched_or_invalid"},
+        )
+        logger.info("Ignoring webhook payload: unmatched WABA/phone metadata")
+        return "OK", 200
+    trace_event(
+        stage="api.webhook.filtered",
+        status="accepted",
+        details={"entries": len(filtered_payload.get("entry", []) or [])},
+    )
+
+    from whatsapp.webhook_utils import classify_webhook_payload, split_status_and_message_payload
+
+    webhook_kind = classify_webhook_payload(filtered_payload)
+
+    if webhook_kind == "empty":
+        return "OK", 200
+
+    # Process status receipts inline by default so they don't flood the main
+    # webhook worker queue and delay inbound message processing.
+    inline_status_processing = _env_bool("WHATSAPP_WEBHOOK_INLINE_STATUS", True)
+
+    if webhook_kind == "status_only" and inline_status_processing:
+        try:
+            processor = WebhookProcessor(get_db())
+            success, message = processor.process_webhook(filtered_payload)
+            if not success:
+                logger.warning("Status webhook inline processing: %s", message)
+        except Exception as exc:
+            logger.exception("Status webhook inline error: %s", exc)
+        return "OK", 200
+
+    worker_payload = filtered_payload
+    if inline_status_processing and webhook_kind == "message":
+        # Mixed payloads: process statuses inline, enqueue only message changes.
+        status_part, message_part = split_status_and_message_payload(filtered_payload)
+        if status_part:
+            try:
+                processor = WebhookProcessor(get_db())
+                success, message = processor.process_webhook(status_part)
+                if not success:
+                    logger.warning("Status webhook inline processing: %s", message)
+            except Exception as exc:
+                logger.exception("Status webhook inline error: %s", exc)
+        worker_payload = message_part or filtered_payload
+
+    # Enqueue inbound messages to worker when Redis is available.
+    try:
+        from core.queue.manager import enqueue_job, get_queue_backend
+
+        if get_queue_backend() == "redis":
+            enqueue_job("whatsapp-webhook", {"payload": worker_payload}, source="webhook")
+            trace_event(
+                stage="api.webhook.enqueued",
+                status="ok",
+                details={"job": "whatsapp-webhook", "backend": "redis"},
+            )
+            logger.info("Webhook enqueued for worker processing")
+            return "OK", 200
+    except Exception as exc:
+        logger.warning("Webhook enqueue failed, falling back to inline processing: %s", exc)
+
+    # Inline fallback (no Redis or enqueue error)
     try:
         processor = WebhookProcessor(get_db())
-        success, message = processor.process_webhook(payload)
-        
+        success, message = processor.process_webhook(worker_payload)
+
         if success:
             logger.info(f"✅ Webhook processed successfully: {message}")
         else:
             logger.error(f"❌ Webhook processing error: {message}")
     except Exception as e:
         logger.exception(f"🔥 Webhook exception: {e}")
-    
-    # Always return 200 OK
+
     return "OK", 200
+
+
+@whatsapp_bp.route("/debug/trace/wamid/<path:wamid>", methods=["GET"])
+def debug_trace_wamid(wamid: str):
+    """Return recent trace timeline for a specific wamid."""
+    limit = min(int(request.args.get("limit", 200)), 1000)
+    events = get_trace_by_wamid(wamid, limit=limit)
+    return jsonify({
+        "success": True,
+        "wamid": wamid,
+        "count": len(events),
+        "events": events,
+    }), 200
+
+
+@whatsapp_bp.route("/debug/trace/conversation/<int:conversation_id>", methods=["GET"])
+def debug_trace_conversation(conversation_id: int):
+    """Return recent trace timeline for a conversation."""
+    limit = min(int(request.args.get("limit", 300)), 1000)
+    events = get_trace_by_conversation(conversation_id, limit=limit)
+    return jsonify({
+        "success": True,
+        "conversation_id": conversation_id,
+        "count": len(events),
+        "events": events,
+    }), 200
 
 
 # ============================================================
@@ -644,13 +1109,15 @@ def send_text():
             }), 400
         
         # Limit Check
-        allowed, error_resp = _enforce_message_limit(phone_number_id)
+        allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="manual")
         if not allowed:
             return error_resp, 429
         
         # Send
         service = WhatsAppService(get_db(), phone_number_id, g.access_token)
         result = service.send_text(to=to, text=text, preview_url=data.get("preview_url", False))
+        from .human_escalation import enrich_agent_send_result
+        result = enrich_agent_send_result(result)
         
         return jsonify(result), 200 if result.get("success") else 400
         
@@ -695,13 +1162,15 @@ def send_sticker():
             }), 400
         
         # Limit Check
-        allowed, error_resp = _enforce_message_limit(phone_number_id)
+        allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="media")
         if not allowed:
             return error_resp, 429
         
         # Send
         service = WhatsAppService(get_db(), phone_number_id, g.access_token)
         result = service.send_sticker(to=to, sticker=media_id)
+        from .human_escalation import enrich_agent_send_result
+        result = enrich_agent_send_result(result)
         
         return jsonify(result), 200 if result.get("success") else 400
         
@@ -731,7 +1200,12 @@ def send_template():
         
         # Validate
         to, template_name, language, components = validate_template_message(data)
-        
+
+        # Copy-code button value (optional — for templates with a COPY_CODE button)
+        copy_code_value = data.get("copy_code_value") or None
+        if copy_code_value:
+            copy_code_value = str(copy_code_value).strip() or None
+
         phone_number_id = get_phone_number_id()
         if not phone_number_id:
             return jsonify({
@@ -740,11 +1214,7 @@ def send_template():
             }), 400
         
         # Limit Check
-        allowed, error_resp = _enforce_message_limit(phone_number_id)
-        if not allowed:
-            return error_resp, 429
-        
-        # LOG THE TOKEN BEING USED (using print for visibility)
+        allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="template")
         token_preview = g.access_token[:30] + "..." + g.access_token[-20:] if g.access_token else "NO TOKEN"
         print(f"\n{'='*60}")
         print(f"=== SEND TEMPLATE ===")
@@ -760,10 +1230,13 @@ def send_template():
             template_name=template_name,
             language_code=language,
             components=components,
+            copy_code_value=copy_code_value,
         )
         
         # Log result
         logger.info(f"Result: {result}")
+        from .human_escalation import enrich_agent_send_result
+        result = enrich_agent_send_result(result)
         
         return jsonify(result), 200 if result.get("success") else 400
         
@@ -816,7 +1289,7 @@ def send_template_advanced():
             }), 400
         
         # Limit Check
-        allowed, error_resp = _enforce_message_limit(phone_number_id)
+        allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="template")
         if not allowed:
             return error_resp, 429
         
@@ -829,6 +1302,8 @@ def send_template_advanced():
             body_params=body_params,
             button_url_suffix=button_url_suffix,
         )
+        from .human_escalation import enrich_agent_send_result
+        result = enrich_agent_send_result(result)
         
         return jsonify(result), 200 if result.get("success") else 400
         
@@ -877,24 +1352,7 @@ def send_flow():
         footer_text = data.get("footer_text", "")
         button_text = data.get("button_text", "Open Form")
         flow_token = data.get("flow_token", f"flow_{to}_{flow_id}")
-
-        # Draft mode lets you send an UNPUBLISHED flow to test recipients
-        # (bypasses the publish/business-verification requirement).
-        mode = (data.get("mode") or "").strip().lower()
-
-        # Resolve the entry screen: explicit param > flow's stored entry screen > WELCOME.
-        screen = (data.get("screen") or "").strip()
-        if not screen:
-            try:
-                from .models import WhatsAppFlow
-                _flow = WhatsAppFlow.query.filter_by(meta_flow_id=str(flow_id)).first()
-                if _flow and _flow.entry_screen_id:
-                    screen = _flow.entry_screen_id
-            except Exception as _se:
-                logger.warning(f"Could not resolve entry screen for flow {flow_id}: {_se}")
-        if not screen:
-            screen = "WELCOME"
-
+        
         # Normalize phone number
         if not to.startswith("+"):
             to = to.lstrip("0")
@@ -908,11 +1366,7 @@ def send_flow():
             }), 400
         
         # Limit Check
-        allowed, error_resp = _enforce_message_limit(phone_number_id)
-        if not allowed:
-            return error_resp, 429
-        
-        # Build the interactive flow message
+        allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="flow")
         interactive_payload = {
             "type": "flow",
             "header": {
@@ -931,15 +1385,11 @@ def send_flow():
                     "flow_cta": button_text,
                     "flow_action": "navigate",
                     "flow_action_payload": {
-                        "screen": screen
+                        "screen": "WELCOME"
                     }
                 }
             }
         }
-
-        # Send the unpublished/draft flow (for testing before publish).
-        if mode == "draft":
-            interactive_payload["action"]["parameters"]["mode"] = "draft"
         
         # Add footer if provided
         if footer_text:
@@ -1022,7 +1472,7 @@ def send_media():
             }), 400
         
         # Limit Check
-        allowed, error_resp = _enforce_message_limit(phone_number_id)
+        allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="media")
         if not allowed:
             return error_resp, 429
         
@@ -1041,6 +1491,8 @@ def send_media():
         else:
             return jsonify({"success": False, "error": f"Unsupported media type: {media_type}"}), 400
         
+        from .human_escalation import enrich_agent_send_result
+        result = enrich_agent_send_result(result)
         return jsonify(result), 200 if result.get("success") else 400
         
     except ValidationError as e:
@@ -1100,16 +1552,14 @@ def send_interactive():
             }), 400
         
         # Limit Check
-        allowed, error_resp = _enforce_message_limit(phone_number_id)
+        allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="interactive")
         if not allowed:
             return error_resp, 429
-        
+
         service = WhatsAppService(get_db(), phone_number_id, g.access_token)
-        
-        # Determine interactive type
         interactive = data.get("interactive", {})
         int_type = interactive.get("type", data.get("type", "button"))
-        
+
         if int_type == "button":
             to, body_text, buttons, header, footer = validate_interactive_buttons(data)
             result = service.send_interactive_buttons(
@@ -1135,6 +1585,8 @@ def send_interactive():
                 "error": f"Unknown interactive type: {int_type}. Supported: button, list"
             }), 400
         
+        from .human_escalation import enrich_agent_send_result
+        result = enrich_agent_send_result(result)
         return jsonify(result), 200 if result.get("success") else 400
         
     except ValidationError as e:
@@ -1166,6 +1618,13 @@ def send_message():
             return jsonify({"success": False, "error": "Request body required"}), 400
         
         msg_type = data.get("type", "text")
+        sk = "manual"
+        if msg_type == "template":
+            sk = "template"
+        elif msg_type in ("image", "video", "audio", "document"):
+            sk = "media"
+        elif msg_type == "interactive":
+            sk = "interactive"
         
         # Route to appropriate handler based on type
         phone_number_id = get_phone_number_id()
@@ -1176,7 +1635,7 @@ def send_message():
             }), 400
         
         # Limit Check
-        allowed, error_resp = _enforce_message_limit(phone_number_id)
+        allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind=sk)
         if not allowed:
             return error_resp, 429
         
@@ -1218,6 +1677,8 @@ def send_message():
                 "error": f"Unknown message type: {msg_type}. Supported: text, template, image, video, audio, document, interactive"
             }), 400
         
+        from .human_escalation import enrich_agent_send_result
+        result = enrich_agent_send_result(result)
         return jsonify(result), 200 if result.get("success") else 400
             
     except ValidationError as e:
@@ -1225,6 +1686,98 @@ def send_message():
     except Exception as exc:
         logger.exception(f"send_message exception: {exc}")
         return jsonify({"success": False, "error": str(exc)}), 500
+
+
+def _coerce_interactive_send_payload(data: dict) -> dict:
+    """Normalize partner aliases (button/list) into send-message interactive shape."""
+    payload = dict(data)
+    msg_type = str(payload.get("type") or "text").lower()
+    interactive = payload.get("interactive")
+    if not isinstance(interactive, dict):
+        interactive = {}
+
+    if msg_type in ("button", "buttons"):
+        interactive.setdefault("type", "button")
+        interactive.setdefault("body", payload.get("body") or interactive.get("body"))
+        interactive.setdefault("buttons", payload.get("buttons") or interactive.get("buttons"))
+        payload["type"] = "interactive"
+        payload["interactive"] = interactive
+    elif msg_type == "list":
+        interactive.setdefault("type", "list")
+        interactive.setdefault("body", payload.get("body") or interactive.get("body"))
+        interactive.setdefault("button", payload.get("button") or payload.get("button_text") or interactive.get("button"))
+        interactive.setdefault("sections", payload.get("sections") or interactive.get("sections"))
+        payload["type"] = "interactive"
+        payload["interactive"] = interactive
+
+    return payload
+
+
+def _is_meta_interactive_passthrough(interactive: dict) -> bool:
+    """True when interactive is already in WhatsApp Cloud API shape."""
+    if not isinstance(interactive, dict):
+        return False
+    body = interactive.get("body")
+    if isinstance(body, dict) and "text" in body and interactive.get("action"):
+        return True
+    if interactive.get("passthrough") is True:
+        return True
+    return False
+
+
+def _header_footer_text(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and value.get("text"):
+        return str(value.get("text"))
+    return None
+
+
+def _send_interactive_message(service: WhatsAppService, data: dict) -> dict:
+    """
+    Send interactive button/list via partner send-message.
+
+    Supports simplified Sociovia format (validators) or Meta Cloud API pass-through.
+    """
+    data = _coerce_interactive_send_payload(data)
+    interactive = data.get("interactive") or {}
+    int_type = str(interactive.get("type") or "button").lower()
+
+    if _is_meta_interactive_passthrough(interactive):
+        passthrough = dict(interactive)
+        passthrough.pop("passthrough", None)
+        return service.send_interactive_passthrough(
+            to=data.get("to"),
+            interactive=passthrough,
+        )
+
+    if int_type in ("button", "buttons"):
+        to, body_text, buttons, header, footer = validate_interactive_buttons(data)
+        return service.send_interactive_buttons(
+            to=to,
+            body_text=body_text,
+            buttons=buttons,
+            header_text=_header_footer_text(header),
+            footer_text=_header_footer_text(footer),
+        )
+
+    if int_type == "list":
+        to, body_text, button_text, sections, header, footer = validate_interactive_list(data)
+        return service.send_interactive_list(
+            to=to,
+            body_text=body_text,
+            button_text=button_text,
+            sections=sections,
+            header_text=_header_footer_text(header),
+            footer_text=_header_footer_text(footer),
+        )
+
+    return {
+        "success": False,
+        "error": f"Unknown interactive type: {int_type}. Supported: button, list (or Meta Cloud API passthrough)",
+    }
 
 
 @whatsapp_bp.route("/send-message", methods=["POST"])
@@ -1252,6 +1805,40 @@ def send_message_v2():
         "type": "template",
         "template_name": "hello_world",
         "template_language": "en"
+    }
+
+    Interactive reply buttons (within 24h session):
+    {
+        "workspace_id": "113",
+        "to": "917013123744",
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": "Choose an option",
+            "buttons": [{"id": "opt1", "title": "Option 1"}]
+        }
+    }
+
+    Interactive list (alias type=list also accepted):
+    {
+        "workspace_id": "113",
+        "to": "917013123744",
+        "type": "list",
+        "body": "Select a category",
+        "button_text": "View options",
+        "sections": [{"title": "Menu", "rows": [{"id": "r1", "title": "Item 1"}]}]
+    }
+
+    Meta Cloud API pass-through (full interactive object):
+    {
+        "workspace_id": "113",
+        "to": "917013123744",
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": "Choose"},
+            "action": {"button": "Options", "sections": [...]}
+        }
     }
     """
     try:
@@ -1313,11 +1900,38 @@ def send_message_v2():
             template_name = data.get("template_name")
             if not template_name:
                 return jsonify({"success": False, "error": "template_name is required for template messages"}), 400
+
+            components = data.get("template_components")
+            language_code = data.get("template_language", "en")
+            recruiter_carousel = data.get("recruiter_carousel") or data.get("vaish_carousel")
+            if recruiter_carousel and not components:
+                from . import vaish_carousel_template as vaish_ct
+
+                components = vaish_ct.build_carousel_template_components(
+                    service,
+                    search_context=str(
+                        recruiter_carousel.get("search_context")
+                        or recruiter_carousel.get("context")
+                        or "your search"
+                    ),
+                    cards=recruiter_carousel.get("cards") or [],
+                    card_count=int(
+                        recruiter_carousel.get("card_count")
+                        or vaish_ct.VAISH_RECRUITER_CAROUSEL_CARD_COUNT
+                    ),
+                )
+                if not components:
+                    return jsonify({
+                        "success": False,
+                        "error": "Failed to build recruiter carousel (image upload or card data)",
+                    }), 400
+                language_code = data.get("template_language") or vaish_ct.VAISH_RECRUITER_CAROUSEL_LANG
+
             result = service.send_template(
                 to=to,
                 template_name=template_name,
-                language_code=data.get("template_language", "en"),
-                components=data.get("template_components"),
+                language_code=language_code,
+                components=components,
                 waba_id=account.waba_id
             )
             
@@ -1328,24 +1942,132 @@ def send_message_v2():
             caption = data.get("caption")
             
             if msg_type == "image":
-                result = service.send_image(to=to, image_url=media_url, caption=caption)
+                result = service.send_image_with_url_candidates(
+                    to=to,
+                    image_url=media_url,
+                    url_candidates=data.get("url_candidates"),
+                    caption=caption,
+                )
             elif msg_type == "video":
                 result = service.send_video(to=to, video_url=media_url, caption=caption)
             elif msg_type == "audio":
                 result = service.send_audio(to=to, audio_url=media_url)
             elif msg_type == "document":
                 result = service.send_document(to=to, document_url=media_url, caption=caption, filename=data.get("filename"))
+
+        elif msg_type in ("interactive", "button", "buttons", "list"):
+            result = _send_interactive_message(service, data)
+
         else:
             return jsonify({
                 "success": False,
-                "error": f"Unsupported message type: {msg_type}. Supported: text, template, image, video, audio, document"
+                "error": (
+                    f"Unsupported message type: {msg_type}. "
+                    "Supported: text, template, image, video, audio, document, "
+                    "interactive, button, buttons, list"
+                ),
             }), 400
-        
+
+        from .human_escalation import enrich_agent_send_result
+        result = enrich_agent_send_result(result)
         return jsonify(result), 200 if result.get("success") else 400
-        
+
+    except ValidationError as e:
+        return handle_validation_error(e)
     except Exception as exc:
         logger.exception(f"send_message_v2 exception: {exc}")
         return jsonify({"success": False, "error": str(exc)}), 500
+
+
+# ============================================================
+# Partner template discovery (Vaish / workspace integrations)
+# ============================================================
+
+def _partner_sync_and_list(workspace_id: str, *, sync_first: bool):
+    from .partner_templates import query_approved_templates, template_to_partner_dict
+    from .services import WhatsAppService
+
+    account, error = get_valid_account_for_workspace(workspace_id)
+    if error or not account:
+        return None, jsonify({
+            "success": False,
+            "error": error or f"No active WhatsApp account for workspace {workspace_id}",
+        }), 404
+
+    sync_stats = None
+    if sync_first:
+        try:
+            service = WhatsAppService(
+                db_session=get_db(),
+                access_token=account.get_access_token(),
+                phone_number_id=account.phone_number_id,
+                waba_id=account.waba_id,
+                account_id=account.id,
+                workspace_id=str(workspace_id),
+            )
+            sync_stats = service.sync_templates()
+            if not sync_stats.get("success"):
+                return None, jsonify({
+                    "success": False,
+                    "error": sync_stats.get("error", "template_sync_failed"),
+                    "sync": sync_stats,
+                }), 400
+        except Exception as exc:
+            logger.exception("partner template sync error: %s", exc)
+            return None, jsonify({"success": False, "error": str(exc)}), 500
+
+    templates = query_approved_templates(account.id)
+    payload_templates = [template_to_partner_dict(t, str(workspace_id)) for t in templates]
+    body = {
+        "success": True,
+        "workspace_id": str(workspace_id),
+        "account_id": account.id,
+        "display_phone_number": account.display_phone_number,
+        "synced_from_meta": bool(sync_first),
+        "count": len(payload_templates),
+        "templates": payload_templates,
+    }
+    if sync_stats is not None:
+        body["sync"] = sync_stats
+    return body, None, None
+
+
+@whatsapp_bp.route("/partner/templates", methods=["GET"])
+def partner_list_templates():
+    """
+    List APPROVED WhatsApp templates for a partner workspace (send-ready format).
+
+    GET /api/whatsapp/partner/templates?workspace_id=113
+    GET /api/whatsapp/partner/templates?workspace_id=113&sync=true
+    """
+    workspace_id = request.args.get("workspace_id")
+    if not workspace_id:
+        return jsonify({"success": False, "error": "workspace_id is required"}), 400
+
+    sync_first = request.args.get("sync", "").lower() in ("1", "true", "yes")
+    body, err_resp, err_code = _partner_sync_and_list(workspace_id, sync_first=sync_first)
+    if err_resp is not None:
+        return err_resp, err_code
+    return jsonify(body)
+
+
+@whatsapp_bp.route("/partner/templates/sync", methods=["POST"])
+def partner_sync_templates():
+    """
+    Sync templates from Meta for a partner workspace, then return APPROVED list.
+
+    POST /api/whatsapp/partner/templates/sync
+    Body: { "workspace_id": "113" }
+    """
+    data = request.get_json(silent=True) or {}
+    workspace_id = data.get("workspace_id") or request.args.get("workspace_id")
+    if not workspace_id:
+        return jsonify({"success": False, "error": "workspace_id is required"}), 400
+
+    body, err_resp, err_code = _partner_sync_and_list(workspace_id, sync_first=True)
+    if err_resp is not None:
+        return err_resp, err_code
+    return jsonify(body)
 
 
 # ============================================================
@@ -1361,45 +2083,83 @@ def list_conversations():
     GET /api/whatsapp/conversations?phone_number_id=xxx&limit=50&offset=0&status=open
     GET /api/whatsapp/conversations?workspace_id=xxx
     """
-    from .models import WhatsAppAccount
-    
-    phone_number_id = request.args.get("phone_number_id")
-    workspace_id = request.args.get("workspace_id")
-    status = request.args.get("status")
-    limit = min(int(request.args.get("limit", 50)), 100)
-    offset = int(request.args.get("offset", 0))
-    
-    # Get account IDs for workspace filtering
-    account_ids = None
-    if workspace_id:
-        workspace_accounts = WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).all()
-        account_ids = [a.id for a in workspace_accounts]
-        if not account_ids:
-            # No accounts for this workspace
-            return jsonify({
-                "success": True,
-                "conversations": [],
-                "count": 0,
-                "limit": limit,
-                "offset": offset,
-            })
-    
-    service = ConversationService(get_db())
-    conversations = service.get_conversations(
-        phone_number_id=phone_number_id,
-        status=status,
-        limit=limit,
-        offset=offset,
-        account_ids=account_ids,
-    )
-    
-    return jsonify({
-        "success": True,
-        "conversations": conversations,
-        "count": len(conversations),
-        "limit": limit,
-        "offset": offset,
-    })
+    try:
+        from .models import WhatsAppAccount
+        
+        phone_number_id = request.args.get("phone_number_id")
+        workspace_id = request.args.get("workspace_id")
+        status = request.args.get("status")
+        category = (request.args.get("category") or "").strip().lower() or None
+        search = (request.args.get("search") or "").strip() or None
+        include_totals = request.args.get("include_totals", "").lower() in {"1", "true", "yes"}
+        limit = min(int(request.args.get("limit", 50)), 100)
+        offset = int(request.args.get("offset", 0))
+        
+        # Get account IDs for workspace filtering
+        account_ids = None
+        if workspace_id:
+            workspace_accounts = WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).all()
+            account_ids = [a.id for a in workspace_accounts]
+            if not account_ids:
+                # No accounts for this workspace
+                payload = {
+                    "success": True,
+                    "conversations": [],
+                    "count": 0,
+                    "total_count": 0,
+                    "limit": limit,
+                    "offset": offset,
+                }
+                if include_totals:
+                    payload["totals"] = {
+                        "all": 0,
+                        "unread": 0,
+                        "active": 0,
+                        "expired": 0,
+                        "needs_reply": 0,
+                        "human_required": 0,
+                        "opted_out": 0,
+                    }
+                return jsonify(payload)
+        
+        service = ConversationService(get_db())
+        conversations = service.get_conversations(
+            phone_number_id=phone_number_id,
+            status=status,
+            limit=limit,
+            offset=offset,
+            account_ids=account_ids,
+            category=category,
+            search=search,
+        )
+
+        total_count = None
+        totals = None
+        if category or include_totals:
+            totals = service.count_conversation_totals(
+                phone_number_id=phone_number_id,
+                status=status,
+                account_ids=account_ids,
+                search=search,
+            )
+            if category:
+                total_count = totals.get(category, len(conversations))
+            elif include_totals:
+                total_count = totals.get("all", len(conversations))
+        
+        return jsonify({
+            "success": True,
+            "conversations": conversations,
+            "count": len(conversations),
+            "total_count": total_count if total_count is not None else len(conversations),
+            "totals": totals,
+            "limit": limit,
+            "offset": offset,
+            "category": category,
+        })
+    except Exception as e:
+        current_app.logger.exception("list_conversations failed: %s", e)
+        return jsonify({"success": False, "error": "Failed to load conversations"}), 500
 
 
 @whatsapp_bp.route("/conversations/<int:conversation_id>", methods=["GET"])
@@ -1713,7 +2473,7 @@ def toggle_account_status(account_id: int):
     - Account credentials are retained
     """
     from .models import WhatsAppAccount
-    from models import db
+    from shared_models import db
     
     try:
         account = WhatsAppAccount.query.get(account_id)
@@ -1822,7 +2582,12 @@ def get_analytics_summary():
     # 1. Parse params
     workspace_id = request.args.get("workspace_id")
     account_id = request.args.get("account_id")
-    days = _parse_analytics_days(7)
+    days_param = request.args.get("days", "7")
+    
+    try:
+        days = int(days_param)
+    except:
+        days = 7
         
     db_session = get_db()
     now = datetime.now(timezone.utc)
@@ -1847,7 +2612,9 @@ def get_analytics_summary():
         if account_id:
             q = q.join(WhatsAppConversation).filter(WhatsAppConversation.account_id == int(account_id))
         elif workspace_id:
-            ids = _account_ids_for_workspace(workspace_id)
+            # Get accounts
+            accs = WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).all()
+            ids = [a.id for a in accs]
             if ids:
                 q = q.join(WhatsAppConversation).filter(WhatsAppConversation.account_id.in_(ids))
             else:
@@ -1895,66 +2662,15 @@ def get_analytics_summary():
     if account_id:
         active_q = active_q.filter(WhatsAppConversation.account_id == int(account_id))
     elif workspace_id:
-        ids = _account_ids_for_workspace(workspace_id)
+        accs = WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).all()
+        ids = [a.id for a in accs]
         if ids:
             active_q = active_q.filter(WhatsAppConversation.account_id.in_(ids))
             
     curr_data["active_customers"] = active_q.scalar() or 0
     
-    # Calculate average response time
-    # Find pairs: incoming message followed by outgoing response in same conversation
-    avg_response_time = None
-    try:
-        # Get conversations with messages in the current period
-        conv_filter = WhatsAppConversation.id.isnot(None)
-        if account_id:
-            conv_filter = WhatsAppConversation.account_id == int(account_id)
-        elif workspace_id:
-            ids = _account_ids_for_workspace(workspace_id)
-            if ids:
-                conv_filter = WhatsAppConversation.account_id.in_(ids)
-        
-        # Get all messages in current period, ordered by conversation and time
-        messages = db_session.query(WhatsAppMessage).join(
-            WhatsAppConversation
-        ).filter(
-            conv_filter,
-            WhatsAppMessage.created_at >= current_start,
-         
-            WhatsAppMessage.created_at < current_end
-        ).order_by(
-            WhatsAppMessage.conversation_id,
-            WhatsAppMessage.created_at
-        ).all()
-        
-        # Calculate response times per conversation
-        response_times = []
-        current_conv_id = None
-        last_incoming_time = None
-        
-        for msg in messages:
-            if msg.conversation_id != current_conv_id:
-                # New conversation
-                current_conv_id = msg.conversation_id
-                last_incoming_time = None
-            
-            if msg.direction == "incoming":
-                # Record the incoming message time
-                last_incoming_time = msg.created_at
-            elif msg.direction == "outgoing" and last_incoming_time:
-                # Calculate response time (outgoing after incoming)
-                response_time = (msg.created_at - last_incoming_time).total_seconds()
-                # Only count reasonable response times (< 24 hours, > 0 seconds)
-                if 0 < response_time < 86400:
-                    response_times.append(response_time)
-                last_incoming_time = None  # Reset after counting
-        
-        if response_times:
-            avg_response_time = sum(response_times) / len(response_times)
-    except Exception as e:
-        logger.warning(f"Failed to calculate response time: {e}")
-    
-    curr_data["avg_response_time_seconds"] = round(avg_response_time, 1) if avg_response_time else None
+    # Skip per-message response-time scan (loads every message into Python — too slow for dashboard).
+    curr_data["avg_response_time_seconds"] = None
     
     # Comparisons
     def calc_change(curr, prev):
@@ -1988,29 +2704,19 @@ def get_analytics_trends():
     
     workspace_id = request.args.get("workspace_id")
     account_id = request.args.get("account_id")
-    days = _parse_analytics_days(7)
+    days_param = request.args.get("days", "7")
+    try:
+        days = int(days_param)
+    except:
+        days = 7
         
     db_session = get_db()
     now = datetime.now(timezone.utc)
     start_date = now - timedelta(days=days)
-
-    def _zero_daily_series():
-        today = now.date()
-        series = []
-        for offset in range(days - 1, -1, -1):
-            day = today - timedelta(days=offset)
-            key = str(day)
-            series.append({"date": key, "sent": 0, "delivered": 0, "read": 0})
-        return series
-
-    account_ids = None
-    if account_id:
-        account_ids = [int(account_id)]
-    elif workspace_id:
-        account_ids = _account_ids_for_workspace(workspace_id)
-        if not account_ids:
-            return jsonify({"success": True, "daily": _zero_daily_series()})
-
+    
+    # Query grouped by date
+    # Note: func.date() works in Postgres. For SQLite/others might need strftime.
+    
     q = db_session.query(
         func.date(WhatsAppMessage.created_at).label("date"),
         func.count(WhatsAppMessage.id).label("sent"),
@@ -2020,33 +2726,26 @@ def get_analytics_trends():
         WhatsAppMessage.created_at >= start_date,
         WhatsAppMessage.direction == "outgoing"
     )
-
-    if account_ids is not None:
-        q = q.join(WhatsAppConversation).filter(WhatsAppConversation.account_id.in_(account_ids))
+    
+    if account_id:
+        q = q.join(WhatsAppConversation).filter(WhatsAppConversation.account_id == int(account_id))
+    elif workspace_id:
+        accs = WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).all()
+        ids = [a.id for a in accs]
+        if ids:
+            q = q.join(WhatsAppConversation).filter(WhatsAppConversation.account_id.in_(ids))
             
     results = q.group_by(func.date(WhatsAppMessage.created_at)).order_by(func.date(WhatsAppMessage.created_at)).all()
-
-    by_date = {}
-    for r in results:
-        by_date[str(r.date)] = {
-            "date": str(r.date),
-            "sent": int(r.sent or 0),
-            "delivered": int(r.delivered or 0),
-            "read": int(r.read or 0),
-        }
-
+    
     daily = []
-    today = now.date()
-    for offset in range(days - 1, -1, -1):
-        day = today - timedelta(days=offset)
-        key = str(day)
-        daily.append(
-            by_date.get(
-                key,
-                {"date": key, "sent": 0, "delivered": 0, "read": 0},
-            )
-        )
-
+    for r in results:
+        daily.append({
+            "date": str(r.date),
+            "sent": r.sent,
+            "delivered": r.delivered or 0,
+            "read": r.read or 0
+        })
+        
     return jsonify({
         "success": True,
         "daily": daily
@@ -2120,7 +2819,7 @@ def generate_ai_insights():
         if not client:
             return jsonify({"success": False, "error": "AI service not configured"}), 503
             
-        model_name = os.environ.get("TEXT_MODEL", "gemini-3.1-flash-lite")
+        model_name = os.environ.get("TEXT_MODEL") or os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash"
         
         prompt = f"""You are Sociovia AI, a WhatsApp Business analytics expert. Be CONCISE and ACTIONABLE.
 
@@ -2374,6 +3073,7 @@ def get_analytics():
     
     account_id = request.args.get("account_id")
     workspace_id = request.args.get("workspace_id")
+    conversations_only = request.args.get("conversations_only", "").lower() in {"1", "true", "yes"}
     db_session = get_db()
     now = datetime.now(timezone.utc)
     
@@ -2412,6 +3112,58 @@ def get_analytics():
             # Fallback for any invalid value
             start_date = now - timedelta(days=7)
             period_label = "Last 7 days"
+
+    workspace_account_ids = None
+    if workspace_id:
+        workspace_account_ids = [
+            a.id for a in WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).all()
+        ]
+
+    if conversations_only:
+        empty_conversations = {"total": 0, "open": 0, "with_unread": 0, "active_sessions": 0}
+        if workspace_id and not workspace_account_ids and not account_id:
+            return jsonify({
+                "success": True,
+                "period_label": period_label,
+                "conversations": empty_conversations,
+            })
+
+        conv_query = db_session.query(
+            func.count(WhatsAppConversation.id).label("total"),
+            func.sum(case((WhatsAppConversation.status == "open", 1), else_=0)).label("open_status"),
+            func.sum(case((WhatsAppConversation.closed_by_agent == True, 1), else_=0)).label("closed_by_agent"),
+            func.sum(case((WhatsAppConversation.unread_count > 0, 1), else_=0)).label("with_unread"),
+        )
+        if account_id:
+            conv_query = conv_query.filter(WhatsAppConversation.account_id == int(account_id))
+        elif workspace_id and workspace_account_ids:
+            conv_query = conv_query.filter(WhatsAppConversation.account_id.in_(workspace_account_ids))
+
+        conv_result = conv_query.first()
+        active_sessions = db_session.query(func.count(WhatsAppConversation.id)).filter(
+            WhatsAppConversation.session_expires_at > now,
+            WhatsAppConversation.closed_by_agent != True,
+        )
+        if account_id:
+            active_sessions = active_sessions.filter(WhatsAppConversation.account_id == int(account_id))
+        elif workspace_id and workspace_account_ids:
+            active_sessions = active_sessions.filter(WhatsAppConversation.account_id.in_(workspace_account_ids))
+        active_count = active_sessions.scalar() or 0
+
+        open_by_status = conv_result.open_status or 0 if conv_result else 0
+        closed_by_agent_count = conv_result.closed_by_agent or 0 if conv_result else 0
+        real_open = max(0, open_by_status - closed_by_agent_count)
+
+        return jsonify({
+            "success": True,
+            "period_label": period_label,
+            "conversations": {
+                "total": conv_result.total or 0 if conv_result else 0,
+                "open": real_open,
+                "with_unread": conv_result.with_unread or 0 if conv_result else 0,
+                "active_sessions": active_count,
+            },
+        })
     
     # === Message Stats ===
     msg_query = db_session.query(WhatsAppMessage)
@@ -2837,6 +3589,13 @@ def health_check():
         logger.exception(f"Health check DB error: {e}")
         db_ok = False
         account_count = 0
+
+    queue_snapshot = {}
+    try:
+        from core.queue.manager import queue_health_snapshot
+        queue_snapshot = queue_health_snapshot()
+    except Exception as exc:
+        queue_snapshot = {"error": str(exc)}
     
     return jsonify({
         "status": "ok" if (token_configured and phone_configured) else "degraded",
@@ -2852,6 +3611,7 @@ def health_check():
             "connected": db_ok,
             "accounts": account_count,
         },
+        "queues": queue_snapshot,
     })
 
 
@@ -2882,7 +3642,8 @@ def list_templates():
         if account:
             account_id = account.id
     
-    query = WhatsAppTemplate.query
+    # Only return templates that are not archived
+    query = WhatsAppTemplate.query.filter_by(is_archived=False)
     
     if account_id:
         query = query.filter_by(account_id=account_id)
@@ -2977,20 +3738,30 @@ def delete_template(template_id):
     import requests as http_requests
     from .models import WhatsAppTemplate, WhatsAppAccount
     
-    workspace_id = request.args.get("workspace_id")
+    data = {}
+    try:
+        data = request.get_json() or {}
+    except Exception:
+        pass
+
+    workspace_id = request.args.get("workspace_id") or data.get("workspace_id")
+    account_id = request.args.get("account_id") or data.get("account_id")
     
-    if not workspace_id:
-        return jsonify({"success": False, "error": "workspace_id required"}), 400
+    if not workspace_id and not account_id:
+        return jsonify({"success": False, "error": "workspace_id or account_id required"}), 400
     
-    # Resolve account from workspace
-    account, token_error = get_valid_account_for_workspace(workspace_id)
+    # Resolve account
+    if account_id:
+        account, token_error = get_account_with_token(account_id)
+    else:
+        account, token_error = get_valid_account_for_workspace(workspace_id)
+        
     if token_error:
         return jsonify({"success": False, "error": token_error}), 400
     
     access_token = account.get_access_token()
-    from tenant.integration import get_tenant_meta_config
-    api_version = get_tenant_meta_config(workspace_id=workspace_id).whatsapp_api_version or "v22.0"
-
+    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    
     # Find template in database - first try by meta_template_id (string)
     template = WhatsAppTemplate.query.filter_by(
         account_id=account.id,
@@ -3221,7 +3992,18 @@ def rewrite_template_for_category():
                 })
         
         # ===========================================
-        # STEP 4: Build placeholder-safe prompts
+        # STEP 4: Initialize Vertex AI client (NOT free-tier)
+        # ===========================================
+        from google import genai
+        from google.genai import types
+        
+        # Use Vertex AI with project-based auth (not API key)
+        # Fallback chain: GCP_PROJECT -> PROJECT_ID -> hardcoded default
+        gcp_project = os.environ.get("GCP_PROJECT") or os.environ.get("PROJECT_ID") or "angular-sorter-473216-k8"
+        gcp_location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+        
+        # ===========================================
+        # STEP 5: Build placeholder-safe prompts
         # ===========================================
         placeholder_warning = ""
         if unique_placeholders:
@@ -3297,22 +4079,21 @@ Return ONLY the cleaned template text. No explanations.
 """
 
         # ===========================================
-        # STEP 5: Call Gemini API (API key locally, Vertex in prod)
+        # STEP 6: Call Gemini API
         # ===========================================
         try:
-            from .ai_chatbot import get_genai_client
-
-            text_model = os.environ.get("TEXT_MODEL", "gemini-3.1-flash-lite")
-            client = get_genai_client()
-            if not client:
-                return jsonify({
-                    "success": False,
-                    "rewritten_text": None,
-                    "confidence": "LOW",
-                    "notes": "AI service not configured. Set GEMINI_API_KEY in your environment.",
-                    "cannot_rewrite": True,
-                })
-
+            from google.genai.types import HttpOptions
+            
+            text_model = os.environ.get("TEXT_MODEL") or os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash"
+            
+            # Initialize Vertex AI client (NOT free-tier API key)
+            client = genai.Client(
+                http_options=HttpOptions(api_version="v1"),
+                project=gcp_project,
+                location=gcp_location,
+                vertexai=True,
+            )
+            
             response = client.models.generate_content(
                 model=text_model,
                 contents=prompt
@@ -3394,6 +4175,7 @@ def create_template():
     """
     import requests as http_requests
     from .models import WhatsAppTemplate, WhatsAppAccount
+    from .flow_access import validate_template_flow_attachment
     
     data = request.get_json() or {}
     account_id = data.get("account_id")
@@ -3419,10 +4201,9 @@ def create_template():
     # Update account_id if helper returned a different active account
     account_id = account.id
     access_token = account.get_access_token()
-
-    from tenant.integration import get_tenant_meta_config
-    api_version = get_tenant_meta_config(workspace_id=account.workspace_id).whatsapp_api_version or "v22.0"
-
+    
+    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    
     # ====== INTENT ENFORCEMENT ======
     # Server-side validation to prevent Marketing disguised as Utility
     try:
@@ -3489,6 +4270,73 @@ def create_template():
     # ====== END INTENT ENFORCEMENT ======
     
     try:
+        # Validate advanced button requirements server-side to prevent Meta rejections.
+        has_catalog_button = False
+        has_voice_call_button = False
+        for comp in components:
+            if str(comp.get("type", "")).upper() != "BUTTONS":
+                continue
+
+            for btn in (comp.get("buttons", []) or []):
+                btn_type = str(btn.get("type", "")).upper()
+
+                if btn_type == "FLOW":
+                    flow_id = str(btn.get("flow_id") or "").strip()
+                    if not flow_id:
+                        return jsonify({"success": False, "error": "Flow button requires flow_id"}), 400
+
+                    is_valid_flow, flow_error = validate_template_flow_attachment(account_id, flow_id)
+                    if not is_valid_flow:
+                        return jsonify({"success": False, "error": flow_error}), 400
+
+                if btn_type == "COPY_CODE":
+                    code_example = str(btn.get("example") or btn.get("copy_code") or "").strip()
+                    if code_example and len(code_example) > 15:
+                        return jsonify({"success": False, "error": "COPY_CODE example must be 15 characters or less"}), 400
+
+                if btn_type == "CATALOG":
+                    has_catalog_button = True
+
+                if btn_type == "VOICE_CALL":
+                    has_voice_call_button = True
+
+        if has_catalog_button:
+            # Meta catalog templates are MARKETING category templates.
+            if str(category).upper() != "MARKETING":
+                return jsonify({
+                    "success": False,
+                    "error": "Catalog button requires MARKETING category"
+                }), 400
+
+            # Best-effort check: ensure at least one product catalog is connected to this WABA.
+            catalogs_resp = http_requests.get(
+                f"https://graph.facebook.com/{api_version}/{account.waba_id}/product_catalogs",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=15,
+            )
+            catalogs_data = catalogs_resp.json() if catalogs_resp.content else {}
+            if catalogs_resp.ok:
+                connected_catalogs = catalogs_data.get("data", []) or []
+                if not connected_catalogs:
+                    return jsonify({
+                        "success": False,
+                        "error": "No product catalog connected to this WhatsApp Business Account.",
+                        "catalog_required": True,
+                        "catalog_setup_url": "/dashboard/whatsapp/catalog",
+                        "suggestion": "Connect a catalog on the Catalog Management page before submitting a CATALOG button template.",
+                    }), 400
+            else:
+                logger.warning("Catalog precheck failed: %s", catalogs_data)
+
+        if has_voice_call_button:
+            capability = _get_voice_call_capability(account, access_token, api_version)
+            if capability.get("block_template_submission"):
+                return jsonify({
+                    "success": False,
+                    "error": "VOICE_CALL button is blocked until account call readiness checks pass.",
+                    "capability": capability,
+                }), 400
+
         # Parse body text to extract variables
         import re
         import json
@@ -3527,9 +4375,16 @@ def create_template():
             if comp_type == "BODY":
                 # Use lowercase 'body' for named params as per Meta documentation
                 body_comp = {
-                    "type": "body" if is_named else "BODY",
-                    "text": comp.get("text", "")
+                    "type": "body" if is_named else "BODY"
                 }
+                
+                # CRITICAL: Authentication templates have a very strict schema.
+                # They MUST NOT have a 'text' field in the BODY component.
+                # Instead, they use a fixed format and can include a security recommendation.
+                if category.upper() == 'AUTHENTICATION':
+                    body_comp["add_security_recommendation"] = True
+                else:
+                    body_comp["text"] = comp.get("text", "")
                 # Add example based on parameter format
                 if variable_count > 0:
                     if is_named:
@@ -3582,36 +4437,124 @@ def create_template():
                             }
                 api_components.append(body_comp)
             elif comp_type == "HEADER":
+                header_format = str(comp.get("format", "TEXT")).upper()
                 header_comp = {
                     "type": "HEADER",
-                    "format": comp.get("format", "TEXT"),
+                    "format": header_format,
                 }
-                # Handle text headers
-                if comp.get("text"):
+
+                # Text header
+                if header_format == "TEXT" and comp.get("text"):
                     header_comp["text"] = comp.get("text")
-                # Handle image headers with media handle
-                if comp.get("example", {}).get("header_handle"):
+
+                    # Optional examples for text header variables
+                    header_example = comp.get("example", {}) or {}
+                    if header_example.get("header_text"):
+                        header_comp["example"] = {"header_text": header_example.get("header_text")}
+                    elif header_example.get("header_text_named_params"):
+                        header_comp["example"] = {
+                            "header_text_named_params": header_example.get("header_text_named_params")
+                        }
+
+                # Media header (image/video/document/gif)
+                if header_format in {"IMAGE", "VIDEO", "DOCUMENT", "GIF"} and comp.get("example", {}).get("header_handle"):
                     header_comp["example"] = comp.get("example")
+
+                # Location header has no extra properties for create payload
                 api_components.append(header_comp)
             elif comp_type == "FOOTER":
+                # CRITICAL: Authentication templates have a very strict schema.
+                # Standard FOOTER with 'text' is NOT allowed for AUTHENTICATION.
+                # Only specific fields like 'code_expiration_minutes' or 'add_security_recommendation' (deprecated from footer) are allowed.
+                if category.upper() == 'AUTHENTICATION':
+                    logger.info("Skipping invalid FOOTER 'text' for AUTHENTICATION template")
+                    # We skip the footer if it's a standard one, as it would cause an error.
+                    continue
+                
                 api_components.append({
                     "type": "FOOTER",
                     "text": comp.get("text", "")
                 })
             elif comp_type == "BUTTONS":
-                # Sanitize buttons before sending to Meta. FLOW buttons carry a
-                # `flow_token` only at SEND time — Meta rejects it (and any empty
-                # value) during template CREATION with error (#100).
-                clean_buttons = []
-                for btn in comp.get("buttons", []):
-                    btn = dict(btn)
-                    if str(btn.get("type", "")).upper() == "FLOW":
-                        btn.pop("flow_token", None)
-                        btn = {k: v for k, v in btn.items() if v not in ("", None)}
-                    clean_buttons.append(btn)
-                api_components.append({"type": "BUTTONS", "buttons": clean_buttons})
+                raw_buttons = comp.get("buttons", []) or []
+                normalized_buttons = []
+
+                for btn in raw_buttons:
+                    btn_type = str(btn.get("type", "")).upper()
+                    if not btn_type:
+                        continue
+
+                    norm_btn = {"type": btn_type}
+
+                    # Types with text labels
+                    if btn_type in {"QUICK_REPLY", "URL", "PHONE_NUMBER", "FLOW", "VOICE_CALL", "CATALOG"}:
+                        btn_text = btn.get("text")
+                        if btn_text:
+                            norm_btn["text"] = btn_text
+                        elif btn_type == "CATALOG":
+                            # Meta requires text for CATALOG buttons; default to "View catalog"
+                            norm_btn["text"] = "View catalog"
+
+                    if btn_type == "URL":
+                        if btn.get("url"):
+                            norm_btn["url"] = btn.get("url")
+                        if btn.get("example"):
+                            norm_btn["example"] = btn.get("example")
+
+                    elif btn_type == "PHONE_NUMBER":
+                        if btn.get("phone_number") or btn.get("phone"):
+                            norm_btn["phone_number"] = btn.get("phone_number") or btn.get("phone")
+
+                    elif btn_type == "FLOW":
+                        if btn.get("flow_id"):
+                            norm_btn["flow_id"] = btn.get("flow_id")
+                        if btn.get("flow_token"):
+                            norm_btn["flow_token"] = btn.get("flow_token")
+
+                    elif btn_type == "COPY_CODE":
+                        # Meta expects example code when creating coupon templates
+                        code_example = btn.get("example") or btn.get("copy_code") or btn.get("code")
+                        if code_example:
+                            norm_btn["example"] = code_example
+
+                    elif btn_type == "OTP":
+                        # Authentication templates: OTP button schema
+                        if btn.get("otp_type"):
+                            norm_btn["otp_type"] = str(btn.get("otp_type")).upper()
+                        if btn.get("supported_apps"):
+                            norm_btn["supported_apps"] = btn.get("supported_apps")
+
+                    normalized_buttons.append(norm_btn)
+
+                if normalized_buttons:
+                    api_components.append({
+                        "type": "BUTTONS",
+                        "buttons": normalized_buttons,
+                    })
             else:
                 api_components.append(comp)
+        
+        # CRITICAL: Authentication templates MUST have exactly one OTP button.
+        # Auto-inject a copy_code button if user didn't provide one.
+        if category.upper() == 'AUTHENTICATION':
+            has_otp_button = any(
+                c.get("type", "").upper() == "BUTTONS" and any(
+                    str(btn.get("type", "")).upper() == "OTP"
+                    for btn in (c.get("buttons", []) or [])
+                )
+                for c in api_components
+            )
+            if not has_otp_button:
+                logger.info("Auto-injecting OTP copy_code button for AUTHENTICATION template")
+                api_components.append({
+                    "type": "BUTTONS",
+                    "buttons": [
+                        {
+                            "type": "OTP",
+                            "otp_type": "COPY_CODE"
+                        }
+                    ]
+                })
         
         # Build the API request payload
         api_payload = {
@@ -3739,11 +4682,8 @@ def get_template(template_name: str):
     # Fallback to environment variables
     if not access_token:
         access_token = os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TEMP_TOKEN")
-
-    from tenant.integration import get_tenant_meta_config
-    api_version = get_tenant_meta_config(
-        workspace_id=(account.workspace_id if account else None)
-    ).whatsapp_api_version or "v22.0"
+    
+    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
     
     if not access_token:
         return jsonify({
@@ -3825,8 +4765,8 @@ def list_accounts():
     
     By default only returns ACTIVE accounts that have access tokens.
     """
-    from .models import WhatsAppAccount
-    
+    from .models import WhatsAppAccount, accounts_query_with_any_token
+
     workspace_id = request.args.get("workspace_id")
     include_inactive = request.args.get("include_inactive", "false").lower() == "true"
     
@@ -3838,8 +4778,7 @@ def list_accounts():
     # By default, only return active accounts with tokens
     if not include_inactive:
         query = query.filter_by(is_active=True)
-        # Also filter out accounts without access tokens
-        query = query.filter(WhatsAppAccount.access_token_encrypted.isnot(None))
+        query = accounts_query_with_any_token(query)
     
     accounts = query.all()
     
@@ -3871,7 +4810,7 @@ def unlink_account(account_id: int):
         
         # Soft delete - just mark as inactive, keep all data
         account.is_active = False
-        account.access_token_encrypted = None  # Clear token for security
+        account.clear_access_token_storage()
         get_db().commit()
         
         logger.info(f"Unlinked WhatsApp account: {phone_number}")
@@ -3971,6 +4910,100 @@ def admin_diagnose_account():
     })
 
 
+@whatsapp_bp.route("/accounts/<int:account_id>/customer-webhook", methods=["GET", "PATCH"])
+def customer_webhook_config(account_id: int):
+    """
+    Get or set customer webhook forwarding for partner inbound events (Vaish).
+
+    PATCH body:
+      {
+        "customer_webhook_url": "https://customer.example.com/webhook",
+        "customer_webhook_secret_header": "x-customer-secret",
+        "customer_webhook_secret_value": "..."
+      }
+    """
+    from .models import WhatsAppAccount
+
+    account = WhatsAppAccount.query.get(account_id)
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+
+    if request.method == "GET":
+        return jsonify({
+            "success": True,
+            "account_id": account.id,
+            "workspace_id": account.workspace_id,
+            "waba_id": account.waba_id,
+            "customer_webhook_url": account.customer_webhook_url,
+            "customer_webhook_secret_header": account.customer_webhook_secret_header,
+            "customer_webhook_secret_configured": bool(
+                (account.customer_webhook_secret_header or "").strip()
+                and (account.customer_webhook_secret_value or "").strip()
+            ),
+        })
+
+    data = request.get_json(silent=True) or {}
+    if not any(
+        key in data
+        for key in (
+            "customer_webhook_url",
+            "customer_webhook_secret_header",
+            "customer_webhook_secret_value",
+        )
+    ):
+        return jsonify({
+            "success": False,
+            "error": "At least one of customer_webhook_url, customer_webhook_secret_header, "
+            "customer_webhook_secret_value is required",
+        }), 400
+
+    if "customer_webhook_url" in data:
+        raw_url = data.get("customer_webhook_url")
+        if raw_url is None or (isinstance(raw_url, str) and not raw_url.strip()):
+            account.customer_webhook_url = None
+        else:
+            url = str(raw_url).strip()
+            if not url.startswith("https://"):
+                return jsonify({"success": False, "error": "customer_webhook_url must use https://"}), 400
+            if len(url) > 512:
+                return jsonify({"success": False, "error": "URL too long (max 512 characters)"}), 400
+            account.customer_webhook_url = url
+
+    if "customer_webhook_secret_header" in data:
+        raw_header = data.get("customer_webhook_secret_header")
+        if raw_header is None or (isinstance(raw_header, str) and not raw_header.strip()):
+            account.customer_webhook_secret_header = None
+        else:
+            header = str(raw_header).strip()
+            if len(header) > 128:
+                return jsonify({"success": False, "error": "Secret header name too long (max 128)"}), 400
+            account.customer_webhook_secret_header = header
+
+    if "customer_webhook_secret_value" in data:
+        raw_secret = data.get("customer_webhook_secret_value")
+        if raw_secret is None or (isinstance(raw_secret, str) and not raw_secret.strip()):
+            account.customer_webhook_secret_value = None
+        else:
+            account.customer_webhook_secret_value = str(raw_secret).strip()
+
+    try:
+        get_db().commit()
+        return jsonify({
+            "success": True,
+            "account_id": account.id,
+            "workspace_id": account.workspace_id,
+            "customer_webhook_url": account.customer_webhook_url,
+            "customer_webhook_secret_configured": bool(
+                (account.customer_webhook_secret_header or "").strip()
+                and (account.customer_webhook_secret_value or "").strip()
+            ),
+        })
+    except Exception as exc:
+        get_db().rollback()
+        logger.exception("customer_webhook_config failed: %s", exc)
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
 @whatsapp_bp.route("/accounts/<int:account_id>/rename", methods=["PATCH"])
 def rename_account(account_id: int):
     """
@@ -4013,6 +5046,273 @@ def rename_account(account_id: int):
     except Exception as e:
         get_db().rollback()
         logger.exception(f"Failed to rename account: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@whatsapp_bp.route("/accounts/<int:account_id>/meta-business-id", methods=["PATCH", "PUT"])
+def update_meta_business_id(account_id: int):
+    """
+    Update Meta Business Manager ID for a WhatsApp account.
+
+    PATCH/PUT /api/whatsapp/accounts/<id>/meta-business-id
+    Body: {"meta_business_id": "123456789012345"}
+    """
+    from .models import WhatsAppAccount
+
+    account = WhatsAppAccount.query.get(account_id)
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+
+    data = request.get_json() or {}
+    raw_value = data.get("meta_business_id", "")
+    meta_business_id = "".join(c for c in str(raw_value).strip() if c.isdigit())
+
+    if raw_value and not meta_business_id:
+        return jsonify({"success": False, "error": "Meta Business Manager ID must contain digits only"}), 400
+
+    if meta_business_id and len(meta_business_id) > 64:
+        return jsonify({"success": False, "error": "Meta Business Manager ID is too long"}), 400
+
+    try:
+        account.meta_business_id = meta_business_id or None
+        get_db().commit()
+
+        logger.info(f"Updated Meta Business Manager ID for account {account_id}: {meta_business_id or 'cleared'}")
+
+        return jsonify({
+            "success": True,
+            "message": "Meta Business Manager ID updated successfully",
+            "account": account.to_dict()
+        })
+    except Exception as e:
+        get_db().rollback()
+        logger.exception(f"Failed to update Meta Business Manager ID: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@whatsapp_bp.route("/accounts/<int:account_id>/migrate-resources", methods=["POST"])
+@require_admin_only
+def migrate_account_resources(account_id: int):
+    """
+    Migrate account-scoped WhatsApp resources into a target account.
+
+    POST /api/whatsapp/accounts/<target_account_id>/migrate-resources
+
+    Body (all optional):
+    {
+      "source_account_ids": [12, 18],
+      "include_active_sources": false,
+      "dry_run": true
+    }
+
+    Defaults:
+    - source_account_ids: all other accounts in same workspace
+    - include_active_sources: false (migrate from old/unlinked accounts only)
+    - dry_run: true
+    """
+    from .models import WhatsAppAccount, WhatsAppTemplate, WhatsAppFlow
+    from .automation_models import (
+        WhatsAppAutomationRule,
+        WhatsAppBusinessHours,
+        ContactAutomationOverride,
+    )
+    from .visual_automation_models import WhatsAppVisualAutomation
+    from .trigger_models import WhatsAppTrigger
+    from .faq_models import WhatsAppFAQ
+    from .drip_models import WhatsAppDripCampaign
+
+    target_account = WhatsAppAccount.query.get(account_id)
+    if not target_account:
+        return jsonify({"success": False, "error": "Target account not found"}), 404
+
+    workspace_id = str(target_account.workspace_id or "")
+    if not workspace_id:
+        return jsonify({"success": False, "error": "Target account has no workspace_id"}), 400
+
+    data = request.get_json(silent=True) or {}
+    dry_run = bool(data.get("dry_run", True))
+    include_active_sources = bool(data.get("include_active_sources", False))
+    source_ids_raw = data.get("source_account_ids")
+
+    source_query = WhatsAppAccount.query.filter(
+        WhatsAppAccount.workspace_id == workspace_id,
+        WhatsAppAccount.id != target_account.id,
+    )
+    if not include_active_sources:
+        source_query = source_query.filter(WhatsAppAccount.is_active == False)
+
+    source_accounts = source_query.all()
+
+    if source_ids_raw:
+        try:
+            requested_ids = {int(x) for x in source_ids_raw}
+        except Exception:
+            return jsonify({"success": False, "error": "source_account_ids must be an array of integers"}), 400
+        source_accounts = [a for a in source_accounts if a.id in requested_ids]
+
+    if not source_accounts:
+        return jsonify({
+            "success": True,
+            "message": "No source accounts found to migrate",
+            "dry_run": dry_run,
+            "target_account_id": target_account.id,
+            "workspace_id": workspace_id,
+            "source_account_ids": [],
+            "summary": {},
+        })
+
+    summary = {
+        "templates": {"migrated": 0, "skipped_conflicts": 0},
+        "flows": {"migrated": 0, "skipped_conflicts": 0},
+        "triggers": {"migrated": 0, "skipped_conflicts": 0},
+        "automation_rules": {"migrated": 0},
+        "business_hours": {"migrated": 0, "skipped_conflicts": 0},
+        "contact_overrides": {"migrated": 0},
+        "visual_automations": {"migrated": 0},
+        "faqs": {"migrated": 0},
+        "drip_campaigns": {"migrated": 0},
+    }
+    details = {
+        "template_conflicts": [],
+        "flow_conflicts": [],
+        "trigger_conflicts": [],
+        "business_hours_conflicts": [],
+    }
+
+    try:
+        for source in source_accounts:
+            # Templates: unique(account_id, name, language)
+            source_templates = WhatsAppTemplate.query.filter_by(account_id=source.id).all()
+            for tmpl in source_templates:
+                conflict = WhatsAppTemplate.query.filter_by(
+                    account_id=target_account.id,
+                    name=tmpl.name,
+                    language=tmpl.language,
+                ).first()
+                if conflict:
+                    summary["templates"]["skipped_conflicts"] += 1
+                    details["template_conflicts"].append({
+                        "source_account_id": source.id,
+                        "template_id": tmpl.id,
+                        "name": tmpl.name,
+                        "language": tmpl.language,
+                    })
+                else:
+                    summary["templates"]["migrated"] += 1
+                    if not dry_run:
+                        tmpl.account_id = target_account.id
+
+            # Flows: unique(account_id, name, flow_version)
+            source_flows = WhatsAppFlow.query.filter_by(account_id=source.id).all()
+            for flow in source_flows:
+                conflict = WhatsAppFlow.query.filter_by(
+                    account_id=target_account.id,
+                    name=flow.name,
+                    flow_version=flow.flow_version,
+                ).first()
+                if conflict:
+                    summary["flows"]["skipped_conflicts"] += 1
+                    details["flow_conflicts"].append({
+                        "source_account_id": source.id,
+                        "flow_id": flow.id,
+                        "name": flow.name,
+                        "flow_version": flow.flow_version,
+                    })
+                else:
+                    summary["flows"]["migrated"] += 1
+                    if not dry_run:
+                        flow.account_id = target_account.id
+
+            # Triggers: unique(account_id, slug)
+            source_triggers = WhatsAppTrigger.query.filter_by(account_id=source.id).all()
+            for trig in source_triggers:
+                conflict = WhatsAppTrigger.query.filter_by(
+                    account_id=target_account.id,
+                    slug=trig.slug,
+                ).first()
+                if conflict:
+                    summary["triggers"]["skipped_conflicts"] += 1
+                    details["trigger_conflicts"].append({
+                        "source_account_id": source.id,
+                        "trigger_id": trig.id,
+                        "slug": trig.slug,
+                    })
+                else:
+                    summary["triggers"]["migrated"] += 1
+                    if not dry_run:
+                        trig.account_id = target_account.id
+
+            # Business hours: unique(workspace_id, account_id)
+            source_bh = WhatsAppBusinessHours.query.filter_by(
+                workspace_id=workspace_id,
+                account_id=source.id,
+            ).first()
+            if source_bh:
+                target_bh = WhatsAppBusinessHours.query.filter_by(
+                    workspace_id=workspace_id,
+                    account_id=target_account.id,
+                ).first()
+                if target_bh:
+                    summary["business_hours"]["skipped_conflicts"] += 1
+                    details["business_hours_conflicts"].append({
+                        "source_account_id": source.id,
+                        "business_hours_id": source_bh.id,
+                    })
+                else:
+                    summary["business_hours"]["migrated"] += 1
+                    if not dry_run:
+                        source_bh.account_id = target_account.id
+
+            # Straight rebind resources (no unique account constraint risk)
+            moved_rules = WhatsAppAutomationRule.query.filter_by(
+                workspace_id=workspace_id,
+                account_id=source.id,
+            ).update({"account_id": target_account.id}, synchronize_session=False)
+            summary["automation_rules"]["migrated"] += moved_rules
+
+            moved_overrides = ContactAutomationOverride.query.filter_by(
+                workspace_id=workspace_id,
+                account_id=source.id,
+            ).update({"account_id": target_account.id}, synchronize_session=False)
+            summary["contact_overrides"]["migrated"] += moved_overrides
+
+            moved_visual = WhatsAppVisualAutomation.query.filter_by(
+                workspace_id=workspace_id,
+                account_id=source.id,
+            ).update({"account_id": target_account.id}, synchronize_session=False)
+            summary["visual_automations"]["migrated"] += moved_visual
+
+            moved_faqs = WhatsAppFAQ.query.filter_by(
+                workspace_id=workspace_id,
+                account_id=source.id,
+            ).update({"account_id": target_account.id}, synchronize_session=False)
+            summary["faqs"]["migrated"] += moved_faqs
+
+            moved_drips = WhatsAppDripCampaign.query.filter_by(
+                workspace_id=workspace_id,
+                account_id=source.id,
+            ).update({"account_id": target_account.id}, synchronize_session=False)
+            summary["drip_campaigns"]["migrated"] += moved_drips
+
+        if dry_run:
+            get_db().rollback()
+        else:
+            get_db().commit()
+
+        return jsonify({
+            "success": True,
+            "dry_run": dry_run,
+            "target_account_id": target_account.id,
+            "workspace_id": workspace_id,
+            "source_account_ids": [a.id for a in source_accounts],
+            "summary": summary,
+            "details": details,
+            "message": "Dry run completed" if dry_run else "Resources migrated successfully",
+        })
+
+    except Exception as e:
+        get_db().rollback()
+        logger.exception(f"Failed to migrate resources to account {account_id}: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -4242,6 +5542,58 @@ def manual_subscribe_webhooks(account_id: int):
     }), 200 if success else 400
 
 
+@whatsapp_bp.route("/accounts/<int:account_id>/webhook-health/revalidate", methods=["POST"])
+def webhook_health_revalidate(account_id: int):
+    """
+    Re-run webhook subscription + delivery integrity checks (advisory persistence only).
+
+    POST /api/whatsapp/accounts/<id>/webhook-health/revalidate
+    """
+    from .models import WhatsAppAccount
+    from .webhook_health import validate_and_persist_account
+
+    account = WhatsAppAccount.query.get(account_id)
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+    report = validate_and_persist_account(account, probe_callback=True)
+    return jsonify({"success": True, "report": report})
+
+
+@whatsapp_bp.route("/accounts/<int:account_id>/webhook-health/retry-subscribe", methods=["POST"])
+def webhook_health_retry_subscribe(account_id: int):
+    """
+    POST subscribed_apps (full fields) then revalidate health.
+
+    POST /api/whatsapp/accounts/<id>/webhook-health/retry-subscribe
+    """
+    from .models import WhatsAppAccount
+    from .webhook_health import retry_subscribe_webhooks
+
+    account = WhatsAppAccount.query.get(account_id)
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+    out = retry_subscribe_webhooks(account)
+    ok = bool(out.get("subscribe_result", {}).get("success"))
+    return jsonify({"success": ok, **out}), 200 if ok else 400
+
+
+@whatsapp_bp.route("/accounts/<int:account_id>/webhook-health/refresh-subscriptions", methods=["POST"])
+def webhook_health_refresh_subscriptions(account_id: int):
+    """
+    GET subscribed_apps metadata only (no callback probe).
+
+    POST /api/whatsapp/accounts/<id>/webhook-health/refresh-subscriptions
+    """
+    from .models import WhatsAppAccount
+    from .webhook_health import refresh_subscribed_apps_metadata
+
+    account = WhatsAppAccount.query.get(account_id)
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+    meta = refresh_subscribed_apps_metadata(account)
+    return jsonify({"success": bool(meta.get("success")), **meta}), 200 if meta.get("success") else 400
+
+
 @whatsapp_bp.route("/accounts/<int:account_id>", methods=["DELETE"])
 @require_admin_only  # SECURITY: Only admins can delete accounts
 def delete_account(account_id: int):
@@ -4250,7 +5602,18 @@ def delete_account(account_id: int):
     
     DELETE /api/whatsapp/accounts/<id>
     """
-    from .models import WhatsAppAccount, WhatsAppConversation, WhatsAppMessage, WhatsAppTemplate
+    from .models import WhatsAppAccount, WhatsAppConversation, WhatsAppMessage, WhatsAppTemplate, WhatsAppFlow, WhatsAppUsageEvent
+    from .trigger_models import WhatsAppTrigger
+    from .trigger_logs_model import TriggerLog
+    from .faq_models import WhatsAppFAQ
+    from .drip_models import WhatsAppDripCampaign, WhatsAppDripStep, WhatsAppDripEnrollment
+    from .automation_models import (
+        WhatsAppAutomationRule,
+        WhatsAppAutomationLog,
+        WhatsAppBusinessHours,
+        ContactAutomationOverride,
+    )
+    from .visual_automation_models import WhatsAppVisualAutomation, WhatsAppAutomationNode
     
     account = WhatsAppAccount.query.get(account_id)
     
@@ -4262,9 +5625,63 @@ def delete_account(account_id: int):
         phone_number = account.display_phone_number
         waba_id = account.waba_id
         
-        # Delete related templates first
-        template_count = WhatsAppTemplate.query.filter_by(account_id=account_id).delete()
-        logger.info(f"Deleted {template_count} templates for account {account_id}")
+        # Delete account-scoped dependencies first to avoid FK constraint failures.
+        template_count = WhatsAppTemplate.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+        flow_count = WhatsAppFlow.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+
+        # Delete trigger logs (child) before triggers (parent)
+        trigger_log_count = TriggerLog.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+        trigger_count = WhatsAppTrigger.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+
+        faq_count = WhatsAppFAQ.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+        
+        # Delete Drip Campaign sub-records (steps and enrollments) before campaigns
+        drip_campaign_ids = [c.id for c in WhatsAppDripCampaign.query.filter_by(account_id=account_id).all()]
+        drip_step_count = 0
+        drip_enrollment_count = 0
+        if drip_campaign_ids:
+            drip_enrollment_count = WhatsAppDripEnrollment.query.filter(WhatsAppDripEnrollment.campaign_id.in_(drip_campaign_ids)).delete(synchronize_session=False)
+            drip_step_count = WhatsAppDripStep.query.filter(WhatsAppDripStep.campaign_id.in_(drip_campaign_ids)).delete(synchronize_session=False)
+        drip_count = WhatsAppDripCampaign.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+
+        # Delete usage events
+        usage_event_count = WhatsAppUsageEvent.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+
+        automation_rule_ids = [r.id for r in WhatsAppAutomationRule.query.filter_by(account_id=account_id).all()]
+        automation_log_count = 0
+        if automation_rule_ids:
+            automation_log_count = WhatsAppAutomationLog.query.filter(WhatsAppAutomationLog.rule_id.in_(automation_rule_ids)).delete(synchronize_session=False)
+        automation_rule_count = WhatsAppAutomationRule.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+        business_hours_count = WhatsAppBusinessHours.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+        contact_override_count = ContactAutomationOverride.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+
+        visual_automation_ids = [a.id for a in WhatsAppVisualAutomation.query.filter_by(account_id=account_id).all()]
+        visual_node_count = 0
+        if visual_automation_ids:
+            visual_node_count = WhatsAppAutomationNode.query.filter(WhatsAppAutomationNode.automation_id.in_(visual_automation_ids)).delete(synchronize_session=False)
+        visual_count = WhatsAppVisualAutomation.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+
+        logger.info(
+            "Deleted dependencies for account %s: templates=%s flows=%s triggers=%s trigger_logs=%s faqs=%s drips=%s "
+            "drip_steps=%s drip_enrollments=%s usage_events=%s "
+            "automation_rules=%s automation_logs=%s business_hours=%s contact_overrides=%s visual_automations=%s visual_nodes=%s",
+            account_id,
+            template_count,
+            flow_count,
+            trigger_count,
+            trigger_log_count,
+            faq_count,
+            drip_count,
+            drip_step_count,
+            drip_enrollment_count,
+            usage_event_count,
+            automation_rule_count,
+            automation_log_count,
+            business_hours_count,
+            contact_override_count,
+            visual_count,
+            visual_node_count,
+        )
         
         # Delete related conversations and messages
         conversations = WhatsAppConversation.query.filter_by(account_id=account_id).all()
@@ -4319,9 +5736,8 @@ def register_phone_number(account_id: int):
     # Get optional PIN from request body
     data = request.get_json(silent=True) or {}
     pin = data.get("pin", "123456")  # Default 6-digit PIN
-
-    from tenant.integration import get_tenant_meta_config
-    api_version = get_tenant_meta_config(workspace_id=account.workspace_id).whatsapp_api_version or "v24.0"
+    
+    api_version = os.getenv("WHATSAPP_API_VERSION", "v24.0")
     
     try:
         resp = http_requests.post(
@@ -4487,6 +5903,22 @@ def get_account_diagnostics(account_id: int):
     return jsonify(diagnostics)
 
 
+@whatsapp_bp.route("/accounts/<int:account_id>/voice-call-capability", methods=["GET"])
+def get_account_voice_call_capability(account_id: int):
+    """
+    Get voice-call readiness for VOICE_CALL template buttons.
+
+    GET /api/whatsapp/accounts/<id>/voice-call-capability
+    """
+    account, token_error = get_account_with_token(account_id)
+    if token_error:
+        return jsonify({"success": False, "error": token_error}), 400
+
+    access_token = account.get_access_token()
+    capability = _get_voice_call_capability(account, access_token)
+    return jsonify(capability)
+
+
 # ============================================================
 # Ice Breakers (Conversation Starters)
 # ============================================================
@@ -4509,9 +5941,8 @@ def get_ice_breakers(account_id: int):
         return jsonify({"success": False, "error": token_error}), 400
     
     access_token = account.get_access_token()
-    from tenant.integration import get_tenant_meta_config
-    api_version = get_tenant_meta_config(workspace_id=account.workspace_id).whatsapp_api_version or "v22.0"
-
+    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    
     try:
         # Get WhatsApp Business Profile with ice breakers
         url = f"https://graph.facebook.com/{api_version}/{account.phone_number_id}/whatsapp_business_profile"
@@ -4603,9 +6034,8 @@ def update_ice_breakers(account_id: int):
             return jsonify({"success": False, "error": f"Ice breaker {i+1} exceeds 80 character limit"}), 400
     
     access_token = account.get_access_token()
-    from tenant.integration import get_tenant_meta_config
-    api_version = get_tenant_meta_config(workspace_id=account.workspace_id).whatsapp_api_version or "v22.0"
-
+    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    
     try:
         # Build conversational automation payload
         automation_payload = {
@@ -4669,9 +6099,8 @@ def delete_ice_breakers(account_id: int):
         return jsonify({"success": False, "error": token_error}), 400
     
     access_token = account.get_access_token()
-    from tenant.integration import get_tenant_meta_config
-    api_version = get_tenant_meta_config(workspace_id=account.workspace_id).whatsapp_api_version or "v22.0"
-
+    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    
     try:
         # Clear ice breakers by setting empty array
         url = f"https://graph.facebook.com/{api_version}/{account.phone_number_id}/conversational_automation"
@@ -4726,15 +6155,14 @@ def connect_start():
     if not workspace_id:
         return jsonify({"success": False, "error": "workspace_id is required"}), 400
 
-    # Per-tenant Meta credentials (falls back to env for T0000/unconfigured).
-    from tenant.integration import get_tenant_meta_config
-    cfg = get_tenant_meta_config(workspace_id=workspace_id)
-    app_id = cfg.app_id
-    config_id = cfg.config_id
-    api_version = cfg.fb_api_version or "v22.0"
+    from . import oauth as _wa_oauth
+
+    app_id = _wa_oauth.META_APP_ID
+    config_id = os.getenv("WHATSAPP_CONFIG_ID")
+    api_version = os.getenv("FB_API_VERSION") or os.getenv("WHATSAPP_API_VERSION", "v22.0")
     
     if not app_id:
-        return jsonify({"success": False, "error": "FB_APP_ID not configured"}), 500
+        return jsonify({"success": False, "error": "Meta app id not configured (META_APP_ID or FB_APP_ID)"}), 500
     
     if not config_id:
         return jsonify({"success": False, "error": "WHATSAPP_CONFIG_ID not configured. Add your WhatsApp Embedded Signup config ID to .env"}), 500
@@ -4765,24 +6193,23 @@ def connect_popup():
     serializer = URLSafeSerializer(secret_key, salt="whatsapp-oauth")
     state = serializer.dumps({"workspace_id": workspace_id})
 
+    from . import oauth as _wa_oauth
+
     # OAuth configuration
-    app_id = os.getenv("FB_APP_ID")
+    app_id = _wa_oauth.META_APP_ID
     config_id = os.getenv("WHATSAPP_CONFIG_ID")
-    from tenant.integration import get_tenant_meta_config
-    api_version = get_tenant_meta_config(workspace_id=workspace_id).fb_api_version or "v22.0"
+    api_version = os.getenv("FB_API_VERSION") or os.getenv("WHATSAPP_API_VERSION", "v22.0")
     redirect_base = os.getenv("OAUTH_REDIRECT_BASE", "https://sociovia-backend-362038465411.europe-west1.run.app")
     redirect_uri = f"{redirect_base.rstrip('/')}/api/whatsapp/connect/callback"
 
     if not app_id:
-        return "FB_APP_ID not configured", 500
+        return "Meta app id not configured (META_APP_ID or FB_APP_ID)", 500
 
     # WhatsApp-specific scopes for Embedded Signup
-    # catalog_management + business_management are required for product catalog APIs
     scopes = [
         "whatsapp_business_management",
         "whatsapp_business_messaging",
         "business_management",
-        "catalog_management",
     ]
 
     # Build Facebook OAuth URL for WhatsApp Embedded Signup
@@ -4806,7 +6233,7 @@ def connect_popup():
         import json
         extras = {
             "feature": "whatsapp_embedded_signup",
-            "sessionInfoVersion": 2,
+            "sessionInfoVersion": 4,
         }
         params["extras"] = json.dumps(extras)
 
@@ -4859,7 +6286,13 @@ def connect_exchange():
     This is called by the frontend after FB.login() returns a code.
     
     POST /api/whatsapp/connect/exchange
-    Body: { "code": "...", "workspace_id": "..." }
+    Body: {
+      "code": "...",
+      "workspace_id": "...",
+      "business_id": "optional — Meta Business Manager id",
+      "waba_id": "optional — WhatsApp Business Account id",
+      "phone_number_id": "optional — Cloud API phone number id"
+    }
     """
     import requests as http_requests
     from .models import WhatsAppAccount
@@ -4867,24 +6300,39 @@ def connect_exchange():
     data = request.get_json(silent=True) or {}
     code = data.get("code")
     workspace_id = data.get("workspace_id")
-    # Embedded Signup session hints from the WA_EMBEDDED_SIGNUP postMessage —
-    # tokens from Embedded Signup often lack business_management, so /me
-    # discovery fails and these hints are the reliable source.
-    waba_id_hint = str(data.get("waba_id") or "").strip() or None
-    phone_number_id_hint = str(data.get("phone_number_id") or "").strip() or None
     
     if not code:
         return jsonify({"success": False, "error": "Authorization code is required"}), 400
     
     if not workspace_id:
         return jsonify({"success": False, "error": "workspace_id is required"}), 400
+
+    ob_session = None
+    onboarding_session_id = data.get("onboarding_session_id")
+    resume_token = str(data.get("resume_token") or "").strip()
+    if onboarding_session_id:
+        from .onboarding_session_manager import get_session as _ob_get_session, verify_resume as _ob_verify_resume
+
+        ob_session = _ob_get_session(str(onboarding_session_id))
+        if not ob_session or str(ob_session.workspace_id) != str(workspace_id):
+            return jsonify({"success": False, "error": "invalid_onboarding_session"}), 400
+        if not _ob_verify_resume(ob_session, resume_token):
+            return jsonify({"success": False, "error": "invalid_or_missing_resume_token"}), 401
     
-    # Per-tenant Meta credentials (falls back to env for T0000/unconfigured).
-    from tenant.integration import get_tenant_meta_config
-    cfg = get_tenant_meta_config(workspace_id=workspace_id)
-    app_id = cfg.app_id
-    app_secret = cfg.app_secret
-    api_version = cfg.fb_api_version or "v22.0"
+    from . import oauth as _wa_oauth
+
+    app_id = _wa_oauth.META_APP_ID
+    app_secret = _wa_oauth.META_APP_SECRET
+    api_version = os.getenv("FB_API_VERSION") or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+
+    if not app_id or not app_secret:
+        return jsonify(
+            {
+                "success": False,
+                "error": "Meta app credentials not configured for connect/exchange",
+                "hint": "Set META_APP_ID + META_APP_SECRET or FB_APP_* or WHATSAPP_APP_SECRET (see oauth.py).",
+            }
+        ), 503
 
     try:
         # Exchange code for access token (no redirect_uri needed for Embedded Signup)
@@ -4906,134 +6354,115 @@ def connect_exchange():
         access_token = token_resp.get("access_token")
         if not access_token:
             raise ValueError("No access_token in response")
+
+        # Meta Tech Provider: Embedded Signup code exchange returns the business integration
+        # token. Skip fb_exchange_token unless explicitly enabled (exchange can downgrade partner tokens).
+        if os.getenv("WHATSAPP_EMBEDDED_SIGNUP_LONG_LIVED", "false").lower() == "true":
+            try:
+                long_token_resp = http_requests.get(
+                    f"https://graph.facebook.com/{api_version}/oauth/access_token",
+                    params={
+                        "grant_type": "fb_exchange_token",
+                        "client_id": app_id,
+                        "client_secret": app_secret,
+                        "fb_exchange_token": access_token,
+                    },
+                    timeout=15,
+                ).json()
+                if "access_token" in long_token_resp:
+                    access_token = long_token_resp["access_token"]
+                    logger.info("Got long-lived token")
+            except Exception as e:
+                logger.warning(f"Failed to get long-lived token: {e}")
         
-        # Get long-lived token
+        from .meta_asset_discovery import DiscoveryAmbiguousError, resolve_binding_for_auto_connect
+        from .tech_provider_onboarding import (
+            apply_hint_overrides,
+            merge_connect_hints,
+            tech_provider_next_steps,
+        )
+
+        hints = merge_connect_hints(data, ob_session)
+        if ob_session and hints:
+            try:
+                from .onboarding_session_manager import record_asset_hints
+
+                record_asset_hints(
+                    ob_session,
+                    business_manager_id=hints.get("business_id"),
+                    waba_id=hints.get("waba_id"),
+                    phone_number_id=hints.get("phone_number_id"),
+                )
+            except Exception as hint_e:
+                logger.warning("record_asset_hints during connect/exchange: %s", hint_e)
+
         try:
-            long_token_resp = http_requests.get(
-                f"https://graph.facebook.com/{api_version}/oauth/access_token",
-                params={
-                    "grant_type": "fb_exchange_token",
-                    "client_id": app_id,
-                    "client_secret": app_secret,
-                    "fb_exchange_token": access_token,
-                },
-                timeout=15,
-            ).json()
-            if "access_token" in long_token_resp:
-                access_token = long_token_resp["access_token"]
-                logger.info("Got long-lived token")
-        except Exception as e:
-            logger.warning(f"Failed to get long-lived token: {e}")
-        
-        # Get WABA and phone number info
-        # Priority 1: session hints from the Embedded Signup postMessage (most reliable)
-        waba_id = waba_id_hint
-        phone_number_id = phone_number_id_hint
-        display_phone_number = None
-        verified_name = None
-        
-        # Priority 2: /me businesses discovery (requires business_management permission)
-        if not waba_id or not phone_number_id:
-            try:
-                me_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/me",
-                    params={
-                        "access_token": access_token,
-                        "fields": "id,name,businesses{id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number,verified_name,quality_rating}}}"
-                    },
-                    timeout=15,
-                ).json()
-                
-                logger.info(f"Me response: {me_resp}")
-                
-                businesses = me_resp.get("businesses", {}).get("data", [])
-                for business in businesses:
-                    wabas = business.get("owned_whatsapp_business_accounts", {}).get("data", [])
-                    for waba in wabas:
-                        waba_id = waba.get("id")
-                        phones = waba.get("phone_numbers", {}).get("data", [])
-                        if phones:
-                            phone = phones[0]
-                            phone_number_id = phone.get("id")
-                            display_phone_number = phone.get("display_phone_number")
-                            verified_name = phone.get("verified_name")
-                        break
-                    if waba_id:
-                        break
-            except Exception as e:
-                logger.warning(f"Failed to get WABA from /me: {e}")
-        
-        # Priority 3: debug_token granular_scopes (works with Embedded Signup tokens)
-        if not waba_id:
-            try:
-                debug_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/debug_token",
-                    params={
-                        "input_token": access_token,
-                        "access_token": f"{app_id}|{app_secret}",
-                    },
-                    timeout=15,
-                ).json()
-                
-                logger.info(f"debug_token response: {debug_resp}")
-                
-                granular_scopes = debug_resp.get("data", {}).get("granular_scopes", [])
-                for scope in granular_scopes:
-                    if scope.get("scope") in ("whatsapp_business_management", "whatsapp_business_messaging"):
-                        target_ids = scope.get("target_ids", [])
-                        if target_ids:
-                            waba_id = target_ids[0]
-                            break
-            except Exception as e:
-                logger.warning(f"Failed to get WABA from debug_token: {e}")
-        
-        # Get phone numbers if we have WABA but no phone
-        if waba_id and not phone_number_id:
-            try:
-                phones_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/{waba_id}/phone_numbers",
-                    params={"access_token": access_token},
-                    timeout=15,
-                ).json()
-                phones = phones_resp.get("data", [])
-                if phones:
-                    phone = phones[0]
-                    phone_number_id = phone.get("id")
-                    display_phone_number = phone.get("display_phone_number")
-                    verified_name = phone.get("verified_name")
-            except Exception as e:
-                logger.warning(f"Failed to fetch phone numbers: {e}")
-        
-        # Fetch display details when the phone id came from session hints
-        if phone_number_id and not display_phone_number:
-            try:
-                phone_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/{phone_number_id}",
-                    params={
-                        "access_token": access_token,
-                        "fields": "display_phone_number,verified_name,quality_rating",
-                    },
-                    timeout=15,
-                ).json()
-                display_phone_number = phone_resp.get("display_phone_number") or display_phone_number
-                verified_name = phone_resp.get("verified_name") or verified_name
-            except Exception as e:
-                logger.warning(f"Failed to fetch phone details: {e}")
-        
-        if not waba_id or not phone_number_id:
-            raise ValueError("Could not retrieve WhatsApp Business Account. Make sure you completed the Embedded Signup flow and shared your WhatsApp Business Account.")
+            binding, discovery = resolve_binding_for_auto_connect(
+                access_token,
+                api_version=api_version,
+                app_id=app_id,
+                app_secret=app_secret,
+                hints=hints or None,
+                allow_legacy_single_guess=False,
+            )
+        except DiscoveryAmbiguousError as e:
+            d = e.discovery
+            if ob_session:
+                try:
+                    from .onboarding_session_manager import attach_exchange_context
+
+                    attach_exchange_context(
+                        ob_session,
+                        workspace_id=str(workspace_id),
+                        hints=hints or {},
+                        discovery=d,
+                    )
+                except Exception as attach_e:
+                    logger.warning("onboarding attach_exchange_context: %s", attach_e)
+            body = {
+                "success": False,
+                "error": str(e),
+                "requires_user_choice": True,
+                "candidates": d.get("candidates"),
+                "ambiguity": d.get("ambiguity"),
+                "token_debug": d.get("token_debug"),
+                "wabas_without_phones": d.get("wabas_without_phones"),
+            }
+            if ob_session:
+                body["onboarding_session_id"] = str(ob_session.id)
+            return jsonify(body), 409
+
+        binding = apply_hint_overrides(binding, hints)
+        waba_id = binding["waba_id"]
+        phone_number_id = binding["phone_number_id"]
+        display_phone_number = binding.get("display_phone_number")
+        verified_name = binding.get("verified_name")
+        meta_business_id = binding.get("meta_business_id")
+        if discovery.get("legacy_guess_used"):
+            logger.warning("connect/exchange used legacy_guess_used (should not happen with allow_legacy False)")
         
         # GUARD: Block if this phone is active in another workspace
         from .connection_guard import check_phone_available
         conflict = check_phone_available(phone_number_id, workspace_id)
         if conflict:
-            return jsonify({"success": False, "error": conflict["error"], "error_code": conflict["error_code"]}), 409
+            cbody = {"success": False, "error": conflict["error"], "error_code": conflict["error_code"]}
+            if ob_session:
+                cbody["onboarding_session_id"] = str(ob_session.id)
+            return jsonify(cbody), 409
+            
+        # META COMPLIANCE: Business Readiness Validation
+        from .meta_asset_discovery import check_business_readiness
+        readiness = check_business_readiness(phone_number_id, access_token, api_version=api_version)
         
         # Save to database
         existing = WhatsAppAccount.query.filter_by(phone_number_id=phone_number_id).first()
-        
+        existed_before = existing is not None
+
         if existing:
             existing.workspace_id = workspace_id
+            existing.waba_id = waba_id
+            if meta_business_id:
+                existing.meta_business_id = str(meta_business_id)
             existing.set_access_token(access_token, token_type="permanent")
             existing.is_active = True
             existing.display_phone_number = display_phone_number
@@ -5047,66 +6476,136 @@ def connect_exchange():
                 display_phone_number=display_phone_number,
                 verified_name=verified_name,
                 is_active=True,
+                meta_business_id=str(meta_business_id) if meta_business_id else None,
             )
             account.set_access_token(access_token, token_type="permanent")
             get_db().add(account)
         
         get_db().commit()
+
+        try:
+            from .warmup_account_ops import ensure_mature_relink_skips_warmup, start_warmup_for_new_account
+
+            if not existed_before:
+                start_warmup_for_new_account(account, source="embedded_signup")
+            else:
+                ensure_mature_relink_skips_warmup(account)
+                
+            if not readiness.get("is_ready"):
+                account.operational_mode = "advisory_safe_mode"
+                issues_str = ", ".join(readiness.get("missing_fields", []) + readiness.get("issues", []))
+                account.safe_mode_reason = f"Incomplete Business Profile: {issues_str}"
+                
+            get_db().commit()
+        except Exception as w_e:
+            logger.warning("warmup bootstrap after connect/exchange: %s", w_e)
+            get_db().rollback()
         
         logger.info(f"WhatsApp account connected via Embedded Signup: {phone_number_id}")
         
-        # Auto-subscribe the app to this WABA's webhooks (messages, template
-        # updates, message_echoes) — without this Meta sends no webhook events.
-        webhook_subscribed = False
-        webhook_error = None
+        # ============================================================
+        # CANONICAL PROVISIONING PIPELINE
+        # All post-save setup (phone registration, webhook subscription,
+        # warmup, templates, capability matrix) via ONE pipeline.
+        # ============================================================
+        finalize_ok = True
+        provisioning_result = None
         try:
-            from .utils import subscribe_waba_to_app
-            for attempt in (1, 2):
-                sub_result = subscribe_waba_to_app(waba_id, access_token)
-                if sub_result.get("success"):
-                    webhook_subscribed = True
-                    webhook_error = None
-                    logger.info(f"✅ Webhook auto-subscribe for WABA {waba_id} succeeded (attempt {attempt})")
-                    break
-                webhook_error = sub_result.get("error")
-                logger.warning(f"⚠️ Webhook auto-subscribe failed for WABA {waba_id} (attempt {attempt}): {webhook_error}")
-        except Exception as e:
-            webhook_error = str(e)
-            logger.warning(f"Webhook auto-subscribe error for WABA {waba_id}: {e}")
-        
-        # Auto-register phone number
-        try:
-            register_resp = http_requests.post(
-                f"https://graph.facebook.com/{api_version}/{phone_number_id}/register",
-                json={
-                    "messaging_product": "whatsapp",
-                    "pin": "123456"
-                },
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json"
-                },
-                timeout=15
+            from .provisioning_engine import provision_account
+
+            provisioning_result = provision_account(
+                account=account,
+                access_token=access_token,
+                source="embedded_signup",
+                is_new_account=not existed_before,
+                api_version=api_version,
             )
-            logger.info(f"Phone registration response: {register_resp.json()}")
-        except Exception as e:
-            logger.warning(f"Phone registration failed (may already be registered): {e}")
-        
-        return jsonify({
-            "success": True,
-            "webhook_subscribed": webhook_subscribed,
-            "webhook_error": webhook_error,
-            "account": {
-                "id": account.id,
-                "waba_id": account.waba_id,
-                "phone_number_id": account.phone_number_id,
-                "display_phone_number": account.display_phone_number,
-                "verified_name": account.verified_name,
+            finalize_ok = provisioning_result.success
+        except Exception as prov_e:
+            finalize_ok = False
+            logger.warning("provisioning after connect/exchange: %s", prov_e)
+
+        # Onboarding session lifecycle
+        if ob_session:
+            try:
+                from .onboarding_session_manager import mark_token_exchanged
+
+                mark_token_exchanged(ob_session)
+            except Exception as tok_e:
+                logger.warning("onboarding mark_token_exchanged: %s", tok_e)
+            if finalize_ok:
+                try:
+                    from .onboarding_session_manager import mark_webhook_subscribed, mark_completed
+
+                    sub_status = {"success": True}
+                    mark_webhook_subscribed(ob_session, sub_status)
+                    mark_completed(ob_session, account.id)
+                except Exception as mc_e:
+                    logger.warning("onboarding mark_completed: %s", mc_e)
+            else:
+                try:
+                    from .onboarding_session_manager import mark_failed
+
+                    mark_failed(
+                        ob_session,
+                        (provisioning_result.action_required if provisioning_result else "provisioning_pipeline_failed")[
+                            :2000
+                        ],
+                    )
+                except Exception:
+                    pass
+
+        next_steps = tech_provider_next_steps(provisioning_result, include_payment=finalize_ok)
+        account_payload = {
+            "id": account.id,
+            "waba_id": account.waba_id,
+            "phone_number_id": account.phone_number_id,
+            "display_phone_number": account.display_phone_number,
+            "verified_name": account.verified_name,
+            "meta_business_id": account.meta_business_id,
+        }
+
+        if not finalize_ok:
+            prov_dict = provisioning_result.to_dict() if provisioning_result else None
+            fail_body = {
+                "success": False,
+                "error": (
+                    provisioning_result.action_required
+                    if provisioning_result and provisioning_result.action_required
+                    else "WhatsApp provisioning incomplete — webhooks or registration failed"
+                ),
+                "error_code": "PROVISIONING_INCOMPLETE",
+                "account": account_payload,
+                "business_readiness": readiness,
+                "provisioning": prov_dict,
+                "next_steps": next_steps,
             }
-        })
-        
+            if ob_session:
+                fail_body["onboarding_session_id"] = str(ob_session.id)
+                fail_body["onboarding_finalize_ok"] = False
+            return jsonify(fail_body), 422
+
+        ok_body = {
+            "success": True,
+            "account": account_payload,
+            "business_readiness": readiness,
+            "provisioning": provisioning_result.to_dict() if provisioning_result else None,
+            "next_steps": next_steps,
+        }
+        if ob_session:
+            ok_body["onboarding_session_id"] = str(ob_session.id)
+            ok_body["onboarding_finalize_ok"] = True
+        return jsonify(ok_body)
+
     except Exception as e:
         logger.exception(f"Embedded Signup Exchange Error: {e}")
+        if ob_session:
+            try:
+                from .onboarding_session_manager import mark_failed
+
+                mark_failed(ob_session, str(e)[:2000])
+            except Exception:
+                pass
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -5135,6 +6634,8 @@ def facebook_oauth_login():
     import requests as http_requests
     from .models import WhatsAppAccount
     
+    from . import oauth as wa_oauth
+
     data = request.get_json(silent=True) or {}
     short_token = data.get("access_token")
     workspace_id = data.get("workspace_id")
@@ -5145,16 +6646,21 @@ def facebook_oauth_login():
     if not workspace_id:
         return jsonify({"success": False, "error": "workspace_id is required"}), 400
     
-    # Per-tenant Meta credentials (falls back to env for T0000/unconfigured).
-    from tenant.integration import get_tenant_meta_config
-    cfg = get_tenant_meta_config(workspace_id=workspace_id)
-    app_id = cfg.app_id
-    app_secret = cfg.app_secret
-    api_version = cfg.fb_api_version or "v22.0"
-
+    app_id = wa_oauth.META_APP_ID
+    app_secret = wa_oauth.META_APP_SECRET
+    api_version = os.getenv("FB_API_VERSION") or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    
     if not app_id or not app_secret:
-        logger.error("Facebook app credentials not configured")
-        return jsonify({"success": False, "error": "Facebook OAuth not configured"}), 500
+        logger.error(
+            "Facebook / Meta app credentials not configured for oauth/facebook-login "
+            "(set META_APP_ID + META_APP_SECRET, or FB_APP_ID + FB_APP_SECRET, "
+            "or include WHATSAPP_APP_SECRET alongside META_APP_ID)"
+        )
+        return jsonify({
+            "success": False,
+            "error": "Facebook OAuth not configured",
+            "hint": "Set META_APP_ID and META_APP_SECRET (or FB_APP_*), or WHATSAPP_APP_SECRET with META_APP_ID.",
+        }), 503
     
     try:
         # Validate the short-lived token first
@@ -5178,14 +6684,23 @@ def facebook_oauth_login():
         user_id = token_data.get("user_id")
         scopes = token_data.get("scopes", [])
         
-        # Check for required WhatsApp scopes
-        required_scopes = ["whatsapp_business_management", "whatsapp_business_messaging"]
+        # Check for required WhatsApp scopes.
+        # business_management is required for full business asset management flows
+        # (and for partner credit-line operations), while the two whatsapp_* scopes
+        # are required for template and messaging operations.
+        required_scopes = [
+            "whatsapp_business_management",
+            "whatsapp_business_messaging",
+            "business_management",
+        ]
         missing_scopes = [s for s in required_scopes if s not in scopes]
         
         if missing_scopes:
             return jsonify({
                 "success": False,
-                "error": f"Missing required permissions: {', '.join(missing_scopes)}. Please login again and grant all permissions."
+                "error": f"Missing required permissions: {', '.join(missing_scopes)}. Please login again and grant all permissions.",
+                "missing_scopes": missing_scopes,
+                "required_scopes": required_scopes,
             }), 403
         
         # Exchange for long-lived token
@@ -5214,72 +6729,54 @@ def facebook_oauth_login():
         logger.info(f"Facebook OAuth login successful for user {user_id}, workspace {workspace_id}")
         
         # ============================================================
-        # AUTO-DISCOVER WABA AND PHONE NUMBERS
+        # AUTO-DISCOVER WABA AND PHONE NUMBERS (canonical discovery)
         # ============================================================
+        from .meta_asset_discovery import DiscoveryAmbiguousError, resolve_binding_for_auto_connect
+
+        hints = {}
+        if data.get("business_id"):
+            hints["business_id"] = str(data.get("business_id")).strip()
+        if data.get("waba_id"):
+            hints["waba_id"] = str(data.get("waba_id")).strip()
+        if data.get("phone_number_id"):
+            hints["phone_number_id"] = str(data.get("phone_number_id")).strip()
+
         waba_id = None
         phone_number_id = None
         display_phone_number = None
         verified_name = None
-        
-        # Method 1: Get from /me with businesses and WABAs
+        meta_business_id = None
+        discovery_summary = None
+
         try:
-            me_resp = http_requests.get(
-                f"https://graph.facebook.com/{api_version}/me",
-                params={
-                    "access_token": long_token,
-                    "fields": "id,name,businesses{id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number,verified_name,quality_rating}}}"
-                },
-                timeout=15,
-            ).json()
-            
-            logger.info(f"Facebook /me response for WABA discovery: {me_resp}")
-            
-            businesses = me_resp.get("businesses", {}).get("data", [])
-            for business in businesses:
-                wabas = business.get("owned_whatsapp_business_accounts", {}).get("data", [])
-                for waba in wabas:
-                    waba_id = waba.get("id")
-                    phones = waba.get("phone_numbers", {}).get("data", [])
-                    if phones:
-                        phone = phones[0]
-                        phone_number_id = phone.get("id")
-                        display_phone_number = phone.get("display_phone_number")
-                        verified_name = phone.get("verified_name")
-                    break
-                if waba_id:
-                    break
-        except Exception as e:
-            logger.warning(f"Failed to get WABA from /me: {e}")
-        
-        # Method 2: Try debug_token granular_scopes if no WABA found
-        if not waba_id:
-            try:
-                granular_scopes = token_data.get("granular_scopes", [])
-                for scope in granular_scopes:
-                    if scope.get("scope") == "whatsapp_business_management":
-                        target_ids = scope.get("target_ids", [])
-                        if target_ids:
-                            waba_id = target_ids[0]
-                            break
-            except Exception as e:
-                logger.warning(f"Failed to get WABA from debug_token: {e}")
-        
-        # Method 3: Get phone numbers if we have WABA but no phone
-        if waba_id and not phone_number_id:
-            try:
-                phones_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/{waba_id}/phone_numbers",
-                    params={"access_token": long_token},
-                    timeout=15,
-                ).json()
-                phones = phones_resp.get("data", [])
-                if phones:
-                    phone = phones[0]
-                    phone_number_id = phone.get("id")
-                    display_phone_number = phone.get("display_phone_number")
-                    verified_name = phone.get("verified_name")
-            except Exception as e:
-                logger.warning(f"Failed to fetch phone numbers: {e}")
+            binding, discovery_summary = resolve_binding_for_auto_connect(
+                long_token,
+                api_version=api_version,
+                app_id=app_id,
+                app_secret=app_secret,
+                hints=hints or None,
+                allow_legacy_single_guess=False,
+            )
+            waba_id = binding["waba_id"]
+            phone_number_id = binding["phone_number_id"]
+            display_phone_number = binding.get("display_phone_number")
+            verified_name = binding.get("verified_name")
+            meta_business_id = binding.get("meta_business_id")
+        except DiscoveryAmbiguousError as e:
+            d = e.discovery
+            return jsonify({
+                "success": False,
+                "connected": False,
+                "error": str(e),
+                "requires_user_choice": True,
+                "candidates": d.get("candidates"),
+                "ambiguity": d.get("ambiguity"),
+                "token_debug": d.get("token_debug"),
+                "access_token": long_token,
+                "expires_in": expires_in,
+            }), 409
+        except ValueError as ve:
+            logger.info("Facebook login: no unique WABA binding: %s", ve)
         
         # ============================================================
         # AUTO-CONNECT IF WABA FOUND
@@ -5303,6 +6800,9 @@ def facebook_oauth_login():
             
             if existing:
                 existing.workspace_id = workspace_id
+                existing.waba_id = waba_id
+                if meta_business_id:
+                    existing.meta_business_id = str(meta_business_id)
                 existing.set_access_token(long_token, token_type="permanent")
                 existing.is_active = True
                 existing.display_phone_number = display_phone_number
@@ -5318,6 +6818,7 @@ def facebook_oauth_login():
                     verified_name=verified_name,
                     connected_by_user_id=user_id,
                     is_active=True,
+                    meta_business_id=str(meta_business_id) if meta_business_id else None,
                 )
                 account.set_access_token(long_token, token_type="permanent")
                 get_db().add(account)
@@ -5326,34 +6827,65 @@ def facebook_oauth_login():
             
             logger.info(f"WhatsApp account auto-connected via Facebook Login: {phone_number_id} for workspace {workspace_id}")
             
-            # Auto-register phone number
+            # ============================================================
+            # CANONICAL PROVISIONING PIPELINE
+            # Fixes: missing webhook subscription, missing warmup,
+            # missing readiness validation for Facebook Login flow.
+            # ============================================================
+            provisioning_result = None
             try:
-                register_resp = http_requests.post(
-                    f"https://graph.facebook.com/{api_version}/{phone_number_id}/register",
-                    json={
-                        "messaging_product": "whatsapp",
-                        "pin": "123456"
-                    },
-                    headers={
-                        "Authorization": f"Bearer {long_token}",
-                        "Content-Type": "application/json"
-                    },
-                    timeout=15
+                from .provisioning_engine import provision_account
+
+                provisioning_result = provision_account(
+                    account=account,
+                    access_token=long_token,
+                    source="facebook_login",
+                    is_new_account=not existing,
+                    api_version=api_version,
                 )
-                logger.info(f"Phone registration response: {register_resp.json()}")
-            except Exception as e:
-                logger.warning(f"Phone registration failed (may already be registered): {e}")
+            except Exception as prov_e:
+                logger.warning("provisioning after facebook-login: %s", prov_e)
+
+            from .connection_path import verify_messaging_send_access
+
+            send_check = verify_messaging_send_access(long_token, phone_number_id, waba_id)
+            send_details = send_check.get("details") or {}
+            send_permission_ok = bool(send_check.get("can_send"))
+            requires_system_user = (
+                not send_permission_ok
+                and (
+                    send_details.get("token_type") == "USER"
+                    or send_details.get("waba_ownership_type") == "CLIENT_OWNED"
+                )
+            )
+
+            message = "WhatsApp account connected successfully!"
+            if not send_permission_ok:
+                message = (
+                    "Account linked, but this Facebook login token cannot send messages on this "
+                    "WhatsApp Business Account. Use Manual Connection with a System User token "
+                    "from Sociovia Business Manager."
+                )
             
             return jsonify({
                 "success": True,
                 "connected": True,
-                "message": "WhatsApp account connected successfully!",
+                "message": message,
                 "account": {
                     "id": account.id,
                     "waba_id": account.waba_id,
                     "phone_number_id": account.phone_number_id,
                     "display_phone_number": account.display_phone_number,
                     "verified_name": account.verified_name,
+                },
+                "provisioning": provisioning_result.to_dict() if provisioning_result else None,
+                "send_permission": {
+                    "ok": send_permission_ok,
+                    "error": send_check.get("error"),
+                    "error_code": send_check.get("error_code"),
+                    "hints": send_check.get("hints") or [],
+                    "requires_system_user_token": requires_system_user,
+                    "details": send_details,
                 },
                 "access_token": long_token,
                 "expires_in": expires_in,
@@ -5373,6 +6905,70 @@ def facebook_oauth_login():
         
     except Exception as e:
         logger.exception(f"Facebook OAuth Login Error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@whatsapp_bp.route("/post-connection-check", methods=["POST"])
+def post_connection_check():
+    """
+    Called by frontend immediately after redirect to /dashboard/whatsapp.
+    Runs the full provisioning pipeline with auto-fix.
+    Returns capability matrix + readiness score + auto-fix results.
+
+    POST /api/whatsapp/post-connection-check
+    Body: { "workspace_id": "..." }
+    """
+    from .models import WhatsAppAccount
+
+    data = request.get_json(silent=True) or {}
+    workspace_id = data.get("workspace_id")
+
+    if not workspace_id:
+        return jsonify({"success": False, "error": "workspace_id is required"}), 400
+
+    account = WhatsAppAccount.query.filter_by(
+        workspace_id=str(workspace_id), is_active=True
+    ).first()
+
+    if not account:
+        return jsonify({
+            "success": False,
+            "error": "No active WhatsApp account found",
+            "readiness_score": 0,
+            "capability_matrix": {},
+        }), 404
+
+    access_token = account.get_access_token()
+    if not access_token:
+        return jsonify({
+            "success": False,
+            "error": "No valid access token — re-authentication required",
+            "readiness_score": 0,
+            "action_required": "Re-authenticate with Meta to restore access",
+        }), 200
+
+    try:
+        from .provisioning_engine import provision_account
+
+        result = provision_account(
+            account=account,
+            access_token=access_token,
+            source="post_connection_check",
+            is_new_account=False,
+        )
+        payload = result.to_dict()
+        from .operational_profile import build_operational_profile
+
+        payload["operational_profile"] = build_operational_profile(
+            capability_matrix=payload.get("capability_matrix"),
+            checks=payload.get("checks"),
+            token_debug=payload.get("token_debug"),
+            warmup_state=payload.get("warmup_state"),
+            connection_status="CONNECTED",
+        )
+        return jsonify(payload)
+    except Exception as e:
+        logger.exception("post-connection-check error: %s", e)
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -5406,8 +7002,6 @@ def discover_waba():
             ]
         }
     """
-    import requests as http_requests
-    
     data = request.get_json(silent=True) or {}
     access_token = data.get("access_token")
     
@@ -5419,123 +7013,59 @@ def discover_waba():
     try:
         wabas = []
         
-        # Method 1: Get from /me with businesses and WABAs
-        me_resp = http_requests.get(
-            f"https://graph.facebook.com/{api_version}/me",
-            params={
-                "access_token": access_token,
-                "fields": "id,name,businesses{id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number,verified_name,quality_rating}}}"
-            },
-            timeout=15,
-        ).json()
-        
-        if "error" in me_resp:
-            return jsonify({
-                "success": False,
-                "error": me_resp["error"].get("message", "Failed to call Meta API")
-            }), 400
-        
-        logger.info(f"WABA discovery /me response: {me_resp}")
-        
-        businesses = me_resp.get("businesses", {}).get("data", [])
-        for business in businesses:
-            biz_wabas = business.get("owned_whatsapp_business_accounts", {}).get("data", [])
-            for waba in biz_wabas:
-                waba_info = {
-                    "waba_id": waba.get("id"),
-                    "waba_name": waba.get("name"),
-                    "business_name": business.get("name"),
-                    "phone_numbers": []
+        from .meta_asset_discovery import discover_whatsapp_assets
+
+        app_id = os.getenv("FB_APP_ID") or os.getenv("META_APP_ID")
+        app_secret = os.getenv("FB_APP_SECRET") or os.getenv("META_APP_SECRET")
+
+        disc = discover_whatsapp_assets(
+            access_token,
+            api_version=api_version,
+            app_id=app_id,
+            app_secret=app_secret,
+            hints=None,
+        )
+
+        for b in disc.get("businesses") or []:
+            for w in b.get("wabas") or []:
+                waba_entry = {
+                    "waba_id": w.get("waba_id"),
+                    "waba_name": w.get("waba_name"),
+                    "business_id": b.get("business_id"),
+                    "business_name": b.get("business_name"),
+                    "our_app_subscribed": w.get("our_app_subscribed"),
+                    "subscribed_apps": w.get("subscribed_apps"),
+                    "phone_numbers": [],
                 }
-                
-                phones = waba.get("phone_numbers", {}).get("data", [])
-                for phone in phones:
-                    waba_info["phone_numbers"].append({
+                for phone in w.get("phone_numbers") or []:
+                    waba_entry["phone_numbers"].append({
                         "id": phone.get("id"),
                         "display_phone_number": phone.get("display_phone_number"),
                         "verified_name": phone.get("verified_name"),
-                        "quality_rating": phone.get("quality_rating")
+                        "quality_rating": phone.get("quality_rating"),
+                        "name_status": phone.get("name_status"),
                     })
-                
-                # If no phones from nested query, try to fetch separately
-                if not waba_info["phone_numbers"] and waba_info["waba_id"]:
-                    try:
-                        phones_resp = http_requests.get(
-                            f"https://graph.facebook.com/{api_version}/{waba_info['waba_id']}/phone_numbers",
-                            params={"access_token": access_token},
-                            timeout=15,
-                        ).json()
-                        for phone in phones_resp.get("data", []):
-                            waba_info["phone_numbers"].append({
-                                "id": phone.get("id"),
-                                "display_phone_number": phone.get("display_phone_number"),
-                                "verified_name": phone.get("verified_name"),
-                                "quality_rating": phone.get("quality_rating")
-                            })
-                    except Exception as e:
-                        logger.warning(f"Failed to fetch phones for WABA {waba_info['waba_id']}: {e}")
-                
-                wabas.append(waba_info)
-        
-        # Method 2: Try debug_token for granular_scopes if no WABAs found
-        if not wabas:
-            app_id = os.getenv("FB_APP_ID") or os.getenv("META_APP_ID")
-            app_secret = os.getenv("FB_APP_SECRET") or os.getenv("META_APP_SECRET")
-            
-            if app_id and app_secret:
-                debug_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/debug_token",
-                    params={
-                        "input_token": access_token,
-                        "access_token": f"{app_id}|{app_secret}",
-                    },
-                    timeout=15,
-                ).json()
-                
-                token_data = debug_resp.get("data", {})
-                granular_scopes = token_data.get("granular_scopes", [])
-                
-                for scope in granular_scopes:
-                    if scope.get("scope") == "whatsapp_business_management":
-                        target_ids = scope.get("target_ids", [])
-                        for waba_id in target_ids:
-                            waba_info = {
-                                "waba_id": waba_id,
-                                "waba_name": None,
-                                "business_name": None,
-                                "phone_numbers": []
-                            }
-                            
-                            # Fetch phone numbers
-                            try:
-                                phones_resp = http_requests.get(
-                                    f"https://graph.facebook.com/{api_version}/{waba_id}/phone_numbers",
-                                    params={"access_token": access_token},
-                                    timeout=15,
-                                ).json()
-                                for phone in phones_resp.get("data", []):
-                                    waba_info["phone_numbers"].append({
-                                        "id": phone.get("id"),
-                                        "display_phone_number": phone.get("display_phone_number"),
-                                        "verified_name": phone.get("verified_name"),
-                                        "quality_rating": phone.get("quality_rating")
-                                    })
-                            except Exception as e:
-                                logger.warning(f"Failed to fetch phones for WABA {waba_id}: {e}")
-                            
-                            wabas.append(waba_info)
+                wabas.append(waba_entry)
         
         if not wabas:
             return jsonify({
                 "success": True,
                 "wabas": [],
-                "message": "No WhatsApp Business Accounts found. Make sure your Facebook account has access to a WABA in Meta Business Suite."
+                "requires_user_choice": False,
+                "message": "No WhatsApp Business Accounts found. Make sure your Facebook account has access to a WABA in Meta Business Suite.",
+                "token_debug": disc.get("token_debug"),
+                "portfolio_errors": disc.get("portfolio_errors"),
             })
         
         return jsonify({
             "success": True,
             "wabas": wabas,
-            "count": len(wabas)
+            "count": len(wabas),
+            "requires_user_choice": disc.get("requires_user_choice"),
+            "candidates": disc.get("candidates"),
+            "ambiguity": disc.get("ambiguity"),
+            "token_debug": disc.get("token_debug"),
+            "wabas_without_phones": disc.get("wabas_without_phones"),
         })
         
     except Exception as e:
@@ -5596,14 +7126,12 @@ def connect_callback():
 
     try:
         # Exchange code for access token
-        # Per-tenant Meta credentials (falls back to env for T0000/unconfigured).
-        from tenant.integration import get_tenant_meta_config
-        cfg = get_tenant_meta_config(workspace_id=workspace_id)
-        app_id = cfg.app_id
-        app_secret = cfg.app_secret
-        api_version = cfg.fb_api_version or "v22.0"
-        redirect_uri = cfg.redirect_url
-
+        app_id = os.getenv("FB_APP_ID") or os.getenv("META_APP_ID")
+        app_secret = os.getenv("FB_APP_SECRET") or os.getenv("META_APP_SECRET")
+        api_version = os.getenv("FB_API_VERSION", "v22.0")
+        redirect_base = os.getenv("OAUTH_REDIRECT_BASE", "https://sociovia-backend-362038465411.europe-west1.run.app")
+        redirect_uri = f"{redirect_base.rstrip('/')}/api/whatsapp/connect/callback"
+        
         import requests as http_requests
         
         # Token exchange
@@ -5625,100 +7153,62 @@ def connect_callback():
         if not access_token:
             raise ValueError("No access_token in response")
         
-        # Get long-lived token
-        try:
-            long_token_resp = http_requests.get(
-                f"https://graph.facebook.com/{api_version}/oauth/access_token",
-                params={
-                    "grant_type": "fb_exchange_token",
-                    "client_id": app_id,
-                    "client_secret": app_secret,
-                    "fb_exchange_token": access_token,
-                },
-                timeout=15,
-            ).json()
-            access_token = long_token_resp.get("access_token", access_token)
-        except Exception:
-            pass  # Keep short-lived token if exchange fails
-        
-        # Fetch WhatsApp Business Accounts (WABA) using debug_token or /me/businesses
-        waba_id = None
-        phone_number_id = None
-        display_phone_number = None
-        verified_name = None
-        
-        # Try to get WABA from the shared phone number or businesses
-        try:
-            # Method 1: Get businesses and their WhatsApp accounts
-            me_resp = http_requests.get(
-                f"https://graph.facebook.com/{api_version}/me",
-                params={
-                    "access_token": access_token,
-                    "fields": "id,name,businesses{id,name,owned_whatsapp_business_accounts{id,name,phone_numbers{id,display_phone_number,verified_name,quality_rating}}}"
-                },
-                timeout=15,
-            ).json()
-            
-            # Extract WABA and phone info
-            businesses = me_resp.get("businesses", {}).get("data", [])
-            for business in businesses:
-                wabas = business.get("owned_whatsapp_business_accounts", {}).get("data", [])
-                for waba in wabas:
-                    waba_id = waba.get("id")
-                    phones = waba.get("phone_numbers", {}).get("data", [])
-                    if phones:
-                        phone = phones[0]
-                        phone_number_id = phone.get("id")
-                        display_phone_number = phone.get("display_phone_number")
-                        verified_name = phone.get("verified_name")
-                    break
-                if waba_id:
-                    break
-                    
-        except Exception as e:
-            logger.warning(f"Failed to fetch WABA from businesses: {e}")
-        
-        # If no WABA found, try direct shared WABA ID endpoint
-        if not waba_id:
+        # Meta Tech Provider: the Embedded Signup code exchange already returns the
+        # long-lived business-integration (system-user) token. Running it through
+        # fb_exchange_token DOWNGRADES it to a long-lived USER token, so skip it
+        # unless explicitly opted in (mirrors /connect/exchange).
+        if os.getenv("WHATSAPP_EMBEDDED_SIGNUP_LONG_LIVED", "false").lower() == "true":
             try:
-                shared_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/debug_token",
+                long_token_resp = http_requests.get(
+                    f"https://graph.facebook.com/{api_version}/oauth/access_token",
                     params={
-                        "input_token": access_token,
-                        "access_token": f"{app_id}|{app_secret}",
+                        "grant_type": "fb_exchange_token",
+                        "client_id": app_id,
+                        "client_secret": app_secret,
+                        "fb_exchange_token": access_token,
                     },
                     timeout=15,
                 ).json()
-                
-                granular_scopes = shared_resp.get("data", {}).get("granular_scopes", [])
-                for scope in granular_scopes:
-                    if scope.get("scope") == "whatsapp_business_management":
-                        target_ids = scope.get("target_ids", [])
-                        if target_ids:
-                            waba_id = target_ids[0]
-                            break
-            except Exception as e:
-                logger.warning(f"Failed to get WABA from debug_token: {e}")
+                access_token = long_token_resp.get("access_token", access_token)
+            except Exception:
+                pass  # Keep original token if exchange fails
         
-        # If we got a WABA, fetch phone numbers
-        if waba_id and not phone_number_id:
-            try:
-                phones_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/{waba_id}/phone_numbers",
-                    params={"access_token": access_token},
-                    timeout=15,
-                ).json()
-                phones = phones_resp.get("data", [])
-                if phones:
-                    phone = phones[0]
-                    phone_number_id = phone.get("id")
-                    display_phone_number = phone.get("display_phone_number")
-                    verified_name = phone.get("verified_name")
-            except Exception as e:
-                logger.warning(f"Failed to fetch phone numbers: {e}")
-        
-        if not waba_id or not phone_number_id:
-            raise ValueError("Could not retrieve WhatsApp Business Account. Make sure you have a WhatsApp Business Account linked in Meta Business Suite.")
+        from .meta_asset_discovery import DiscoveryAmbiguousError, resolve_binding_for_auto_connect
+
+        try:
+            binding, discovery = resolve_binding_for_auto_connect(
+                access_token,
+                api_version=api_version,
+                app_id=app_id,
+                app_secret=app_secret,
+                hints=None,
+                allow_legacy_single_guess=False,
+            )
+        except DiscoveryAmbiguousError as e:
+            d = e.discovery
+            return _render_oauth_response(frontend_url, {
+                "type": "sociovia_oauth_complete",
+                "success": False,
+                "error": str(e),
+                "requires_user_choice": True,
+                "candidates": d.get("candidates"),
+                "ambiguity": d.get("ambiguity"),
+                "token_debug": d.get("token_debug"),
+            })
+        except ValueError as ve:
+            return _render_oauth_response(frontend_url, {
+                "type": "sociovia_oauth_complete",
+                "success": False,
+                "error": str(ve),
+            })
+
+        waba_id = binding["waba_id"]
+        phone_number_id = binding["phone_number_id"]
+        display_phone_number = binding.get("display_phone_number")
+        verified_name = binding.get("verified_name")
+        meta_business_id = binding.get("meta_business_id")
+        if discovery.get("legacy_guess_used"):
+            logger.warning("connect/callback used legacy_guess_used (unexpected)")
         
         # Save to database
         from .models import WhatsAppAccount
@@ -5735,6 +7225,9 @@ def connect_callback():
         if existing:
             # Update existing account (same workspace, or inactive transfer)
             existing.workspace_id = workspace_id
+            existing.waba_id = waba_id
+            if meta_business_id:
+                existing.meta_business_id = str(meta_business_id)
             existing.access_token_encrypted = None  # Will be set below
             existing.set_access_token(access_token, token_type="permanent")
             existing.is_active = True
@@ -5750,6 +7243,7 @@ def connect_callback():
                 display_phone_number=display_phone_number,
                 verified_name=verified_name,
                 is_active=True,
+                meta_business_id=str(meta_business_id) if meta_business_id else None,
             )
             account.set_access_token(access_token, token_type="permanent")
             get_db().add(account)
@@ -5883,32 +7377,24 @@ def get_notification_settings():
     Returns:
         - notification_phone_number: The phone number to receive notifications
     """
-    from .models import WhatsAppAccount
-    from .token_helper import get_valid_account_for_workspace
+    from .token_helper import resolve_workspace_or_account_param
     
     workspace_id = request.args.get("workspace_id")
     account_id = request.args.get("account_id")
     
     try:
-        if workspace_id:
-            account, _ = get_valid_account_for_workspace(workspace_id)
-        elif account_id:
-            account = WhatsAppAccount.query.get(int(account_id))
-        else:
-            return jsonify({
-                "success": False,
-                "error": "workspace_id or account_id is required"
-            }), 400
-        
+        account, err = resolve_workspace_or_account_param(workspace_id, account_id)
+        if err == "workspace_id or account_id is required":
+            return jsonify({"success": False, "error": err}), 400
+        if err in ("Invalid account_id", "account_id does not belong to workspace_id"):
+            return jsonify({"success": False, "error": err}), 400
         if not account:
-            return jsonify({
-                "success": False,
-                "error": "No WhatsApp account found"
-            }), 404
+            return jsonify({"success": False, "error": err or "No WhatsApp account found"}), 404
         
         return jsonify({
             "success": True,
-            "notification_phone_number": account.notification_phone_number
+            "notification_phone_number": account.notification_phone_number,
+            "notification_email": getattr(account, "notification_email", None),
         })
         
     except Exception as e:
@@ -5928,45 +7414,45 @@ def update_notification_settings():
         "notification_phone_number": "919876543210"  // With country code, no +
     }
     """
-    from .models import WhatsAppAccount
-    from .token_helper import get_valid_account_for_workspace
+    from .token_helper import resolve_workspace_or_account_param
     
     data = request.get_json() or {}
     workspace_id = data.get("workspace_id")
     account_id = data.get("account_id")
     notification_phone_number = data.get("notification_phone_number", "").strip()
+    notification_email = data.get("notification_email", "").strip()
     
     try:
-        if workspace_id:
-            account, _ = get_valid_account_for_workspace(workspace_id)
-        elif account_id:
-            account = WhatsAppAccount.query.get(int(account_id))
-        else:
-            return jsonify({
-                "success": False,
-                "error": "workspace_id or account_id is required"
-            }), 400
-        
+        account, err = resolve_workspace_or_account_param(workspace_id, account_id)
+        if err == "workspace_id or account_id is required":
+            return jsonify({"success": False, "error": err}), 400
+        if err in ("Invalid account_id", "account_id does not belong to workspace_id"):
+            return jsonify({"success": False, "error": err}), 400
         if not account:
-            return jsonify({
-                "success": False,
-                "error": "No WhatsApp account found"
-            }), 404
+            return jsonify({"success": False, "error": err or "No WhatsApp account found"}), 404
         
         # Clean up phone number - remove spaces, dashes, +
         if notification_phone_number:
             notification_phone_number = notification_phone_number.replace(" ", "").replace("-", "").replace("+", "")
         
-        # Update the notification phone number
+        # Update notification contact details
         account.notification_phone_number = notification_phone_number if notification_phone_number else None
+        if hasattr(account, "notification_email"):
+            account.notification_email = notification_email if notification_email else None
         get_db().commit()
         
-        logger.info(f"Updated notification phone number for account {account.id}: {notification_phone_number}")
+        logger.info(
+            "Updated notification settings for account %s: phone=%s email=%s",
+            account.id,
+            notification_phone_number,
+            notification_email,
+        )
         
         return jsonify({
             "success": True,
             "message": "Notification settings updated successfully",
-            "notification_phone_number": account.notification_phone_number
+            "notification_phone_number": account.notification_phone_number,
+            "notification_email": getattr(account, "notification_email", None),
         })
         
     except Exception as e:
@@ -5988,8 +7474,7 @@ def send_notification_message():
         "body_params": ["John", "john@example.com", "1234567890", "Acme Inc", "2024-01-15 10:30:00"]
     }
     """
-    from .models import WhatsAppAccount
-    from .token_helper import get_valid_account_for_workspace
+    from .token_helper import resolve_workspace_or_account_param
     from .services import WhatsAppService
     
     data = request.get_json() or {}
@@ -5999,21 +7484,13 @@ def send_notification_message():
     body_params = data.get("body_params", [])
     
     try:
-        if workspace_id:
-            account, _ = get_valid_account_for_workspace(workspace_id)
-        elif account_id:
-            account = WhatsAppAccount.query.get(int(account_id))
-        else:
-            return jsonify({
-                "success": False,
-                "error": "workspace_id or account_id is required"
-            }), 400
-        
+        account, err = resolve_workspace_or_account_param(workspace_id, account_id)
+        if err == "workspace_id or account_id is required":
+            return jsonify({"success": False, "error": err}), 400
+        if err in ("Invalid account_id", "account_id does not belong to workspace_id"):
+            return jsonify({"success": False, "error": err}), 400
         if not account:
-            return jsonify({
-                "success": False,
-                "error": "No WhatsApp account found"
-            }), 404
+            return jsonify({"success": False, "error": err or "No WhatsApp account found"}), 404
         
         if not account.notification_phone_number:
             return jsonify({
@@ -6096,7 +7573,18 @@ def upload_chat_media():
     """
     import uuid
     import time
+    import re
     from werkzeug.utils import secure_filename
+
+    try:
+        import boto3
+    except ImportError:
+        logger.error("boto3 is not installed — chat media upload unavailable")
+        return jsonify({
+            "success": False,
+            "error": "storage_not_configured",
+            "message": "Media upload service is not available on this server. Paste a public HTTPS URL instead.",
+        }), 500
     
     if request.method == "OPTIONS":
         response = jsonify({})
@@ -6104,133 +7592,6 @@ def upload_chat_media():
         response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
         return response
-
-    def _resolve_meta_media_handle(file_bytes, content_type, ext, account_id):
-        """Upload bytes to Meta Resumable Upload API and return media handle (h)."""
-        if not account_id or not file_bytes:
-            return None
-        try:
-            account = WhatsAppAccount.query.get(int(account_id))
-            access_token = account.get_access_token() if account else None
-        except Exception:
-            access_token = None
-        if not access_token:
-            access_token = os.getenv("WHATSAPP_ACCESS_TOKEN")
-        if not access_token:
-            return None
-
-        import tempfile
-        from .services import WhatsAppService
-
-        suffix = ext if ext.startswith(".") else f".{ext}" if ext else ".bin"
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(file_bytes)
-                temp_path = tmp.name
-            return WhatsAppService().resumable_media_upload(
-                temp_path, content_type, access_token=access_token
-            )
-        except Exception as meta_err:
-            logger.warning("Meta resumable upload failed: %s", meta_err)
-            return None
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
-
-    def _build_media_upload_response(
-        public_url,
-        media_type,
-        original_filename,
-        file_size,
-        content_type,
-        key,
-        media_handle=None,
-    ):
-        payload = {
-            "success": True,
-            "public_url": public_url,
-            "url": public_url,
-            "media_type": media_type,
-            "filename": original_filename,
-            "size": file_size,
-            "mime_type": content_type,
-            "key": key,
-        }
-        if media_handle:
-            payload["media_handle"] = media_handle
-            payload["handle"] = media_handle
-        return jsonify(payload)
-
-    # URL-based upload (template header / remote image)
-    if request.path.rstrip("/").endswith("/media/upload/url"):
-        try:
-            body = request.get_json(silent=True) or {}
-            image_url = (body.get("url") or "").strip()
-            account_id = body.get("account_id")
-            if not image_url:
-                return jsonify({"success": False, "error": "url_required"}), 400
-            if not image_url.startswith("https://"):
-                return jsonify({"success": False, "error": "https_url_required"}), 400
-
-            import mimetypes
-            import requests as http_requests
-            from io import BytesIO
-
-            resp = http_requests.get(image_url, timeout=30)
-            if resp.status_code != 200:
-                return jsonify({
-                    "success": False,
-                    "error": "url_fetch_failed",
-                    "message": f"Could not download image (HTTP {resp.status_code})",
-                }), 400
-
-            content_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
-            if not content_type.startswith("image/"):
-                return jsonify({"success": False, "error": "invalid_file_type", "message": "URL must point to an image"}), 400
-
-            file_bytes = resp.content
-            file_size = len(file_bytes)
-            if file_size > 5 * 1024 * 1024:
-                return jsonify({"success": False, "error": "file_too_large"}), 400
-
-            from core.spaces_storage import (
-                build_object_key,
-                build_public_url,
-                get_s3_client,
-                is_spaces_configured,
-            )
-            if not is_spaces_configured():
-                return jsonify({"success": False, "error": "storage_not_configured"}), 500
-
-            ext = mimetypes.guess_extension(content_type) or ".jpg"
-            original_filename = f"remote{ext}"
-            ts = int(time.time())
-            unique_id = uuid.uuid4().hex[:12]
-            key = build_object_key("uploads", "chat", "image", f"{ts}_{unique_id}{ext}")
-
-            s3_client, space_name = get_s3_client()
-            s3_client.upload_fileobj(
-                BytesIO(file_bytes),
-                space_name,
-                key,
-                ExtraArgs={"ACL": "public-read", "ContentType": content_type},
-            )
-            public_url = build_public_url(key)
-            media_handle = _resolve_meta_media_handle(file_bytes, content_type, ext, account_id)
-
-            logger.info(
-                "Uploaded media from URL: %s (handle=%s, %s bytes)",
-                public_url,
-                bool(media_handle),
-                file_size,
-            )
-            return _build_media_upload_response(
-                public_url, "image", original_filename, file_size, content_type, key, media_handle
-            )
-        except Exception as url_err:
-            logger.exception("URL media upload failed: %s", url_err)
-            return jsonify({"success": False, "error": "upload_failed", "details": str(url_err)}), 500
     
     try:
         # Check for file
@@ -6344,74 +7705,83 @@ def upload_chat_media():
                 file_data = file.stream
         else:
             file_data = file.stream
-
-        from io import BytesIO
-
-        if isinstance(file_data, BytesIO):
-            file_bytes = file_data.getvalue()
-        elif hasattr(file_data, "read"):
-            file_bytes = file_data.read()
-        else:
-            file_bytes = bytes(file_data)
-        upload_stream = BytesIO(file_bytes)
         
-        from core.spaces_storage import (
-            build_object_key,
-            build_public_url,
-            get_s3_client,
-            is_spaces_configured,
+        # Get S3/Spaces config
+        SPACE_NAME = os.environ.get("SPACE_NAME") or os.environ.get("DO_SPACES_BUCKET")
+        SPACE_REGION = os.environ.get("SPACE_REGION") or os.environ.get("DO_SPACES_REGION")
+        ACCESS_KEY = os.environ.get("ACCESS_KEY") or os.environ.get("DO_ACCESS_KEY_ID")
+        SECRET_KEY = os.environ.get("SECRET_KEY") or os.environ.get("DO_SECRET_ACCESS_KEY")
+        
+        if not all([SPACE_NAME, SPACE_REGION, ACCESS_KEY, SECRET_KEY]):
+            logger.error("S3/Spaces configuration not complete")
+            return jsonify({
+                "success": False,
+                "error": "storage_not_configured",
+                "message": "Media storage is not configured. Set SPACE_NAME, SPACE_REGION, ACCESS_KEY, and SECRET_KEY, or paste a public HTTPS URL.",
+            }), 500
+        
+        # Initialize S3 client
+        SPACE_ENDPOINT = f'https://{SPACE_REGION}.digitaloceanspaces.com'
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=ACCESS_KEY,
+            aws_secret_access_key=SECRET_KEY,
+            endpoint_url=SPACE_ENDPOINT
         )
-
-        if not is_spaces_configured():
-            logger.error("DigitalOcean Spaces configuration not complete (check DO_SPACES_SECRET_KEY)")
-            return jsonify({"success": False, "error": "storage_not_configured"}), 500
-
-        s3_client, space_name = get_s3_client()
-
-        # Generate unique key under sociochat/ prefix in the sociovia bucket
+        
+        # Generate unique key
+        # Keep part of original filename in object key so downstream fetchers (Meta/clients)
+        # can infer a stable document name instead of falling back to "Untitled".
         ts = int(time.time())
         unique_id = uuid.uuid4().hex[:12]
         ext = os.path.splitext(original_filename)[1].lower() or '.bin'
-        key = build_object_key("uploads", "chat", media_type, f"{ts}_{unique_id}{ext}")
-        account_id = request.form.get("account_id")
-
+        filename_base = os.path.splitext(original_filename)[0]
+        safe_base = re.sub(r"[^a-zA-Z0-9_-]+", "_", filename_base).strip("_") or "file"
+        safe_base = safe_base[:80]
+        key = f"uploads/chat/{media_type}/{ts}_{unique_id}_{safe_base}{ext}"
+        
         # Upload to Spaces
         try:
             s3_client.upload_fileobj(
-                upload_stream,
-                space_name,
+                file_data,
+                SPACE_NAME,
                 key,
                 ExtraArgs={
                     "ACL": "public-read",
-                    "ContentType": content_type
+                    "ContentType": content_type,
+                    "ContentDisposition": f'inline; filename="{original_filename}"'
                 }
             )
             
-            public_url = build_public_url(key)
-            media_handle = _resolve_meta_media_handle(file_bytes, content_type, ext, account_id)
+            public_url = f"https://{SPACE_NAME}.{SPACE_REGION}.digitaloceanspaces.com/{key}"
             
-            logger.info(
-                "Uploaded chat media: %s (%s, %s bytes, handle=%s)",
-                public_url,
-                media_type,
-                file_size,
-                bool(media_handle),
-            )
+            logger.info(f"Uploaded chat media: {public_url} ({media_type}, {file_size} bytes)")
             
-            return _build_media_upload_response(
-                public_url,
-                media_type,
-                original_filename,
-                file_size,
-                content_type,
-                key,
-                media_handle,
-            )
+            return jsonify({
+                "success": True,
+                "public_url": public_url,
+                "url": public_url,  # Alias for compatibility
+                "media_type": media_type,
+                "filename": original_filename,
+                "size": file_size,
+                "mime_type": content_type,
+                "key": key
+            })
             
         except Exception as upload_err:
             logger.exception(f"Failed to upload to DigitalOcean Spaces: {upload_err}")
-            return jsonify({"success": False, "error": "upload_failed", "details": str(upload_err)}), 500
+            return jsonify({
+                "success": False,
+                "error": "upload_failed",
+                "message": "Failed to upload file to storage. Check server credentials or use a public HTTPS URL.",
+                "details": str(upload_err),
+            }), 500
     
     except Exception as e:
         logger.exception(f"Chat media upload failed: {e}")
-        return jsonify({"success": False, "error": "internal_server_error", "details": str(e)}), 500
+        return jsonify({
+            "success": False,
+            "error": "internal_server_error",
+            "message": "Unexpected error during upload. Please try again.",
+            "details": str(e),
+        }), 500

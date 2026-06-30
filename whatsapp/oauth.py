@@ -14,16 +14,20 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 from flask import session, request
 
-from models import db
+from shared_models import db
 from .models import WhatsAppAccount
 from .encryption import encrypt_token
 from .utils import subscribe_waba_to_app
 
 logger = logging.getLogger(__name__)
 
-# Meta OAuth Configuration
-META_APP_ID = os.getenv("META_APP_ID") or os.getenv("FB_APP_ID")
-META_APP_SECRET = os.getenv("META_APP_SECRET") or os.getenv("FB_APP_SECRET")
+# Meta OAuth Configuration (read all common env names used across deploys / Docker)
+META_APP_ID = os.getenv("META_APP_ID") or os.getenv("FB_APP_ID") or os.getenv("WHATSAPP_APP_ID")
+META_APP_SECRET = (
+    os.getenv("META_APP_SECRET")
+    or os.getenv("FB_APP_SECRET")
+    or os.getenv("WHATSAPP_APP_SECRET")
+)
 META_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v22.0")
 # OAuth dialog uses a fixed version, but token exchange uses configurable version
 META_OAUTH_BASE = f"https://www.facebook.com/{META_API_VERSION}/dialog/oauth"
@@ -38,20 +42,8 @@ REQUIRED_SCOPES = [
 ]
 
 
-def get_redirect_uri(workspace_id=None) -> str:
-    """Get OAuth callback URL.
-
-    When a workspace_id is supplied, honour the tenant's configured redirect URL
-    (falls back to the global .env default for T0000 / unconfigured tenants).
-    """
-    if workspace_id:
-        try:
-            from tenant.integration import get_tenant_meta_config
-            cfg = get_tenant_meta_config(workspace_id=workspace_id)
-            if cfg.redirect_url:
-                return cfg.redirect_url
-        except Exception:
-            logger.exception("get_redirect_uri tenant resolution failed; using env")
+def get_redirect_uri() -> str:
+    """Get OAuth callback URL."""
     app_base = os.getenv("APP_BASE_URL", "https://sociovia-backend-362038465411.europe-west1.run.app")
     return f"{app_base}/api/whatsapp/connect/callback"
 
@@ -72,24 +64,19 @@ def get_oauth_url(workspace_id: str, user_id: str) -> Dict[str, Any]:
     Returns:
         Dict with auth_url and state
     """
-    # Resolve the tenant's Meta app (env fallback for T0000 / unconfigured).
-    from tenant.integration import get_tenant_meta_config
-    cfg = get_tenant_meta_config(workspace_id=workspace_id)
-    client_id = cfg.app_id or META_APP_ID
-
-    if not client_id:
+    if not META_APP_ID:
         raise ValueError("META_APP_ID environment variable not set")
-
+    
     state = generate_state()
-
+    
     # Store state in session for verification
     session[f"wa_oauth_state_{workspace_id}"] = state
     session[f"wa_oauth_workspace_{state}"] = workspace_id
     session[f"wa_oauth_user_{state}"] = user_id
-
+    
     params = {
-        "client_id": client_id,
-        "redirect_uri": get_redirect_uri(workspace_id=workspace_id),
+        "client_id": META_APP_ID,
+        "redirect_uri": get_redirect_uri(),
         "state": state,
         "scope": ",".join(REQUIRED_SCOPES),
         "response_type": "code",
@@ -114,27 +101,21 @@ def exchange_code_for_token(code: str, state: str) -> Dict[str, Any]:
     Returns:
         Dict with access_token, token_type, expires_in
     """
+    if not META_APP_SECRET:
+        raise ValueError("META_APP_SECRET environment variable not set")
+    
     # Verify state
     workspace_id = session.get(f"wa_oauth_workspace_{state}")
     user_id = session.get(f"wa_oauth_user_{state}")
-
+    
     if not workspace_id or not user_id:
         raise ValueError("Invalid or expired OAuth state")
-
-    # Resolve the tenant's Meta app (env fallback for T0000 / unconfigured).
-    from tenant.integration import get_tenant_meta_config
-    cfg = get_tenant_meta_config(workspace_id=workspace_id)
-    client_id = cfg.app_id or META_APP_ID
-    client_secret = cfg.app_secret or META_APP_SECRET
-
-    if not client_secret:
-        raise ValueError("META_APP_SECRET environment variable not set")
-
+    
     # Exchange code for token
     params = {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "redirect_uri": get_redirect_uri(workspace_id=workspace_id),
+        "client_id": META_APP_ID,
+        "client_secret": META_APP_SECRET,
+        "redirect_uri": get_redirect_uri(),
         "code": code,
     }
     
@@ -169,54 +150,24 @@ def exchange_code_for_token(code: str, state: str) -> Dict[str, Any]:
 
 def fetch_waba_info(access_token: str) -> Dict[str, Any]:
     """
-    Fetch WhatsApp Business Account information from Meta.
-    
-    Args:
-        access_token: Meta access token
-        
-    Returns:
-        Dict with waba_id, phone_numbers, business_name
+    Fetch WhatsApp Business Account information from Meta (canonical discovery).
+
+    Uses ``meta_asset_discovery`` (Business → owned WABAs → phone_numbers).
+    On ambiguous portfolios, falls back to the first candidate only when
+    ``allow_legacy_single_guess`` is enabled inside resolver (True here for
+    backward compatibility with older single-account OAuth flows).
     """
-    # Get WABAs for this token
-    url = f"{META_GRAPH_API}/me/businesses"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    
-    response = requests.get(url, headers=headers, timeout=30)
-    response.raise_for_status()
-    
-    businesses = response.json().get("data", [])
-    
-    if not businesses:
-        raise ValueError("No WhatsApp Business Accounts found")
-    
-    # Get first WABA (or allow selection later)
-    business_id = businesses[0]["id"]
-    
-    # Get WABA details
-    waba_url = f"{META_GRAPH_API}/{business_id}"
-    waba_response = requests.get(waba_url, headers=headers, params={"fields": "id,name"}, timeout=30)
-    waba_response.raise_for_status()
-    waba_data = waba_response.json()
-    
-    # Get phone numbers
-    phone_url = f"{META_GRAPH_API}/{business_id}/owned_phone_numbers"
-    phone_response = requests.get(phone_url, headers=headers, timeout=30)
-    phone_response.raise_for_status()
-    phone_numbers = phone_response.json().get("data", [])
-    
-    if not phone_numbers:
-        raise ValueError("No phone numbers found in WABA")
-    
-    # Use first phone number
-    phone_data = phone_numbers[0]
-    
-    return {
-        "waba_id": business_id,
-        "waba_name": waba_data.get("name", "Unknown"),
-        "phone_number_id": phone_data.get("id"),
-        "display_phone_number": phone_data.get("display_phone_number"),
-        "verified_name": phone_data.get("verified_name"),
-    }
+    from .meta_asset_discovery import candidate_to_legacy_oauth_dict, resolve_binding_for_auto_connect
+
+    binding, _disc = resolve_binding_for_auto_connect(
+        access_token,
+        api_version=META_API_VERSION,
+        app_id=META_APP_ID,
+        app_secret=META_APP_SECRET,
+        hints=None,
+        allow_legacy_single_guess=True,
+    )
+    return candidate_to_legacy_oauth_dict(binding)
 
 
 def save_whatsapp_account(
@@ -267,6 +218,8 @@ def save_whatsapp_account(
         account.verified_name = waba_info.get("waba_name")
         account.last_synced_at = datetime.now(timezone.utc)
         account.is_active = True
+        if waba_info.get("meta_business_id"):
+            account.meta_business_id = str(waba_info["meta_business_id"])
     else:
         # Create new account
         account = WhatsAppAccount(
@@ -277,6 +230,7 @@ def save_whatsapp_account(
             verified_name=waba_info.get("waba_name"),
             connected_by_user_id=user_id,
             is_active=True,
+            meta_business_id=str(waba_info["meta_business_id"]) if waba_info.get("meta_business_id") else None,
         )
         account.set_access_token(access_token, "permanent", token_expires_at)
         account.last_synced_at = datetime.now(timezone.utc)
@@ -285,6 +239,14 @@ def save_whatsapp_account(
     db.session.commit()
     
     logger.info(f"Saved WhatsApp account: WABA {waba_info['waba_id']} for workspace {workspace_id}")
+
+    try:
+        uid = int(str(user_id).strip())
+        from monolith_integration.trigger import schedule_capabilities_resync_for_accounts
+
+        schedule_capabilities_resync_for_accounts([account.id], uid, reason="whatsapp_oauth_save")
+    except Exception as exc:
+        logger.warning("[whatsapp_integration] capability projection schedule failed: %s", exc)
     
     # Subscribe WABA to app for webhooks (messages, template updates, etc.)
     try:
@@ -319,44 +281,30 @@ def save_whatsapp_account(
     return account
 
 
-def exchange_short_for_long_token(short_token: str, workspace_id=None) -> Dict[str, Any]:
+def exchange_short_for_long_token(short_token: str) -> Dict[str, Any]:
     """
     Exchange a short-lived access token from Facebook SDK for a long-lived token.
-
+    
     This is used for simple Facebook OAuth login (not Embedded Signup).
     The short-lived token comes from the FB.login() callback on frontend.
-
+    
     Args:
         short_token: Short-lived access token from Facebook SDK
-        workspace_id: Optional workspace ID — when supplied, the tenant's own
-            Meta app credentials are used (env fallback for T0000 / unconfigured).
-
+        
     Returns:
         Dict with long_token, expires_in, token_type
     """
-    # Resolve the tenant's Meta app (env fallback for T0000 / unconfigured).
-    client_id = META_APP_ID
-    client_secret = META_APP_SECRET
-    if workspace_id:
-        try:
-            from tenant.integration import get_tenant_meta_config
-            cfg = get_tenant_meta_config(workspace_id=workspace_id)
-            client_id = cfg.app_id or META_APP_ID
-            client_secret = cfg.app_secret or META_APP_SECRET
-        except Exception:
-            logger.exception("exchange_short_for_long_token tenant resolution failed; using env")
-
-    if not client_id:
+    if not META_APP_ID:
         raise ValueError("META_APP_ID environment variable not set")
-    if not client_secret:
+    if not META_APP_SECRET:
         raise ValueError("META_APP_SECRET environment variable not set")
-
+    
     # Exchange short token for long-lived token
     exchange_url = f"{META_GRAPH_API}/oauth/access_token"
     params = {
         "grant_type": "fb_exchange_token",
-        "client_id": client_id,
-        "client_secret": client_secret,
+        "client_id": META_APP_ID,
+        "client_secret": META_APP_SECRET,
         "fb_exchange_token": short_token,
     }
     

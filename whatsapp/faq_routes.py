@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from flask import Blueprint, jsonify, request
 from functools import wraps
 
-from models import db
+from shared_models import db
 from .models import WhatsAppAccount
 from .faq_models import (
     WhatsAppFAQ,

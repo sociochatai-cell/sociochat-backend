@@ -35,6 +35,24 @@ VALID_COMPONENT_TYPES = {
     "EmbeddedLink",
 }
 
+SUPPORTED_FLOW_JSON_VERSIONS = {
+    "6.0",
+    "6.1",
+    "6.2",
+    "7.0",
+    "7.1",
+    "7.2",
+    "7.3",
+}
+
+UNSUPPORTED_LEGACY_FLOW_JSON_VERSIONS = {
+    "2.1",
+    "3.0",
+    "3.1",
+    "4.0",
+    "5.0",
+}
+
 # Banned keywords that Meta will reject
 BANNED_KEYWORDS = [
     "password",
@@ -83,91 +101,6 @@ class FlowValidationResult:
             "screen_count": self.screen_count,
             "component_count": self.component_count,
         }
-
-
-def _alpha_suffix(index: int) -> str:
-    suffix = ""
-    n = max(0, int(index))
-    while True:
-        remainder = n % 26
-        suffix = chr(65 + remainder) + suffix
-        n = n // 26
-        if n == 0:
-            break
-        n -= 1
-    return suffix
-
-
-def _to_meta_safe_screen_id(source: str, fallback: str) -> str:
-    candidate = re.sub(r"[^A-Za-z_]+", "_", (source or fallback or "SCREEN"))
-    candidate = re.sub(r"_+", "_", candidate).strip("_") or "SCREEN"
-    if candidate.upper() == "SUCCESS":
-        candidate = "SCREEN_SUCCESS"
-    return candidate[:64]
-
-
-def sanitize_flow_json(
-    flow_json: Dict[str, Any],
-    entry_screen_id: str,
-) -> tuple[Dict[str, Any], str]:
-    """
-    Remap screen IDs to Meta-safe format (letters and underscores only).
-    Fixes flows saved with internal builder IDs that contain numbers.
-    """
-    import copy
-
-    flow_json = copy.deepcopy(flow_json)
-    screens = flow_json.get("screens") or []
-    if not screens:
-        return flow_json, entry_screen_id
-
-    id_map: Dict[str, str] = {}
-    used: set[str] = set()
-    base_counts: Dict[str, int] = {}
-
-    for i, screen in enumerate(screens):
-        old_id = screen.get("id") or f"screen_{i}"
-        base = _to_meta_safe_screen_id(old_id, screen.get("title") or f"STEP_{i + 1}")
-        attempt = base_counts.get(base, 0)
-        new_id = base
-        while new_id in used:
-            new_id = f"{base}_{_alpha_suffix(attempt)}"
-            attempt += 1
-        base_counts[base] = attempt
-        used.add(new_id)
-        id_map[old_id] = new_id
-        screen["id"] = new_id
-
-    routing = flow_json.get("routing_model") or {}
-    new_routing: Dict[str, list] = {}
-    for old_key, targets in routing.items():
-        new_key = id_map.get(old_key, _to_meta_safe_screen_id(old_key, old_key))
-        new_targets = [id_map.get(t, t) for t in (targets or [])]
-        new_routing[new_key] = new_targets
-    flow_json["routing_model"] = new_routing
-
-    for screen in screens:
-        children = screen.get("layout", {}).get("children", [])
-        for child in children:
-            action = child.get("on-click-action") or {}
-            next_obj = action.get("next") or {}
-            if next_obj.get("type") == "screen" and next_obj.get("name"):
-                old_next = next_obj["name"]
-                if old_next in id_map:
-                    next_obj["name"] = id_map[old_next]
-
-    screen_ids = [s.get("id") for s in screens]
-    new_entry = id_map.get(entry_screen_id, entry_screen_id)
-    if new_entry not in screen_ids:
-        new_entry = screen_ids[0]
-
-    version = str(flow_json.get("version") or "")
-    if version in ("", "5.0", "6.0", "6.1"):
-        flow_json["version"] = "7.3"
-    if "data_api_version" in flow_json and not flow_json.get("endpoint_uri"):
-        flow_json.pop("data_api_version", None)
-
-    return flow_json, new_entry
 
 
 def validate_flow_json(flow_json: Dict[str, Any], entry_screen_id: str) -> FlowValidationResult:
@@ -263,15 +196,24 @@ def validate_flow_json(flow_json: Dict[str, Any], entry_screen_id: str) -> FlowV
         if not screen.get("title"):
             result.warnings.append(ValidationError("Screen missing 'title' field", "warning", screen_id))
         
-        # 5c: Footer required on non-terminal screens
-        if not is_terminal:
-            has_footer = any(c.get("type") == "Footer" for c in children)
-            if not has_footer:
+        # 5c: Footer required on every screen
+        footer_component = next((c for c in children if c.get("type") == "Footer"), None)
+        if not footer_component:
+            result.valid = False
+            result.errors.append(ValidationError(
+                "Every screen must include a Footer action component",
+                "error",
+                screen_id
+            ))
+        elif is_terminal:
+            footer_action = footer_component.get("on-click-action", {})
+            if footer_action.get("name") != "complete":
                 result.valid = False
                 result.errors.append(ValidationError(
-                    "Footer with navigation is required on non-terminal screens",
+                    "Terminal screens must use a Footer with on-click-action name 'complete'",
                     "error",
-                    screen_id
+                    screen_id,
+                    "Footer"
                 ))
         
         # 5d: Validate each component
@@ -325,16 +267,22 @@ def validate_flow_json(flow_json: Dict[str, Any], entry_screen_id: str) -> FlowV
             "warning"
         ))
     
-    # === Rule 8: Validate version (v7.3 recommended) ===
+    # === Rule 8: Validate version ===
     version = flow_json.get("version", "")
-    if version in ["2.1", "3.0", "3.1", "4.0", "5.0"]:
-        result.warnings.append(ValidationError(
-            f"Flow version '{version}' is deprecated. Upgrade to v7.3 for best compatibility.",
-            "warning"
+    if version in UNSUPPORTED_LEGACY_FLOW_JSON_VERSIONS:
+        result.valid = False
+        result.errors.append(ValidationError(
+            f"Flow version '{version}' is no longer supported by Meta. Upgrade to v7.3 before publishing.",
+            "error"
         ))
     elif not version:
         result.valid = False
         result.errors.append(ValidationError("Flow JSON missing 'version' field", "error"))
+    elif version not in SUPPORTED_FLOW_JSON_VERSIONS:
+        result.warnings.append(ValidationError(
+            f"Flow version '{version}' is not explicitly covered by this validator. Verify it is currently supported by Meta before publishing.",
+            "warning"
+        ))
     
     # === Rule 9: Validate routing_model (required for v7.3+) ===
     routing_model = flow_json.get("routing_model")
@@ -418,9 +366,12 @@ def generate_sample_flow(category: str = "LEAD_GEN") -> Dict[str, Any]:
     Returns:
         Valid Flow JSON structure
     """
-    if category == "LEAD_GEN":
+    category_key = str(category or "OTHER").strip().upper()
+
+    if category_key in {"LEAD_GEN", "LEAD_GENERATION"}:
         return {
-            "version": "5.0",
+            "version": "7.3",
+            "data_api_version": "4.0",
             "screens": [
                 {
                     "id": "WELCOME",
@@ -499,12 +450,16 @@ def generate_sample_flow(category: str = "LEAD_GEN") -> Dict[str, Any]:
                     }
                 }
             ],
-            "routing_model": {}
+            "routing_model": {
+                "WELCOME": ["THANK_YOU"],
+                "THANK_YOU": []
+            }
         }
     
-    elif category == "SURVEY":
+    elif category_key in {"SURVEY", "FEEDBACK"}:
         return {
-            "version": "5.0",
+            "version": "7.3",
+            "data_api_version": "4.0",
             "screens": [
                 {
                     "id": "RATING",
@@ -576,12 +531,16 @@ def generate_sample_flow(category: str = "LEAD_GEN") -> Dict[str, Any]:
                     }
                 }
             ],
-            "routing_model": {}
+            "routing_model": {
+                "RATING": ["FEEDBACK"],
+                "FEEDBACK": []
+            }
         }
     
     # Default empty flow
     return {
-        "version": "5.0",
+        "version": "7.3",
+        "data_api_version": "4.0",
         "screens": [],
         "routing_model": {}
     }

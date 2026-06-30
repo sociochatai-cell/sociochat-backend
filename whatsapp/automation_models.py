@@ -24,7 +24,7 @@ import enum
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
-from models import db
+from shared_models import db
 from sqlalchemy import Index, UniqueConstraint, JSON, Text
 
 
@@ -132,7 +132,7 @@ class WhatsAppAutomationRule(db.Model):
                           onupdate=lambda: datetime.now(timezone.utc))
     
     # Relationship
-    account = db.relationship("WhatsAppAccount", backref=db.backref("automation_rules", lazy="dynamic"))
+    account = db.relationship("WhatsAppAccount", backref=db.backref("automation_rules", lazy="dynamic", passive_deletes=True))
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for API response."""
@@ -266,7 +266,7 @@ class WhatsAppBusinessHours(db.Model):
                           onupdate=lambda: datetime.now(timezone.utc))
     
     # Relationship
-    account = db.relationship("WhatsAppAccount", backref=db.backref("business_hours", uselist=False))
+    account = db.relationship("WhatsAppAccount", backref=db.backref("business_hours", uselist=False, passive_deletes=True))
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for API response."""
@@ -379,7 +379,7 @@ class ContactAutomationOverride(db.Model):
                           onupdate=lambda: datetime.now(timezone.utc))
     
     # Relationships
-    account = db.relationship("WhatsAppAccount", backref=db.backref("contact_overrides", lazy="dynamic"))
+    account = db.relationship("WhatsAppAccount", backref=db.backref("contact_overrides", lazy="dynamic", passive_deletes=True))
     conversation = db.relationship("WhatsAppConversation", backref=db.backref("automation_overrides", lazy="dynamic"))
     
     def to_dict(self) -> Dict[str, Any]:
@@ -394,6 +394,117 @@ class ContactAutomationOverride(db.Model):
             "created_at": self.created_at.isoformat() + "Z" if self.created_at else None,
             "updated_at": self.updated_at.isoformat() + "Z" if self.updated_at else None,
         }
+
+
+def _agent_pause_ttl_hours() -> float:
+    import os
+    try:
+        return float(os.getenv("WHATSAPP_AGENT_PAUSE_TTL_HOURS", "24"))
+    except Exception:
+        return 24.0
+
+
+def _agent_pause_expired(attribution_data) -> bool:
+    """True if an agent pause is older than the configured TTL, so the bot may resume."""
+    ts = (attribution_data or {}).get("ai_paused_by_agent_at")
+    if not ts:
+        return False
+    try:
+        paused_at = datetime.fromisoformat(ts)
+        if paused_at.tzinfo is None:
+            paused_at = paused_at.replace(tzinfo=timezone.utc)
+        age_h = (datetime.now(timezone.utc) - paused_at).total_seconds() / 3600
+        return age_h > _agent_pause_ttl_hours()
+    except Exception:
+        return False
+
+
+def _pause_active_flow_for_handoff(conversation_id: int, when) -> None:
+    """Pause an active interactive-flow state when a human agent takes over so the bot stops
+    driving it, but keep it resumable (no completed_at). Pins the exact paused state id on the
+    conversation so re-enable resumes THIS state, not a sibling."""
+    try:
+        from sqlalchemy.orm.attributes import flag_modified as _fm
+
+        from .models import WhatsAppConversation
+        from .visual_automation_models import WhatsAppConversationState
+
+        active = (
+            WhatsAppConversationState.query
+            .filter_by(conversation_id=conversation_id, is_active=True)
+            .order_by(WhatsAppConversationState.updated_at.desc())
+            .first()
+        )
+        if active is None:
+            return
+        sd = dict(active.state_data or {})
+        sd["paused"] = True
+        sd["paused_node_id"] = sd.get("paused_node_id") or active.current_node_id
+        sd["pause_reason"] = "human_handoff"
+        active.state_data = sd
+        _fm(active, "state_data")
+        active.is_active = False
+        active.updated_at = when
+        db.session.commit()
+
+        conv = WhatsAppConversation.query.get(conversation_id)
+        if conv is not None:
+            attr = dict(conv.attribution_data or {})
+            attr["handoff_paused_state_id"] = active.id
+            conv.attribution_data = attr
+            _fm(conv, "attribution_data")
+            db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+def _resume_flow_after_handoff(conversation_id: int) -> None:
+    """Re-activate the EXACT flow state paused by a human handoff (pinned id), but only if the
+    customer was active within the stale window — otherwise it's a truly abandoned flow and we
+    leave it for the sweeper rather than hijacking the customer's next message. Does NOT reset
+    last_user_message_at, so the 24h stale check / sweeper still apply."""
+    try:
+        from datetime import timedelta
+
+        from sqlalchemy.orm.attributes import flag_modified as _fm
+
+        from .models import WhatsAppConversation
+        from .visual_automation_models import WhatsAppConversationState
+
+        now = datetime.now(timezone.utc)
+        conv = WhatsAppConversation.query.get(conversation_id)
+        if conv is None:
+            return
+        attr = dict(conv.attribution_data or {})
+        sid = attr.pop("handoff_paused_state_id", None)
+        # Clear the pin regardless of whether we end up resuming.
+        conv.attribution_data = attr
+        _fm(conv, "attribution_data")
+        db.session.commit()
+        if not sid:
+            return
+
+        cand = WhatsAppConversationState.query.get(sid)
+        if cand is None or cand.completed_at is not None or cand.automation_id is None:
+            return
+        sd = cand.state_data if isinstance(cand.state_data, dict) else {}
+        if not sd.get("paused") or sd.get("pause_reason") != "human_handoff":
+            return
+        lum = cand.last_user_message_at
+        if lum is not None and lum.tzinfo is None:
+            lum = lum.replace(tzinfo=timezone.utc)
+        if lum is None or (now - lum) > timedelta(hours=24):
+            return  # customer abandoned during the handoff — leave for the sweeper
+        sd = dict(sd)
+        sd["paused"] = False
+        sd["resumed_via"] = "agent_reenable"
+        cand.state_data = sd
+        _fm(cand, "state_data")
+        cand.is_active = True
+        cand.updated_at = now
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
 
 
 def is_automation_disabled_for_contact(workspace_id: str, conversation_id: int, rule_type: str) -> bool:
@@ -411,7 +522,27 @@ def is_automation_disabled_for_contact(workspace_id: str, conversation_id: int, 
         is_enabled=False
     ).first()
     
-    return override is not None
+    if override is not None:
+        return True
+
+    # Agent inbox replies set ai_paused_by_agent on the conversation; keep in sync
+    # with contact overrides even when set_contact_override did not persist.
+    # This MUST also gate interactive_flows: the live router runs the interactive
+    # flow engine first and unconditionally (fast_router.route_message), so without
+    # this the bot keeps driving the flow under a human who has taken over.
+    if rule_type in ("ai_chat", "interactive_flows"):
+        try:
+            from .models import WhatsAppConversation
+
+            conv = WhatsAppConversation.query.get(conversation_id)
+            if conv:
+                _attr = conv.attribution_data or {}
+                if bool(_attr.get("ai_paused_by_agent")) and not _agent_pause_expired(_attr):
+                    return True
+        except Exception:
+            pass
+
+    return False
 
 
 def get_contact_overrides(workspace_id: str, conversation_id: int) -> Dict[str, bool]:
@@ -488,3 +619,71 @@ def set_contact_override(
     except Exception as e:
         db.session.rollback()
         return False
+
+
+def clear_agent_ai_pause_flag(conversation_id: int) -> None:
+    """Remove agent-handoff marker when AI Chat is re-enabled for this contact."""
+    from .models import WhatsAppConversation
+
+    conversation = WhatsAppConversation.query.get(conversation_id)
+    if not conversation:
+        return
+    data = dict(conversation.attribution_data or {})
+    if not data.get("ai_paused_by_agent"):
+        return
+    data.pop("ai_paused_by_agent", None)
+    data.pop("ai_paused_by_agent_at", None)
+    data.pop("ai_paused_by_agent_reason", None)
+    conversation.attribution_data = data
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(conversation, "attribution_data")
+    conversation.updated_at = datetime.now(timezone.utc)
+    db.session.commit()
+
+    # Resume a flow that was paused for this handoff: re-activate at its node with a fresh
+    # 24h window so it isn't instantly torn down; the customer's next reply continues it.
+    _resume_flow_after_handoff(conversation_id)
+
+
+def pause_ai_chatbot_for_agent_handoff(
+    conversation_id: int,
+    *,
+    reason: str = "agent_replied",
+) -> Optional[Dict[str, bool]]:
+    """
+    Disable AI Chat for this contact after an agent sends a manual inbox message.
+    """
+    from .models import WhatsAppAccount, WhatsAppConversation
+    from sqlalchemy.orm.attributes import flag_modified
+
+    conversation = WhatsAppConversation.query.get(conversation_id)
+    if not conversation:
+        return None
+    account = WhatsAppAccount.query.get(conversation.account_id)
+    if not account or not account.workspace_id:
+        return None
+
+    set_contact_override(
+        workspace_id=str(account.workspace_id),
+        account_id=account.id,
+        conversation_id=conversation_id,
+        rule_type="ai_chat",
+        is_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    data = dict(conversation.attribution_data or {})
+    data["ai_paused_by_agent"] = True
+    data["ai_paused_by_agent_at"] = now.isoformat()
+    data["ai_paused_by_agent_reason"] = reason
+    conversation.attribution_data = data
+    flag_modified(conversation, "attribution_data")
+    conversation.updated_at = now
+    db.session.commit()
+
+    # Also pause any ACTIVE interactive flow so the bot stops driving it under the human.
+    # Kept resumable (no completed_at); re-activated by clear_agent_ai_pause_flag on re-enable.
+    _pause_active_flow_for_handoff(conversation_id, now)
+
+    return get_contact_overrides(str(account.workspace_id), conversation_id)

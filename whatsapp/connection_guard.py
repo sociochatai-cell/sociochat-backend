@@ -23,7 +23,7 @@ USAGE:
 import logging
 from typing import Optional, Dict, Any
 
-from models import db
+from shared_models import db
 from .models import WhatsAppAccount
 
 logger = logging.getLogger(__name__)

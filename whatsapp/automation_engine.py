@@ -17,13 +17,14 @@ Usage:
 """
 
 import logging
-import os
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List, Tuple
 
-from models import db
+from shared_models import db
 from notifications import notification_manager
+from .trace_debug import trace_event
+from .debug_logger import wa_debug
 from .automation_models import (
     WhatsAppAutomationRule,
     WhatsAppAutomationLog,
@@ -172,6 +173,9 @@ class AutomationEngine:
             ).order_by(
                 WhatsAppAutomationRule.priority.asc()
             ).all()
+
+            # Safety: AI chat should always remain a fallback even if mis-prioritized.
+            rules.sort(key=lambda r: (1 if r.rule_type == "ai_chat" else 0, r.priority or 0, r.id or 0))
             
             self._rules_cache = rules
             return rules
@@ -233,8 +237,11 @@ class AutomationEngine:
         # KEYWORD: Triggers on keyword match
         if rule_type == "keyword":
             keywords = trigger_config.get("keywords", [])
-            match_type = trigger_config.get("match_type", "contains")  # contains, exact, starts_with
-            case_sensitive = trigger_config.get("case_sensitive", False)
+            match_type = trigger_config.get("match_type") or trigger_config.get("matchType") or "contains"
+            case_sensitive = bool(trigger_config.get("case_sensitive", False))
+
+            if isinstance(keywords, str):
+                keywords = [k.strip() for k in keywords.split(",") if k and k.strip()]
             
             text_to_check = message_text if case_sensitive else message_text.lower()
             
@@ -303,9 +310,10 @@ class AutomationEngine:
         """
         try:
             if self._business_hours is None:
-                self._business_hours = WhatsAppBusinessHours.query.filter_by(
-                    workspace_id=self.workspace_id,
-                    account_id=self.account_id
+                # Cast workspace_id to VARCHAR to match column type
+                self._business_hours = WhatsAppBusinessHours.query.filter(
+                    WhatsAppBusinessHours.workspace_id == str(self.workspace_id),
+                    WhatsAppBusinessHours.account_id == self.account_id
                 ).first()
             
             if self._business_hours is None:
@@ -491,15 +499,92 @@ def send_automation_response(
     """
     from .models import WhatsAppAccount, WhatsAppMessage
     from .services import WhatsAppService
-    
+
+    auto_trace = wa_debug.before(
+        "automation_send",
+        acct_id=account_id,
+        conv_id=conversation_id,
+        details={"response_type": response_type, "to_phone": to_phone},
+    )
+
+    def _finish(ok: bool, msg_id: Optional[int], err: Optional[str], **details):
+        wa_debug.after(
+            "automation_send",
+            trace_id=auto_trace,
+            acct_id=account_id,
+            conv_id=conversation_id,
+            status="ok" if ok else "fail",
+            error=err,
+            details=details or None,
+        )
+        # Seamless flow continuation: if this answer resolved an off-script question the customer
+        # asked mid-flow, re-ask the flow step they were on so the conversation picks back up.
+        # No-op unless an interactive flow is paused for an off-script query, so it is safe here.
+        if ok and response_type in ("faq", "ai", "text"):
+            try:
+                from .interactive_automation_engine import reprompt_after_off_script_answer
+                reprompt_after_off_script_answer(
+                    account_id=account_id,
+                    conversation_id=conversation_id,
+                    to_phone=to_phone,
+                )
+            except Exception:
+                logger.exception("[automation] flow re-prompt after answer failed (non-fatal)")
+        return ok, msg_id, err
+
     try:
         account = WhatsAppAccount.query.get(account_id)
         if not account:
-            return False, None, "Account not found"
-        
+            return _finish(False, None, "Account not found", gate="account_lookup")
+
         access_token = account.get_access_token()
         if not access_token:
-            return False, None, "No access token"
+            return _finish(False, None, "No access token", gate="token")
+
+        from .capabilities import automation_capability_check, ai_capability_check
+
+        auto = automation_capability_check(account_id)
+        if not auto.ok:
+            return _finish(
+                False,
+                None,
+                auto.message or "automation_capability_denied",
+                gate="capability",
+            )
+        from .warmup_enforcement import warmup_denial_automation
+
+        wauto = warmup_denial_automation(account_id, db.session, response_type)
+        if wauto:
+            return _finish(False, None, wauto.message, gate="warmup", code=wauto.code)
+        if response_type == "ai":
+            ai_ent = ai_capability_check(account_id)
+            if not ai_ent.ok:
+                return _finish(
+                    False,
+                    None,
+                    ai_ent.message or "ai_capability_denied",
+                    gate="ai_capability",
+                )
+                
+        # Risk-aware throttling via Safe Mode Engine
+        from .safe_mode_engine import is_risk_allowed, RiskClass
+        risk_map = {
+            "text": RiskClass.LOW,
+            "faq": RiskClass.LOW,
+            "interactive": RiskClass.MEDIUM,
+            "ai": RiskClass.MEDIUM,
+            "template": RiskClass.HIGH,
+        }
+        risk_class = risk_map.get(response_type, RiskClass.MEDIUM)
+        
+        if not is_risk_allowed(account, risk_class):
+            logger.warning(f"Automation response ({response_type}) blocked by Safe Mode Engine ({account.operational_mode})")
+            return _finish(
+                False,
+                None,
+                f"Suppressed by Safe Mode: {account.operational_mode}",
+                gate="safe_mode",
+            )
         
         service = WhatsAppService(
             access_token=access_token,
@@ -579,50 +664,257 @@ def send_automation_response(
         
         elif response_type == "ai":
             # AI-powered response using Gemini with RAG integration
-            from .ai_chatbot import create_ai_chatbot, DEFAULT_HANDOFF_MESSAGE
-            
-            business_name = account.custom_name or account.verified_name or "our business"
-            
-            # Get AI configuration from response_config, including workspace_id for RAG
-            ai_config_dict = {
-                "enabled": True,
-                "business_name": business_name,
-                "system_prompt": response_config.get("system_prompt", ""),
-                "fallback_message": response_config.get(
-                    "fallback_message", DEFAULT_HANDOFF_MESSAGE
-                ),
-                "model": response_config.get("model") or os.getenv("TEXT_MODEL", "gemini-3.1-flash-lite"),
-                "max_tokens": response_config.get("max_tokens", 1024),
-                "temperature": response_config.get("temperature", 0.3),
-                "context_messages": response_config.get("context_messages", 5),
-                # RAG configuration - enable knowledge base retrieval
-                "use_rag": response_config.get("use_rag", True),
-                "rag_top_k": response_config.get("rag_top_k", 5),
-                "rag_confidence_threshold": response_config.get("rag_confidence_threshold", 0.5),
-                "workspace_id": account.workspace_id,  # CRITICAL: Pass workspace_id for RAG
-            }
-            
-            chatbot = create_ai_chatbot(ai_config_dict)
-            
-            # Get conversation context for better responses
-            context = _get_conversation_context(conversation_id, ai_config_dict["context_messages"])
-            
-            # Get the incoming message from response_config
+            from .ai_chatbot import create_ai_chatbot, prepare_automation_ai
+            from .human_escalation import apply_human_handoff, should_escalate_to_human
+
+            prep = prepare_automation_ai(account, response_config)
             incoming_message = response_config.get("incoming_message", "")
-            
-            # Generate AI response (now with RAG integration)
-            ai_response = chatbot.generate_response(
-                message=incoming_message,
-                context=context
+            inbound_wamid = response_config.get("inbound_wamid")
+            trace_event(
+                stage="ai.send.start",
+                status="attempt",
+                wamid=inbound_wamid,
+                conversation_id=conversation_id,
+                account_id=account_id,
+                details={
+                    "prep_run": prep.get("run"),
+                    "prep_reason": prep.get("reason"),
+                    "to_phone": to_phone,
+                },
             )
-            
-            if ai_response.success and ai_response.message:
-                result = service.send_text(to_phone, ai_response.message)
-                logger.info(f"[Automation Source: AI CHATBOT + RAG] AI response sent: tokens={ai_response.tokens_used}, time={ai_response.response_time_ms}ms")
+
+            if not prep["run"]:
+                trace_event(
+                    stage="ai.send.prep_blocked",
+                    status="blocked",
+                    wamid=inbound_wamid,
+                    conversation_id=conversation_id,
+                    account_id=account_id,
+                    details={
+                        "prep_reason": prep.get("reason"),
+                        "fallback_message": prep.get("fallback_message"),
+                    },
+                )
+                ok, err = apply_human_handoff(
+                    account_id=account_id,
+                    conversation_id=conversation_id,
+                    to_phone=to_phone,
+                    reason="ai_disabled_or_fallback",
+                    incoming_message=incoming_message,
+                )
+                result = {"success": ok, "conversation_id": conversation_id}
+                if not ok:
+                    result = service.send_text(to_phone, prep["fallback_message"])
+                    trace_event(
+                        stage="ai.reply.send",
+                        status="fallback_text_sent"
+                        if bool(result and result.get("success"))
+                        else "fallback_text_failed",
+                        wamid=inbound_wamid,
+                        conversation_id=conversation_id,
+                        account_id=account_id,
+                        details={
+                            "reason": "prep_blocked_handoff_failed",
+                            "handoff_error": err,
+                            "error": (result or {}).get("error")
+                            if isinstance(result, dict)
+                            else None,
+                        },
+                    )
+                logger.info("AI disabled — human handoff applied (account=%s)", account_id)
             else:
-                # Use fallback message
-                result = service.send_text(to_phone, ai_config_dict["fallback_message"])
-                logger.warning(f"AI failed, using fallback: {ai_response.error}")
+                ai_config_dict = prep["config"]
+                incoming_message = response_config.get("incoming_message", "")
+
+                # If the user paused an interactive flow to ask this, give the AI that context.
+                _flow_hint = None
+                try:
+                    from .interactive_automation_engine import paused_flow_hint
+                    _flow_hint = paused_flow_hint(account_id, conversation_id)
+                except Exception:
+                    _flow_hint = None
+                ai_config_dict["flow_context"] = _flow_hint  # paused-flow awareness (None when not mid-flow)
+
+                # AgentOS growth intent handoff (before generic AI chat)
+                try:
+                    from .agentos_handoff import handle_inbound_agentos
+
+                    handled, handoff_result = handle_inbound_agentos(
+                        account=account,
+                        conversation_id=conversation_id,
+                        incoming_message=incoming_message,
+                        service=service,
+                        to_phone=to_phone,
+                    )
+                    if handled:
+                        result = handoff_result or {"success": True, "conversation_id": conversation_id}
+                        trace_event(
+                            stage="ai.agentos.handoff",
+                            status="ok",
+                            wamid=inbound_wamid,
+                            conversation_id=conversation_id,
+                            account_id=account_id,
+                            details={"handled": True},
+                        )
+                        return result
+                except Exception as agentos_exc:
+                    logger.warning("AgentOS handoff error (continuing with AI): %s", agentos_exc)
+
+                chatbot = create_ai_chatbot(ai_config_dict)
+                context = _get_conversation_context(
+                    conversation_id, ai_config_dict["context_messages"]
+                )
+                ai_response = chatbot.generate_response(
+                    message=incoming_message,
+                    context=context,
+                )
+                trace_event(
+                    stage="ai.generation.result",
+                    status="ok" if ai_response.success else "error",
+                    wamid=inbound_wamid,
+                    conversation_id=conversation_id,
+                    account_id=account_id,
+                    details={
+                        "error": ai_response.error,
+                        "used_rag": ai_response.used_rag,
+                        "rag_chunks": ai_response.rag_chunks,
+                        "low_rag_confidence": ai_response.low_rag_confidence,
+                    },
+                )
+
+                # Hard rule: if AI generation succeeded and produced a non-empty reply,
+                # send that reply to the user. Escalation/fallback is only for real failures.
+                if ai_response.success and ai_response.message:
+                    logger.info(
+                        "[automation_engine][ai] sending_ai_reply conv=%s preview=%r",
+                        conversation_id,
+                        ai_response.message[:160],
+                    )
+                    result = service.send_text(to_phone, ai_response.message)
+                    trace_event(
+                        stage="ai.reply.send",
+                        status="ok" if bool(result and result.get("success")) else "error",
+                        wamid=inbound_wamid,
+                        conversation_id=conversation_id,
+                        account_id=account_id,
+                        details={
+                            "error": (result or {}).get("error") if isinstance(result, dict) else None,
+                            "preview": (ai_response.message or "")[:140],
+                        },
+                    )
+                    logger.info(
+                        "[Automation Source: AI CHATBOT + RAG] AI response sent: "
+                        "tokens=%s, time=%sms",
+                        ai_response.tokens_used,
+                        ai_response.response_time_ms,
+                    )
+                else:
+                    escalate = ai_response.escalate_to_human
+                    escalation_reason = ai_response.escalation_reason
+                    if not escalate:
+                        escalate, escalation_reason = should_escalate_to_human(
+                            success=ai_response.success,
+                            reply_text=ai_response.message,
+                            low_rag_confidence=ai_response.low_rag_confidence,
+                            has_rag_context=ai_response.used_rag,
+                        )
+
+                    logger.info(
+                        "[automation_engine][ai] decision conv=%s success=%s used_rag=%s rag_chunks=%s "
+                        "low_rag_confidence=%s escalate=%s reason=%s",
+                        conversation_id,
+                        ai_response.success,
+                        ai_response.used_rag,
+                        ai_response.rag_chunks,
+                        ai_response.low_rag_confidence,
+                        escalate,
+                        escalation_reason or "",
+                    )
+
+                    if escalate:
+                        trace_event(
+                            stage="ai.escalation",
+                            status="handoff",
+                            wamid=inbound_wamid,
+                            conversation_id=conversation_id,
+                            account_id=account_id,
+                            details={"reason": escalation_reason or "ai_escalation"},
+                        )
+                        ok, err = apply_human_handoff(
+                            account_id=account_id,
+                            conversation_id=conversation_id,
+                            to_phone=to_phone,
+                            reason=escalation_reason or "ai_escalation",
+                            incoming_message=incoming_message,
+                        )
+                        result = {"success": ok, "conversation_id": conversation_id}
+                        if not ok:
+                            logger.warning("[human_escalation] Handoff failed: %s", err)
+                            result = service.send_text(
+                                to_phone, ai_config_dict["fallback_message"]
+                            )
+                            trace_event(
+                                stage="ai.reply.send",
+                                status="fallback_text_sent"
+                                if bool(result and result.get("success"))
+                                else "fallback_text_failed",
+                                wamid=inbound_wamid,
+                                conversation_id=conversation_id,
+                                account_id=account_id,
+                                details={
+                                    "reason": "ai_escalation_handoff_failed",
+                                    "handoff_error": err,
+                                    "escalation_reason": escalation_reason,
+                                    "error": (result or {}).get("error")
+                                    if isinstance(result, dict)
+                                    else None,
+                                },
+                            )
+                        else:
+                            logger.info(
+                                "[human_escalation] Handoff applied conv=%s reason=%s",
+                                conversation_id,
+                                escalation_reason,
+                            )
+                    else:
+                        trace_event(
+                            stage="ai.reply.send",
+                            status="fallback_handoff",
+                            wamid=inbound_wamid,
+                            conversation_id=conversation_id,
+                            account_id=account_id,
+                            details={"reason": "ai_generation_failed", "error": ai_response.error},
+                        )
+                        ok, err = apply_human_handoff(
+                            account_id=account_id,
+                            conversation_id=conversation_id,
+                            to_phone=to_phone,
+                            reason="ai_generation_failed",
+                            incoming_message=incoming_message,
+                        )
+                        result = {"success": ok, "conversation_id": conversation_id}
+                        if not ok:
+                            result = service.send_text(
+                                to_phone, ai_config_dict["fallback_message"]
+                            )
+                            trace_event(
+                                stage="ai.reply.send",
+                                status="fallback_text_sent"
+                                if bool(result and result.get("success"))
+                                else "fallback_text_failed",
+                                wamid=inbound_wamid,
+                                conversation_id=conversation_id,
+                                account_id=account_id,
+                                details={
+                                    "reason": "ai_generation_failed_handoff_failed",
+                                    "handoff_error": err,
+                                    "error": ai_response.error,
+                                    "send_error": (result or {}).get("error")
+                                    if isinstance(result, dict)
+                                    else None,
+                                },
+                            )
+                        logger.warning(f"AI failed — human handoff: {ai_response.error}")
         
         if result and result.get("success"):
             # Get the stored message ID
@@ -644,16 +936,27 @@ def send_automation_response(
             except Exception as e:
                 logger.error(f"Failed to broadcast automation response event: {e}")
             
-            return True, message_id, None
+            return _finish(True, message_id, None, wamid=result.get("wamid"))
         else:
             error = result.get("error", "Unknown error") if result else "No response"
+            error_code = result.get("error_code") if isinstance(result, dict) else None
             logger.warning(f"Automation response failed: {error}")
-            return False, None, error
-            
+            return _finish(
+                False,
+                None,
+                error,
+                error_code=error_code,
+                meta_response=result,
+            )
+
     except Exception as e:
         logger.exception(f"Failed to send automation response: {e}")
         try:
             db.session.rollback()
         except Exception:
             pass
-        return False, None, str(e)
+        return _finish(False, None, str(e), gate="exception")
+
+
+# Re-export for fast_router and other callers
+from .human_escalation import set_conversation_needs_attention  # noqa: E402,F401

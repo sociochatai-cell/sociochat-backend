@@ -1,9 +1,7 @@
 """
 Flow variable resolution and button-capture rules for interactive automations.
 
-Variables and flow_config are stored per automation (in the automation's JSON
-config) - not in env vars. These helpers are pure (no DB access) so they can be
-reused by the engine, routes, and API node executor.
+Variables and flow_config are stored per automation in the database — not in env vars.
 """
 from __future__ import annotations
 

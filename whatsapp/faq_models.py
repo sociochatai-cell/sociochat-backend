@@ -14,10 +14,9 @@ Features:
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
-from models import db
+from shared_models import db
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy import JSON as SAJSON
 
 
 class WhatsAppFAQ(db.Model):
@@ -38,7 +37,7 @@ class WhatsAppFAQ(db.Model):
     answer = db.Column(db.Text, nullable=False)
     
     # Keywords for matching (auto-generated or manual)
-    keywords = db.Column(SAJSON().with_variant(JSONB, "postgresql"), nullable=False, default=list)
+    keywords = db.Column(JSONB, nullable=False, default=list)
     
     # Optional category for organization
     category = db.Column(db.String(64), nullable=True)
@@ -69,7 +68,7 @@ class WhatsAppFAQ(db.Model):
     )
     
     # Relationships
-    account = db.relationship("WhatsAppAccount", backref="faqs")
+    account = db.relationship("WhatsAppAccount", backref=db.backref("faqs", passive_deletes=True))
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize FAQ to dictionary."""

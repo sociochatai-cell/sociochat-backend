@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from functools import wraps
 
-from models import db
+from shared_models import db
 from .models import WhatsAppAccount, WhatsAppConversation
 from .automation_models import (
     WhatsAppAutomationRule,
@@ -725,11 +725,13 @@ def get_contact_automation_overrides(account_id: int, conversation_id: int, acco
             return jsonify({"error": "Conversation not found"}), 404
         
         overrides = get_contact_overrides(workspace_id, conversation_id)
-        
+        attr = conversation.attribution_data if isinstance(conversation.attribution_data, dict) else {}
+
         return jsonify({
             "success": True,
             "overrides": overrides,
-            "conversation_id": conversation_id
+            "conversation_id": conversation_id,
+            "ai_paused_by_agent": bool(attr.get("ai_paused_by_agent")),
         })
         
     except Exception as e:
@@ -786,27 +788,42 @@ def update_contact_automation_overrides(account_id: int, conversation_id: int, a
         
         # Handle single update
         elif "rule_type" in data:
+            rule_type = data["rule_type"]
+            is_enabled = data.get("is_enabled", True)
             success = set_contact_override(
                 workspace_id=workspace_id,
                 account_id=account_id,
                 conversation_id=conversation_id,
-                rule_type=data["rule_type"],
-                is_enabled=data.get("is_enabled", True)
+                rule_type=rule_type,
+                is_enabled=is_enabled,
             )
             if not success:
                 return jsonify({"error": "Failed to update override"}), 500
+            if rule_type in ("ai_chat", "interactive_flows") and is_enabled:
+                from .automation_models import clear_agent_ai_pause_flag
+                clear_agent_ai_pause_flag(conversation_id)
         
         else:
             return jsonify({"error": "Either 'overrides' or 'rule_type' required"}), 400
         
         # Return updated overrides
         overrides = get_contact_overrides(workspace_id, conversation_id)
+        attr = conversation.attribution_data if isinstance(conversation.attribution_data, dict) else {}
+        if "overrides" in data and (
+            data["overrides"].get("ai_chat") is True
+            or data["overrides"].get("interactive_flows") is True
+        ):
+            from .automation_models import clear_agent_ai_pause_flag
+            clear_agent_ai_pause_flag(conversation_id)
+            conversation = WhatsAppConversation.query.get(conversation_id) or conversation
+            attr = conversation.attribution_data if isinstance(conversation.attribution_data, dict) else {}
         
         logger.info(f"Updated contact overrides for conversation {conversation_id}")
         
         return jsonify({
             "success": True,
             "overrides": overrides,
+            "ai_paused_by_agent": bool(attr.get("ai_paused_by_agent")),
             "message": "Overrides updated successfully"
         })
         

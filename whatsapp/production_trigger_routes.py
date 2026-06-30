@@ -12,10 +12,11 @@ import json
 import secrets
 import logging
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 from flask import Blueprint, request, jsonify, url_for
 from sqlalchemy import func, and_, desc
 
-from models import db
+from shared_models import db
 from .models import WhatsAppAccount, WhatsAppTemplate
 from .trigger_models import WhatsAppTrigger
 from .trigger_logs_model import TriggerLog, TriggerContact
@@ -66,7 +67,11 @@ def _log_trigger_invocation(trigger: WhatsAppTrigger, phone: str, variables: lis
 
 
 def _send_via_trigger(trigger: WhatsAppTrigger, phone: str, variables: list, 
-                      source_type: str = "api", source_ref: str = None):
+                      source_type: str = "api", source_ref: str = None,
+                      header_image_url: str = None, header_video_url: str = None,
+                      header_document_url: str = None, header_document_id: str = None,
+                      header_document_filename: str = None,
+                      copy_code_value: str = None):
     """
     Core function to send a message via trigger.
     Returns (success, message_id_or_error)
@@ -84,6 +89,27 @@ def _send_via_trigger(trigger: WhatsAppTrigger, phone: str, variables: list,
     ).first()
     
     mapping = template_obj.get_variable_mapping() if template_obj else {}
+
+    # If the template requires a DOCUMENT header and caller didn't pass one,
+    # use template example header_handle so Meta doesn't reject with 132012.
+    if template_obj and isinstance(template_obj.components, list):
+        requires_document_header = False
+        example_document_url = None
+
+        for comp in template_obj.components:
+            comp_type = str((comp or {}).get("type", "")).upper()
+            comp_format = str((comp or {}).get("format", "")).upper()
+            if comp_type == "HEADER" and comp_format == "DOCUMENT":
+                requires_document_header = True
+                example = (comp or {}).get("example") or {}
+                handles = example.get("header_handle") or []
+                if isinstance(handles, list) and handles:
+                    example_document_url = str(handles[0] or "").strip()
+                break
+
+        if requires_document_header and not (header_document_id or header_document_url):
+            # Don't use example_document_url - it's a temporary CDN link that causes "media upload error"
+            return False, "template_requires_document_header_but_no_header_document_id_provided"
     
     # Build components
     components = []
@@ -100,14 +126,35 @@ def _send_via_trigger(trigger: WhatsAppTrigger, phone: str, variables: list,
             "type": "body",
             "parameters": body_params
         })
-    
+
+    # Optional media header
+    if header_image_url:
+        components.append({
+            "type": "header",
+            "parameters": [{"type": "image", "image": {"link": header_image_url}}]
+        })
+    elif header_video_url:
+        components.append({
+            "type": "header",
+            "parameters": [{"type": "video", "video": {"link": header_video_url}}]
+        })
+    elif header_document_id or header_document_url:
+        doc_param = {"id": header_document_id} if header_document_id else {"link": header_document_url}
+        if header_document_filename:
+            doc_param["filename"] = header_document_filename
+        components.append({
+            "type": "header",
+            "parameters": [{"type": "document", "document": doc_param}]
+        })
+
     # Send message
     service = WhatsAppService(db.session, account.phone_number_id, account.get_access_token())
     result = service.send_template(
         to=phone,
         template_name=trigger.template_name,
         language_code=trigger.language,
-        components=components
+        components=components,
+        copy_code_value=copy_code_value
     )
     
     success = result.get("success", False)
@@ -187,7 +234,15 @@ def invoke_trigger_bulk(trigger_id: int):
         
         source_type = data.get("source_type", "bulk")
         source_ref = data.get("source_reference")
-        
+
+        # Global media params — applied to all recipients unless per-recipient override provided
+        global_img = data.get("header_image_url")
+        global_vid = data.get("header_video_url")
+        global_doc = data.get("header_document_url")
+        global_doc_id = data.get("header_document_id")
+        global_doc_fname = data.get("header_document_filename")
+        global_copy = data.get("copy_code_value")
+
         results = []
         sent_count = 0
         failed_count = 0
@@ -200,9 +255,15 @@ def invoke_trigger_bulk(trigger_id: int):
                 continue
             
             variables = recipient.get("variables", [])
-            
+
             success, result = _send_via_trigger(
-                trigger, phone, variables, source_type, source_ref
+                trigger, phone, variables, source_type, source_ref,
+                header_image_url=recipient.get("header_image_url", global_img),
+                header_video_url=recipient.get("header_video_url", global_vid),
+                header_document_url=recipient.get("header_document_url", global_doc),
+                header_document_id=recipient.get("header_document_id", global_doc_id),
+                header_document_filename=recipient.get("header_document_filename", global_doc_fname),
+                copy_code_value=recipient.get("copy_code_value", global_copy),
             )
             
             if success:
@@ -350,7 +411,13 @@ def ecommerce_webhook(trigger_id: int):
         
         # Send message
         success, result = _send_via_trigger(
-            trigger, phone, variables, f"ecommerce_{platform}", source_ref
+            trigger, phone, variables, f"ecommerce_{platform}", source_ref,
+            header_image_url=data.get("header_image_url"),
+            header_video_url=data.get("header_video_url"),
+            header_document_url=data.get("header_document_url"),
+            header_document_id=data.get("header_document_id"),
+            header_document_filename=data.get("header_document_filename"),
+            copy_code_value=data.get("copy_code_value"),
         )
         
         if success:
@@ -456,7 +523,13 @@ def zapier_webhook(trigger_id: int):
         source_ref = data.get("reference") or data.get("zap_id")
         
         success, result = _send_via_trigger(
-            trigger, phone, variables, "zapier", source_ref
+            trigger, phone, variables, "zapier", source_ref,
+            header_image_url=data.get("header_image_url"),
+            header_video_url=data.get("header_video_url"),
+            header_document_url=data.get("header_document_url"),
+            header_document_id=data.get("header_document_id"),
+            header_document_filename=data.get("header_document_filename"),
+            copy_code_value=data.get("copy_code_value"),
         )
         
         if success:

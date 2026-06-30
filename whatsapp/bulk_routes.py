@@ -4,17 +4,15 @@ from datetime import datetime, timezone, timedelta
 from flask import Blueprint, request, jsonify
 from sqlalchemy import func, distinct, case
 
-from models import db
-from shared_models import WhatsAppLinkTracking
-from notifications import notification_manager
+from shared_models import db, WhatsAppLinkTracking
 from .models import WhatsAppAccount, WhatsAppMessage, WhatsAppConversation
+from .capabilities import broadcast_capability_check
 from .drip_models import WhatsAppDripCampaign, WhatsAppDripStep, WhatsAppDripEnrollment
 from .flow_access import require_account_access
 from .drip_engine import process_single_enrollment, trigger_campaign_now
-from .scheduler import add_campaign_job
 from .utils import normalize_phone_robust
-from rate_limit.decorator import rate_limit
-from subscription.decorators import require_feature
+from .http_rate_limit import rate_limit
+from notifications import notification_manager
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +93,32 @@ def _has_trackable_url_variable(variables):
     return False
 
 
+def _reply_preview_from_content(content):
+    """Best-effort short text preview of an inbound message's stored content."""
+    if content is None:
+        return None
+    if isinstance(content, str):
+        s = content
+    elif isinstance(content, dict):
+        s = (
+            content.get("text")
+            or content.get("body")
+            or content.get("title")
+            or content.get("caption")
+            or ""
+        )
+        if not s:
+            try:
+                import json as _json
+                s = _json.dumps(content, ensure_ascii=False)
+            except Exception:
+                s = str(content)
+    else:
+        s = str(content)
+    s = (s or "").strip()
+    return s[:280] if s else None
+
+
 def _build_campaign_intelligence(campaign: WhatsAppDripCampaign):
     """Compute recipient-level status intelligence for a campaign."""
     enrollments = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign.id).all()
@@ -118,33 +142,41 @@ def _build_campaign_intelligence(campaign: WhatsAppDripCampaign):
         if not normalized_phone:
             continue
 
-        failed = enrollment.status in ("failed", "blocked_missing_data")
-        sent = enrollment.status == "completed" or failed
-
         recipient = recipients.setdefault(
             normalized_phone,
             {
                 "phone_number": normalized_phone,
                 "name": _extract_name_from_variables(variables),
                 "enrollment_status": enrollment.status,
-                "sent": sent,
-                "delivered": False,
-                "read": False,
-                "failed": failed,
+                "sent": bool(enrollment.sent),
+                "delivered": bool(enrollment.delivered),
+                "read": bool(enrollment.read),
+                "failed": bool(enrollment.failed) or enrollment.status in ("failed", "blocked_missing_data"),
                 "clicked": bool(enrollment.clicked),
-                "replied": False,
+                "replied": bool(enrollment.replied),
                 "click_count": int(enrollment.click_count or 0),
-                "last_status": "failed" if failed else ("sent" if sent else "pending"),
-                "last_event_at": _as_aware_utc(enrollment.updated_at or enrollment.created_at),
+                "last_status": "pending",
+                "last_event_at": _as_aware_utc(
+                    enrollment.read_at or enrollment.delivered_at or enrollment.sent_at or enrollment.clicked_at or enrollment.replied_at
+                ),
                 "error_message": enrollment.status_reason,
                 "reply_preview": None,
-                "reply_at": None,
-                "message_id": None,
+                "reply_at": enrollment.replied_at,
+                "message_id": enrollment.message_id,
                 "tracking_id": enrollment.tracking_id,
             },
         )
         if recipient.get("name") is None:
             recipient["name"] = _extract_name_from_variables(variables)
+
+        if recipient.get("read"):
+            recipient["last_status"] = "read"
+        elif recipient.get("delivered"):
+            recipient["last_status"] = "delivered"
+        elif recipient.get("sent"):
+            recipient["last_status"] = "sent"
+        elif recipient.get("failed"):
+            recipient["last_status"] = "failed"
 
         enrollment_by_phone[normalized_phone] = enrollment
 
@@ -165,7 +197,6 @@ def _build_campaign_intelligence(campaign: WhatsAppDripCampaign):
             WhatsAppMessage.delivered_at,
             WhatsAppMessage.read_at,
             WhatsAppMessage.error_message,
-            WhatsAppMessage.conversation_id,
         )
         .join(WhatsAppConversation, WhatsAppMessage.conversation_id == WhatsAppConversation.id)
         .filter(
@@ -175,13 +206,10 @@ def _build_campaign_intelligence(campaign: WhatsAppDripCampaign):
         .all()
     )
 
-    campaign_conv_ids = set()
-    for phone, msg_status, created_at, sent_at, delivered_at, read_at, error_message, conversation_id in msg_rows:
+    for phone, msg_status, created_at, sent_at, delivered_at, read_at, error_message in msg_rows:
         normalized_phone = normalize_phone_robust(phone) or (phone or "")
         if not normalized_phone:
             continue
-        if conversation_id:
-            campaign_conv_ids.add(conversation_id)
 
         recipient = recipients.setdefault(
             normalized_phone,
@@ -223,37 +251,6 @@ def _build_campaign_intelligence(campaign: WhatsAppDripCampaign):
         if event_at and (last_event_at is None or event_at > last_event_at):
             recipient["last_event_at"] = event_at
 
-    if campaign_conv_ids:
-        incoming_rows = (
-            db.session.query(
-                WhatsAppConversation.user_phone,
-                WhatsAppMessage.created_at,
-                WhatsAppMessage.content,
-            )
-            .join(WhatsAppConversation, WhatsAppMessage.conversation_id == WhatsAppConversation.id)
-            .filter(
-                WhatsAppMessage.conversation_id.in_(campaign_conv_ids),
-                WhatsAppMessage.direction == "incoming",
-            )
-            .order_by(WhatsAppMessage.created_at.desc())
-            .all()
-        )
-        for phone, created_at, content in incoming_rows:
-            normalized_phone = normalize_phone_robust(phone) or (phone or "")
-            recipient = recipients.get(normalized_phone)
-            if not recipient or recipient.get("replied"):
-                continue
-            recipient["replied"] = True
-            recipient["reply_at"] = _as_aware_utc(created_at)
-            if isinstance(content, dict):
-                recipient["reply_preview"] = (
-                    content.get("text")
-                    or content.get("body")
-                    or content.get("message")
-                )
-            elif content:
-                recipient["reply_preview"] = str(content)[:120]
-
     click_filters = [
         WhatsAppLinkTracking.workspace_id == str(campaign.workspace_id),
         WhatsAppLinkTracking.click_count > 0,
@@ -270,6 +267,8 @@ def _build_campaign_intelligence(campaign: WhatsAppDripCampaign):
     try:
         clicks = click_query.all()
     except Exception as exc:
+        # Legacy databases may miss newer whatsapp_link_tracking columns.
+        # Keep intelligence endpoint available instead of failing hard.
         db.session.rollback()
         logger.warning("Skipping click-tracking enrichment for campaign %s: %s", campaign.id, exc)
         clicks = []
@@ -282,14 +281,52 @@ def _build_campaign_intelligence(campaign: WhatsAppDripCampaign):
         if not recipient:
             continue
         recipient["clicked"] = bool(recipient.get("clicked") or int(click.click_count or 0) > 0)
-        recipient["click_count"] = max(
-            int(recipient.get("click_count", 0) or 0),
-            int(click.click_count or 0),
-        )
+        # Enrollment click_count is already updated by redirect tracking; avoid double counting by merging with max().
+        recipient["click_count"] = max(int(recipient.get("click_count", 0) or 0), int(click.click_count or 0))
         click_last = _as_aware_utc(click.last_clicked_at)
         last_event_at = _as_aware_utc(recipient.get("last_event_at"))
         if click_last and (last_event_at is None or click_last > last_event_at):
             recipient["last_event_at"] = click_last
+
+    # Inbound replies are now stamped with campaign_id on receipt (webhook.py); surface
+    # the latest reply text per recipient so "replied"/reply_preview are authoritative
+    # on reload instead of depending on the realtime patch. Ordered ascending so the
+    # latest reply wins.
+    try:
+        reply_rows = (
+            db.session.query(
+                WhatsAppConversation.user_phone,
+                WhatsAppMessage.content,
+                WhatsAppMessage.created_at,
+            )
+            .join(WhatsAppConversation, WhatsAppMessage.conversation_id == WhatsAppConversation.id)
+            .filter(
+                WhatsAppMessage.campaign_id == campaign.id,
+                WhatsAppMessage.direction == "incoming",
+            )
+            .order_by(WhatsAppMessage.created_at.asc())
+            .all()
+        )
+    except Exception as exc:
+        db.session.rollback()
+        logger.warning("Skipping reply enrichment for campaign %s: %s", campaign.id, exc)
+        reply_rows = []
+
+    for phone, content, created_at in reply_rows:
+        normalized_phone = normalize_phone_robust(phone) or (phone or "")
+        if not normalized_phone:
+            continue
+        recipient = recipients.get(normalized_phone)
+        if not recipient:
+            continue
+        preview = _reply_preview_from_content(content)
+        if preview:
+            recipient["reply_preview"] = preview
+        recipient["replied"] = True
+        event_at = _as_aware_utc(created_at)
+        prev_reply_at = _as_aware_utc(recipient.get("reply_at"))
+        if event_at and (prev_reply_at is None or event_at > prev_reply_at):
+            recipient["reply_at"] = event_at
 
     summary = {
         "total_recipients": len(recipients),
@@ -303,9 +340,7 @@ def _build_campaign_intelligence(campaign: WhatsAppDripCampaign):
     }
 
     for recipient in recipients.values():
-        recipient["sent"] = bool(
-            recipient["sent"] or recipient["delivered"] or recipient["read"] or recipient["failed"]
-        )
+        recipient["sent"] = bool(recipient["sent"] or recipient["delivered"] or recipient["read"] or recipient["failed"])
         recipient["delivered"] = bool(recipient["delivered"] or recipient["read"])
         if recipient["read"] or recipient["delivered"]:
             recipient["failed"] = False
@@ -474,7 +509,6 @@ def list_campaigns():
     return jsonify({"success": True, "campaigns": result})
 
 @bulk_bp.route("/campaigns", methods=["POST"])
-@require_feature("whatsapp_bulk_messaging")
 @rate_limit("whatsapp.bulk.create")
 @require_account_access
 def create_campaign(account: WhatsAppAccount, workspace_id: str):
@@ -491,6 +525,14 @@ def create_campaign(account: WhatsAppAccount, workspace_id: str):
     template_name = data.get("template_name")
     if not template_name:
         return jsonify({"success": False, "error": "Template is required for bulk campaigns"}), 400
+
+    bc = broadcast_capability_check(account_id)
+    if not bc.ok:
+        return jsonify({"success": False, "error": bc.message, "code": "CAPABILITY_DENIED"}), 403
+        
+    from .safe_mode_engine import is_risk_allowed, RiskClass
+    if not is_risk_allowed(account, RiskClass.HIGH):
+        return jsonify({"success": False, "error": f"Bulk messaging is temporarily disabled by Safe Mode ({account.operational_mode}) to protect your account reputation.", "code": "SAFE_MODE_DENIED"}), 403
         
     # Create campaign
     campaign = WhatsAppDripCampaign(
@@ -537,355 +579,82 @@ def get_campaign(campaign_id: int):
 @bulk_bp.route("/campaigns/<int:campaign_id>/stats", methods=["GET"])
 def get_campaign_stats(campaign_id: int):
     """Get live stats for a campaign."""
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    
-    # Enrollment-level stats
-    total = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id).count()
-    completed = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id, status="completed").count()
-    enrollment_failed = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id, status="failed").count()
-    active = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id, status="active").count()
-    blocked = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id, status="blocked_missing_data").count()
-    
-    # Real stats from messages table — counts actual delivery outcomes from webhooks
-    msg_stats = db.session.query(
-        WhatsAppMessage.status,
-        func.count(distinct(WhatsAppMessage.conversation_id))
-    ).filter(
-        WhatsAppMessage.campaign_id == campaign_id
-    ).group_by(WhatsAppMessage.status).all()
-    
-    msg_counts = {s: c for s, c in msg_stats}
-    
-    # Message-level delivery failures (from Meta webhook, e.g. error 130472, 131049)
-    msg_failed = msg_counts.get("failed", 0)
-    # Delivered = delivered + read (read implies delivered)
-    delivered = msg_counts.get("delivered", 0) + msg_counts.get("read", 0)
-    read = msg_counts.get("read", 0)
-    
-    # Total failed = enrollment-level failures + message-level delivery failures
-    total_failed = enrollment_failed + blocked + msg_failed
-    # Sent = completed enrollments (API accepted the message)
-    sent = completed
-
-    stats = {
-        "total_recipients": total,
-        "sent": sent,
-        "failed": total_failed,
-        "pending": active, 
-        "queued": 0,
-        "delivered": delivered,
-        "read": read,
-        "progress_percent": int((completed / total * 100)) if total > 0 else 0,
-        "delivery_rate": int((delivered / sent * 100)) if sent > 0 else 0,
-        "read_rate": int((read / sent * 100)) if sent > 0 else 0,
-        "failure_rate": int((total_failed / total * 100)) if total > 0 else 0
-    }
-    
-    return jsonify({"success": True, "stats": stats})
-
-
-@bulk_bp.route("/campaigns/<int:campaign_id>/failed", methods=["GET"])
-def get_campaign_failed_messages(campaign_id: int):
-    """Get details of failed message deliveries for a campaign."""
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    
-    # Get messages that failed delivery (webhook reported failure)
-    failed_messages = db.session.query(
-        WhatsAppMessage.id,
-        WhatsAppMessage.error_code,
-        WhatsAppMessage.error_message,
-        WhatsAppMessage.created_at,
-        WhatsAppConversation.user_phone
-    ).join(
-        WhatsAppConversation, WhatsAppMessage.conversation_id == WhatsAppConversation.id
-    ).filter(
-        WhatsAppMessage.campaign_id == campaign_id,
-        WhatsAppMessage.status == "failed"
-    ).all()
-    
-    # Get enrollments that failed at enrollment level
-    failed_enrollments = WhatsAppDripEnrollment.query.filter(
-        WhatsAppDripEnrollment.campaign_id == campaign_id,
-        WhatsAppDripEnrollment.status.in_(["failed", "blocked_missing_data"])
-    ).all()
-    
-    failures = []
-    for msg in failed_messages:
-        failures.append({
-            "phone": msg.user_phone,
-            "error_code": msg.error_code,
-            "error_message": msg.error_message,
-            "type": "delivery_failed",
-            "timestamp": msg.created_at.isoformat() + "Z" if msg.created_at else None
-        })
-    for enr in failed_enrollments:
-        failures.append({
-            "phone": enr.phone_number,
-            "error_code": None,
-            "error_message": enr.status_reason or enr.status,
-            "type": "enrollment_failed",
-            "timestamp": None
-        })
-    
-    return jsonify({"success": True, "failures": failures})
-
-@bulk_bp.route("/campaigns/<int:campaign_id>/resubscribe-webhooks", methods=["POST"])
-def resubscribe_campaign_webhooks(campaign_id: int):
-    """Re-subscribe WABA webhooks for a campaign's account. 
-    
-    Use this to fix webhook delivery issues when status updates stop arriving.
-    """
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    account = WhatsAppAccount.query.get(campaign.account_id)
-    
-    if not account:
-        return jsonify({"success": False, "error": "Account not found"}), 404
-    
-    access_token = account.get_access_token()
-    if not access_token:
-        return jsonify({"success": False, "error": "No access token for account"}), 400
-    
-    from .health_check import subscribe_waba_to_webhooks
-    success, message, details = subscribe_waba_to_webhooks(account.waba_id, access_token)
-    
-    return jsonify({
-        "success": success,
-        "message": message,
-        "details": details,
-        "waba_id": account.waba_id,
-        "account_phone": account.display_phone_number,
-    }), 200 if success else 400
-
-
-@bulk_bp.route("/crm-audience", methods=["GET"])
-def get_crm_audience():
-    """Fetch CRM audience (Leads or Contacts) for bulk messaging."""
     workspace_id = request.args.get("workspace_id")
-    source = request.args.get("source", "leads") # leads or contacts
-    search = request.args.get("search")
-    
-    if not workspace_id:
-        return jsonify({"success": False, "error": "Workspace ID required"}), 400
-        
-    # Access dynamic CRM models
-    from flask import current_app
-    crm_models = getattr(current_app, "crm_models", None)
-    
-    if not crm_models:
-        return jsonify({"success": False, "error": "CRM models not initialized"}), 500
-        
-    model = crm_models["Lead"] if source == "leads" else crm_models["Contact"]
-    
-    query = model.query.filter_by(workspace_id=workspace_id)
-    
-    if search:
-        search_term = f"%{search}%"
-        query = query.filter(
-            db.or_(
-                model.name.ilike(search_term),
-                model.phone.ilike(search_term),
-                model.email.ilike(search_term)
-            )
-        )
-        
-    # Fetch ALL records (no limit as requested)
-    records = query.order_by(model.created_at.desc()).all()
-    
-    audience = []
-    
-    # Summary stats
-    total = len(records)
-    with_phone = 0
-    whatsapp_ready = 0
-    
-    for r in records:
-        # Normalize phone using robust normalizer
-        raw_phone = r.phone or ""
-        norm_phone = normalize_phone_robust(raw_phone)
-        
-        # Valid if normalizer returned a result
-        is_valid = norm_phone is not None
-        
-        if raw_phone:
-            with_phone += 1
-            if is_valid:
-                whatsapp_ready += 1
-        
-        audience.append({
-            "id": r.id,
-            "name": r.name,
-            "phone": raw_phone,
-            "phone_normalized": norm_phone,
-            "email": r.email,
-            "company": r.company,
-            "status": r.status,
-            "source": getattr(r, "source", None) or getattr(r, "external_source", None),
-            "whatsapp_ready": is_valid,
-            "created_at": r.created_at.isoformat() if r.created_at else None
-        })
-        
-    return jsonify({
-        "success": True, 
-        "audience": audience,
-        "summary": {
-            "total": total,
-            "with_phone": with_phone,
-            "whatsapp_ready": whatsapp_ready
+    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
+
+    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
+        return jsonify({"success": False, "error": "Access denied"}), 403
+
+    try:
+        # Enrollment-level stats
+        total = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id).count()
+        completed = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id, status="completed").count()
+        enrollment_failed = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id, status="failed").count()
+        active = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id, status="active").count()
+        blocked = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id, status="blocked_missing_data").count()
+
+        # Real stats from messages table - counts actual delivery outcomes from webhooks
+        msg_stats = db.session.query(
+            WhatsAppMessage.status,
+            func.count(distinct(WhatsAppMessage.conversation_id))
+        ).filter(
+            WhatsAppMessage.campaign_id == campaign_id
+        ).group_by(WhatsAppMessage.status).all()
+
+        msg_counts = {s: c for s, c in msg_stats}
+
+        # Message-level delivery failures (from Meta webhook, e.g. error 130472, 131049)
+        msg_failed = msg_counts.get("failed", 0)
+        # Delivered = delivered + read (read implies delivered)
+        delivered = msg_counts.get("delivered", 0) + msg_counts.get("read", 0)
+        read = msg_counts.get("read", 0)
+
+        # Total failed = enrollment-level failures + message-level delivery failures
+        total_failed = enrollment_failed + blocked + msg_failed
+        # Sent = completed enrollments (API accepted the message)
+        sent = completed
+
+        summary, _, _ = _build_campaign_intelligence(campaign)
+
+        stats = {
+            "total_recipients": total,
+            "sent": sent,
+            "failed": total_failed,
+            "pending": active,
+            "queued": 0,
+            "delivered": delivered,
+            "read": read,
+            "clicked": summary.get("clicked", 0),
+            "replied": summary.get("replied", 0),
+            "progress_percent": int((completed / total * 100)) if total > 0 else 0,
+            "delivery_rate": int((delivered / sent * 100)) if sent > 0 else 0,
+            "read_rate": int((read / sent * 100)) if sent > 0 else 0,
+            "failure_rate": int((total_failed / total * 100)) if total > 0 else 0,
+            "click_rate": summary.get("click_rate", 0),
+            "reply_rate": summary.get("reply_rate", 0),
         }
-    })
-@bulk_bp.route("/campaigns/<int:campaign_id>/recipients", methods=["POST"])
-@rate_limit("whatsapp.bulk.recipients")
-def add_recipients(campaign_id: int):
-    """Add recipients to a bulk campaign."""
-    workspace_id = request.args.get("workspace_id")
-    data = request.get_json() or {}
-    recipients = data.get("recipients", [])
-    
-    if not recipients:
-        return jsonify({"success": False, "error": "No recipients provided"}), 400
-        
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": "Access denied"}), 403
-        
-    added_count = 0
-    duplicates_count = 0
-    invalid_count = 0
-    
-    for r in recipients:
-        phone = r.get("phone_number")
-        if not phone:
-            invalid_count += 1
-            continue
-            
-        # Robust normalization: handles multi-number, country codes, etc.
-        clean_phone = normalize_phone_robust(phone)
-        if not clean_phone:
-            invalid_count += 1
-            continue
-            
-        # Check for duplicate in this campaign
-        existing = WhatsAppDripEnrollment.query.filter_by(
-            campaign_id=campaign_id,
-            phone_number=clean_phone
-        ).first()
-        
-        if existing:
-            # Update variables if needed
-            existing.variables = r.get("params", {})
-            existing.name = r.get("name")
-            duplicates_count += 1
-        else:
-            enrollment = WhatsAppDripEnrollment(
-                campaign_id=campaign_id,
-                phone_number=clean_phone,
-                current_step_order=0,
-                status="active",
-                variables=r.get("params", {}),
-                created_at=datetime.now(timezone.utc),
-                next_run_at=datetime.now(timezone.utc)
-            )
-            db.session.add(enrollment)
-            added_count += 1
-            
-    db.session.commit()
-    
-    # Update stats
-    campaign.enrolled_count = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id).count()
-    db.session.commit()
-    
-    return jsonify({
-        "success": True, 
-        "added": added_count, 
-        "duplicates": duplicates_count, 
-        "invalid": invalid_count
-    })
 
-@bulk_bp.route("/campaigns/<int:campaign_id>/schedule", methods=["POST"])
-@rate_limit("whatsapp.bulk.schedule")
-def schedule_campaign(campaign_id: int):
-    """Schedule or send a campaign."""
-    workspace_id = request.args.get("workspace_id") or (request.get_json() or {}).get("workspace_id")
-    data = request.get_json() or {}
-    
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": f"Access denied. Campaign WS: {campaign.workspace_id}, Req WS: {workspace_id}"}), 403
-        
-    scheduled_at_str = data.get("scheduled_at")
-    
-    if scheduled_at_str:
-        try:
-             # Parse ISO format
-            scheduled_at = datetime.fromisoformat(scheduled_at_str.replace('Z', '+00:00'))
-            # If naive, assume UTC (or handle timezone awareness properly based on app config)
-            if scheduled_at.tzinfo is None:
-                scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
-                
-            # If scheduling for future
-            campaign.status = "scheduled"
-            # Store scheduled_at in trigger_value (repurposing unused field for manual campaigns)
-            campaign.trigger_value = scheduled_at.isoformat()
-            
-            # Schedule the job
-            job_id = add_campaign_job(campaign.id, scheduled_at, trigger_campaign_now)
-            if not job_id:
-                return jsonify({"success": False, "error": "Failed to schedule job"}), 500
-                
-        except ValueError:
-            return jsonify({"success": False, "error": "Invalid date format"}), 400
-    else:
-        # Send now -> Set status to 'running' immediately so UI shows correct state
-        campaign.status = "running"
-        campaign.trigger_value = None
-        
-        from pytz import utc
-        from datetime import timedelta
-        # Schedule 1 second from now to process immediately
-        send_time = datetime.now(utc) + timedelta(seconds=1)
-        add_campaign_job(campaign.id, send_time, trigger_campaign_now)
-        logger.info(f"Send Now: Campaign {campaign.id} set to RUNNING, job scheduled for {send_time}")
-
-        
-    db.session.commit()
-    
-    # TODO: Trigger background job to start sending if 'running'
-    
-    return jsonify({"success": True, "status": campaign.status})
-
-@bulk_bp.route("/campaigns/<int:campaign_id>/pause", methods=["POST"])
-def pause_campaign(campaign_id: int):
-    """Pause a running campaign."""
-    workspace_id = request.args.get("workspace_id") or (request.get_json() or {}).get("workspace_id")
-    
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": "Access denied"}), 403
-        
-    if campaign.status == "running":
-        campaign.status = "paused"
-        db.session.commit()
-        
-    return jsonify({"success": True, "status": campaign.status})
-
-@bulk_bp.route("/campaigns/<int:campaign_id>/resume", methods=["POST"])
-def resume_campaign(campaign_id: int):
-    """Resume a paused campaign."""
-    workspace_id = request.args.get("workspace_id") or (request.get_json() or {}).get("workspace_id")
-    
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": "Access denied"}), 403
-        
-    if campaign.status == "paused":
-        campaign.status = "running"
-        db.session.commit()
-        
-    return jsonify({"success": True, "status": campaign.status})
+        return jsonify({"success": True, "stats": stats})
+    except Exception:
+        logger.exception("Failed to compute campaign stats for campaign_id=%s", campaign_id)
+        return jsonify({"success": True, "stats": {
+            "total_recipients": 0,
+            "sent": 0,
+            "failed": 0,
+            "pending": 0,
+            "queued": 0,
+            "delivered": 0,
+            "read": 0,
+            "clicked": 0,
+            "replied": 0,
+            "progress_percent": 0,
+            "delivery_rate": 0,
+            "read_rate": 0,
+            "failure_rate": 0,
+            "click_rate": 0,
+            "reply_rate": 0,
+            "degraded": True,
+        }}), 200
 
 
 @bulk_bp.route("/campaigns/<int:campaign_id>/summary", methods=["GET"])
@@ -1048,11 +817,8 @@ def retarget_campaign_recipients(campaign_id: int):
     new_campaign.enrolled_count = added
 
     if send_now:
-        new_campaign.status = "running"
-        new_campaign.trigger_value = None
-        from pytz import utc
-        send_time = datetime.now(utc) + timedelta(seconds=1)
-        add_campaign_job(new_campaign.id, send_time, trigger_campaign_now)
+        new_campaign.status = "scheduled"
+        new_campaign.trigger_value = datetime.now(timezone.utc).isoformat()
 
     db.session.commit()
 
@@ -1084,6 +850,306 @@ def retarget_campaign_recipients(campaign_id: int):
         }
     )
 
+
+@bulk_bp.route("/campaigns/<int:campaign_id>/failed", methods=["GET"])
+def get_campaign_failed_messages(campaign_id: int):
+    """Get details of failed message deliveries for a campaign."""
+    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
+    
+    # Get messages that failed delivery (webhook reported failure)
+    failed_messages = db.session.query(
+        WhatsAppMessage.id,
+        WhatsAppMessage.error_code,
+        WhatsAppMessage.error_message,
+        WhatsAppMessage.created_at,
+        WhatsAppConversation.user_phone
+    ).join(
+        WhatsAppConversation, WhatsAppMessage.conversation_id == WhatsAppConversation.id
+    ).filter(
+        WhatsAppMessage.campaign_id == campaign_id,
+        WhatsAppMessage.status == "failed"
+    ).all()
+    
+    # Get enrollments that failed at enrollment level
+    failed_enrollments = WhatsAppDripEnrollment.query.filter(
+        WhatsAppDripEnrollment.campaign_id == campaign_id,
+        WhatsAppDripEnrollment.status.in_(["failed", "blocked_missing_data"])
+    ).all()
+    
+    failures = []
+    for msg in failed_messages:
+        failures.append({
+            "phone": msg.user_phone,
+            "error_code": msg.error_code,
+            "error_message": msg.error_message,
+            "type": "delivery_failed",
+            "timestamp": msg.created_at.isoformat() + "Z" if msg.created_at else None
+        })
+    for enr in failed_enrollments:
+        failures.append({
+            "phone": enr.phone_number,
+            "error_code": None,
+            "error_message": enr.status_reason or enr.status,
+            "type": "enrollment_failed",
+            "timestamp": None
+        })
+    
+    return jsonify({"success": True, "failures": failures})
+
+@bulk_bp.route("/campaigns/<int:campaign_id>/resubscribe-webhooks", methods=["POST"])
+def resubscribe_campaign_webhooks(campaign_id: int):
+    """Re-subscribe WABA webhooks for a campaign's account. 
+    
+    Use this to fix webhook delivery issues when status updates stop arriving.
+    """
+    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
+    account = WhatsAppAccount.query.get(campaign.account_id)
+    
+    if not account:
+        return jsonify({"success": False, "error": "Account not found"}), 404
+    
+    access_token = account.get_access_token()
+    if not access_token:
+        return jsonify({"success": False, "error": "No access token for account"}), 400
+    
+    from .health_check import subscribe_waba_to_webhooks
+    success, message, details = subscribe_waba_to_webhooks(account.waba_id, access_token)
+    
+    return jsonify({
+        "success": success,
+        "message": message,
+        "details": details,
+        "waba_id": account.waba_id,
+        "account_phone": account.display_phone_number,
+    }), 200 if success else 400
+
+
+@bulk_bp.route("/crm-audience", methods=["GET"])
+def get_crm_audience():
+    """Fetch CRM audience (Leads or Contacts) for bulk messaging."""
+    workspace_id = request.args.get("workspace_id")
+    source = request.args.get("source", "leads") # leads or contacts
+    search = request.args.get("search")
+    
+    if not workspace_id:
+        return jsonify({"success": False, "error": "Workspace ID required"}), 400
+        
+    # Access dynamic CRM models
+    from flask import current_app
+    crm_models = getattr(current_app, "crm_models", None)
+    
+    if not crm_models:
+        return jsonify({"success": False, "error": "CRM models not initialized"}), 500
+        
+    model = crm_models["Lead"] if source == "leads" else crm_models["Contact"]
+    
+    query = model.query.filter_by(workspace_id=workspace_id)
+    
+    if search:
+        search_term = f"%{search}%"
+        query = query.filter(
+            db.or_(
+                model.name.ilike(search_term),
+                model.phone.ilike(search_term),
+                model.email.ilike(search_term)
+            )
+        )
+        
+    # Fetch ALL records (no limit as requested)
+    records = query.order_by(model.created_at.desc()).all()
+    
+    audience = []
+    
+    # Summary stats
+    total = len(records)
+    with_phone = 0
+    whatsapp_ready = 0
+    
+    for r in records:
+        # Normalize phone using robust normalizer
+        raw_phone = r.phone or ""
+        norm_phone = normalize_phone_robust(raw_phone)
+        
+        # Valid if normalizer returned a result
+        is_valid = norm_phone is not None
+        
+        if raw_phone:
+            with_phone += 1
+            if is_valid:
+                whatsapp_ready += 1
+        
+        audience.append({
+            "id": r.id,
+            "name": r.name,
+            "phone": raw_phone,
+            "phone_normalized": norm_phone,
+            "email": r.email,
+            "company": r.company,
+            "status": r.status,
+            "source": getattr(r, "source", None) or getattr(r, "external_source", None),
+            "whatsapp_ready": is_valid,
+            "created_at": r.created_at.isoformat() if r.created_at else None
+        })
+        
+    return jsonify({
+        "success": True, 
+        "audience": audience,
+        "summary": {
+            "total": total,
+            "with_phone": with_phone,
+            "whatsapp_ready": whatsapp_ready
+        }
+    })
+@bulk_bp.route("/campaigns/<int:campaign_id>/recipients", methods=["POST"])
+@rate_limit("whatsapp.bulk.recipients")
+def add_recipients(campaign_id: int):
+    """Add recipients to a bulk campaign."""
+    workspace_id = request.args.get("workspace_id")
+    data = request.get_json() or {}
+    recipients = data.get("recipients", [])
+    enable_tracking_url = bool(data.get("enable_tracking_url", True))
+    
+    if not recipients:
+        return jsonify({"success": False, "error": "No recipients provided"}), 400
+        
+    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
+    
+    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
+        return jsonify({"success": False, "error": "Access denied"}), 403
+        
+    added_count = 0
+    duplicates_count = 0
+    invalid_count = 0
+    
+    for r in recipients:
+        phone = r.get("phone_number")
+        if not phone:
+            invalid_count += 1
+            continue
+
+        # Robust normalization: handles multi-number, country codes, Mexico/Argentina, etc.
+        # Use the row's country code (when the dataset provides one) so bare national numbers
+        # are normalized for their actual country instead of defaulting to India (+91).
+        row_cc = r.get("country_code") or r.get("countryCode")
+        clean_phone = normalize_phone_robust(phone, country_code=row_cc)
+        if not clean_phone:
+            invalid_count += 1
+            continue
+            
+        # Check for duplicate in this campaign
+        existing = WhatsAppDripEnrollment.query.filter_by(
+            campaign_id=campaign_id,
+            phone_number=clean_phone
+        ).first()
+        
+        if existing:
+            # Update variables if needed
+            merged_params = dict(r.get("params", {}) or {})
+            merged_params["__enable_tracking_url"] = enable_tracking_url
+            existing.variables = merged_params
+            existing.name = r.get("name")
+            duplicates_count += 1
+        else:
+            merged_params = dict(r.get("params", {}) or {})
+            merged_params["__enable_tracking_url"] = enable_tracking_url
+            enrollment = WhatsAppDripEnrollment(
+                campaign_id=campaign_id,
+                phone_number=clean_phone,
+                current_step_order=0,
+                status="active",
+                variables=merged_params,
+                created_at=datetime.now(timezone.utc),
+                next_run_at=datetime.now(timezone.utc)
+            )
+            db.session.add(enrollment)
+            added_count += 1
+            
+    db.session.commit()
+    
+    # Update stats
+    campaign.enrolled_count = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign_id).count()
+    db.session.commit()
+    
+    return jsonify({
+        "success": True, 
+        "added": added_count, 
+        "duplicates": duplicates_count, 
+        "invalid": invalid_count
+    })
+
+@bulk_bp.route("/campaigns/<int:campaign_id>/schedule", methods=["POST"])
+@rate_limit("whatsapp.bulk.schedule")
+def schedule_campaign(campaign_id: int):
+    """Schedule or send a campaign."""
+    workspace_id = request.args.get("workspace_id") or (request.get_json() or {}).get("workspace_id")
+    data = request.get_json() or {}
+    
+    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
+    
+    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
+        return jsonify({"success": False, "error": f"Access denied. Campaign WS: {campaign.workspace_id}, Req WS: {workspace_id}"}), 403
+        
+    scheduled_at_str = data.get("scheduled_at")
+    
+    if scheduled_at_str:
+        try:
+             # Parse ISO format
+            scheduled_at = datetime.fromisoformat(scheduled_at_str.replace('Z', '+00:00'))
+            # If naive, assume UTC (or handle timezone awareness properly based on app config)
+            if scheduled_at.tzinfo is None:
+                scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+                
+            # If scheduling for future
+            campaign.status = "scheduled"
+            # Store scheduled_at in trigger_value (repurposing unused field for manual campaigns)
+            campaign.trigger_value = scheduled_at.isoformat()
+                
+        except ValueError:
+            return jsonify({"success": False, "error": "Invalid date format"}), 400
+    else:
+        # Send now -> Set status to 'scheduled' immediately so the next tick picks it up
+        campaign.status = "scheduled"
+        campaign.trigger_value = datetime.now(timezone.utc).isoformat()
+        logger.info(f"Send Now: Campaign {campaign.id} set to SCHEDULED for immediate pickup")
+
+        
+    db.session.commit()
+    
+    # TODO: Trigger background job to start sending if 'running'
+    
+    return jsonify({"success": True, "status": campaign.status})
+
+@bulk_bp.route("/campaigns/<int:campaign_id>/pause", methods=["POST"])
+def pause_campaign(campaign_id: int):
+    """Pause a running campaign."""
+    workspace_id = request.args.get("workspace_id") or (request.get_json() or {}).get("workspace_id")
+    
+    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
+    
+    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
+        return jsonify({"success": False, "error": "Access denied"}), 403
+        
+    if campaign.status == "running":
+        campaign.status = "paused"
+        db.session.commit()
+        
+    return jsonify({"success": True, "status": campaign.status})
+
+@bulk_bp.route("/campaigns/<int:campaign_id>/resume", methods=["POST"])
+def resume_campaign(campaign_id: int):
+    """Resume a paused campaign."""
+    workspace_id = request.args.get("workspace_id") or (request.get_json() or {}).get("workspace_id")
+    
+    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
+    
+    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
+        return jsonify({"success": False, "error": "Access denied"}), 403
+        
+    if campaign.status == "paused":
+        campaign.status = "running"
+        db.session.commit()
+        
+    return jsonify({"success": True, "status": campaign.status})
 
 @bulk_bp.route("/campaigns/<int:campaign_id>", methods=["DELETE"])
 def delete_campaign(campaign_id: int):

@@ -19,12 +19,12 @@ from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from sqlalchemy import func
 
-from models import db
+from shared_models import db
 from .models import WhatsAppTemplate, WhatsAppAccount
 from .services import WhatsAppService
 from .template_validator import validate_template, TemplateValidator, ApprovalPath
 from .template_rewriter import rewrite_template, RewriteMode
-from rate_limit.decorator import rate_limit
+from .http_rate_limit import rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -542,6 +542,7 @@ def upload_template_media_url():
         if not (media_url.startswith("https://") or media_url.startswith("http://")):
             return jsonify({"success": False, "error": "URL must start with http:// or https://"}), 400
 
+        # Get account-specific access token
         access_token = None
         if account_id:
             try:
@@ -557,6 +558,7 @@ def upload_template_media_url():
         if not access_token:
             return jsonify({"success": False, "error": "No access token available. Please reconnect your WhatsApp account."}), 400
 
+        # Download remote file
         resp = http_requests.get(media_url, timeout=30, stream=True, allow_redirects=True)
         if not resp.ok:
             return jsonify({"success": False, "error": f"Failed to download media (HTTP {resp.status_code})"}), 400
@@ -577,6 +579,7 @@ def upload_template_media_url():
         if media_type in expected_by_type and content_type not in expected_by_type[media_type]:
             logger.warning("URL media type mismatch: requested=%s, content_type=%s, url=%s", media_type, content_type, media_url)
 
+        # Create temp file with best-effort extension
         parsed = urlparse(media_url)
         ext_from_url = os.path.splitext(parsed.path)[1]
         ext_from_mime = mimetypes.guess_extension(content_type or "") or ""
@@ -596,6 +599,7 @@ def upload_template_media_url():
                 temp_file.write(chunk)
 
         try:
+            # Recalculate mime type from file if header is missing/generic
             if content_type in {"", "application/octet-stream"}:
                 guessed, _ = mimetypes.guess_type(temp_path)
                 if guessed:
@@ -625,7 +629,7 @@ def upload_template_media_url():
 # ==============================================================
 
 @template_bp.route("/", methods=["GET"])
-@template_bp.route("", methods=["GET"])
+@template_bp.route("/", methods=["GET"])
 def get_templates():
     """
     List templates with sorting and filtering.

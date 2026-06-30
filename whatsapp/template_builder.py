@@ -286,6 +286,63 @@ class TemplateBuilder:
             parameters=[{"type": "coupon_code", "coupon_code": code}]
         ))
         return self
+
+    def add_catalog_button(self, index: int, thumbnail_product_retailer_id: str = "") -> "TemplateBuilder":
+        """
+        Add catalog button parameter.
+
+        Meta requires CATALOG buttons to include an action parameter with
+        thumbnail_product_retailer_id. If empty, Meta uses a default thumbnail.
+
+        Args:
+            index: Button index (0-based)
+            thumbnail_product_retailer_id: Retailer ID of a product to use as thumbnail
+        """
+        params: List[Dict[str, Any]] = []
+        if thumbnail_product_retailer_id:
+            params.append({
+                "type": "action",
+                "action": {
+                    "thumbnail_product_retailer_id": thumbnail_product_retailer_id
+                }
+            })
+        self._button_components.append(TemplateComponent(
+            type="button",
+            sub_type="catalog",
+            index=index,
+            parameters=params,
+        ))
+        return self
+
+    def add_flow_button(self, index: int, flow_token: str = "", flow_action_data: Optional[Dict] = None) -> "TemplateBuilder":
+        """
+        Add flow button parameter.
+
+        Args:
+            index: Button index (0-based)
+            flow_token: Token for flow session
+            flow_action_data: Optional data for the flow action
+        """
+        params: List[Dict[str, Any]] = []
+        if flow_token:
+            params.append({"type": "text", "text": flow_token})
+        self._button_components.append(TemplateComponent(
+            type="button",
+            sub_type="flow",
+            index=index,
+            parameters=params,
+        ))
+        return self
+
+    def add_voice_call_button(self, index: int) -> "TemplateBuilder":
+        """
+        Add voice call button. No parameters required at send time.
+
+        Args:
+            index: Button index (0-based)
+        """
+        # Voice call buttons don't need parameters at send time
+        return self
     
     # ============================================================
     # Build Methods

@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify, url_for
 
-from models import db
+from shared_models import db
 from .models import WhatsAppAccount
 from .trigger_models import WhatsAppTrigger
 from .services import WhatsAppService
@@ -29,16 +29,45 @@ def list_triggers(account_id: int, account: WhatsAppAccount, workspace_id: str):
             workspace_id=workspace_id
         ).order_by(WhatsAppTrigger.created_at.desc()).all()
         
-        # Enrich with variable count from templates
+        # Enrich with template info (variable count, header format, copy-code, example media)
         from .models import WhatsAppTemplate
         templates = WhatsAppTemplate.query.filter_by(account_id=account_id).all()
-        template_map = {(t.name, t.language): t.variable_count for t in templates}
-        
+
+        template_info = {}
+        for tmpl in templates:
+            key = (tmpl.name, tmpl.language)
+            header_format = None
+            has_copy_code = False
+            example_media_url = None
+            if tmpl.components:
+                for comp in tmpl.components:
+                    ctype = (comp.get("type") or "").upper()
+                    if ctype == "HEADER":
+                        fmt = (comp.get("format") or "").upper()
+                        if fmt in ("IMAGE", "VIDEO", "DOCUMENT"):
+                            header_format = fmt
+                        handles = (comp.get("example") or {}).get("header_handle", [])
+                        if handles and isinstance(handles[0], str) and handles[0].startswith("http"):
+                            example_media_url = handles[0]
+                    elif ctype == "BUTTONS":
+                        for btn in (comp.get("buttons") or []):
+                            if (btn.get("type") or "").upper() == "COPY_CODE":
+                                has_copy_code = True
+            template_info[key] = {
+                "variable_count": tmpl.variable_count or 0,
+                "header_format": header_format,
+                "has_copy_code_button": has_copy_code,
+                "example_media_url": example_media_url,
+            }
+
         trigger_list = []
         for t in triggers:
             data = t.to_dict()
-            # Default to 0 if template definition not found locally
-            data["variable_count"] = template_map.get((t.template_name, t.language), 0)
+            info = template_info.get((t.template_name, t.language), {})
+            data["variable_count"] = info.get("variable_count", 0)
+            data["header_format"] = info.get("header_format")
+            data["has_copy_code_button"] = info.get("has_copy_code_button", False)
+            data["example_media_url"] = info.get("example_media_url")
             trigger_list.append(data)
         
         return jsonify({
@@ -178,6 +207,22 @@ def invoke_trigger(trigger_id: int):
         ).first()
 
         mapping = template_obj.get_variable_mapping() if template_obj else {}
+
+        # If template requires DOCUMENT header and caller provided neither id nor url,
+        # fallback to template example handle URL to avoid Meta 132012 mismatch.
+        requires_document_header = False
+        example_document_url = None
+        if template_obj and isinstance(template_obj.components, list):
+            for comp in template_obj.components:
+                comp_type = str((comp or {}).get("type", "")).upper()
+                comp_format = str((comp or {}).get("format", "")).upper()
+                if comp_type == "HEADER" and comp_format == "DOCUMENT":
+                    requires_document_header = True
+                    example = (comp or {}).get("example") or {}
+                    handles = example.get("header_handle") or []
+                    if isinstance(handles, list) and handles:
+                        example_document_url = str(handles[0] or "").strip()
+                    break
         
         components = []
         if variables:
@@ -198,12 +243,47 @@ def invoke_trigger(trigger_id: int):
                 "type": "body",
                 "parameters": body_params
             })
-            
+
+        # Optional media header parameters
+        header_image_url = data.get("header_image_url")
+        header_video_url = data.get("header_video_url")
+        header_document_url = data.get("header_document_url")
+        header_document_id = data.get("header_document_id")
+        header_document_filename = data.get("header_document_filename")
+        copy_code_value = data.get("copy_code_value")
+
+        if requires_document_header and not header_document_id and not header_document_url:
+            # Don't use example_document_url - it's a temporary CDN link that causes "media upload error"
+            return jsonify({
+                "error": "template_requires_document_header_but_no_header_document_id_provided",
+                "detail": "Must provide header_document_id (WhatsApp media ID). Temporary CDN URLs are not supported."
+            }), 400
+
+        if header_image_url:
+            components.append({
+                "type": "header",
+                "parameters": [{"type": "image", "image": {"link": header_image_url}}]
+            })
+        elif header_video_url:
+            components.append({
+                "type": "header",
+                "parameters": [{"type": "video", "video": {"link": header_video_url}}]
+            })
+        elif header_document_id or header_document_url:
+            doc_param = {"id": header_document_id} if header_document_id else {"link": header_document_url}
+            if header_document_filename:
+                doc_param["filename"] = header_document_filename
+            components.append({
+                "type": "header",
+                "parameters": [{"type": "document", "document": doc_param}]
+            })
+
         result = service.send_template(
             to=to,
             template_name=trigger.template_name,
             language_code=trigger.language,
-            components=components
+            components=components,
+            copy_code_value=copy_code_value
         )
         
         if result.get("success"):

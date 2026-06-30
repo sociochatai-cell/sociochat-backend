@@ -55,41 +55,58 @@ def normalize_phone(phone: str) -> str:
     return digits
 
 
-def normalize_phone_robust(raw) -> Optional[str]:
+def _digits_only(value) -> str:
+    """All digits in a value, as a string."""
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _region_for_country_code(cc_digits: str):
+    """Map a numeric dialing/country code (e.g. '52', '54', '1') to an ISO region (e.g. 'MX',
+    'AR', 'US') using phonenumbers. Returns None if unavailable/ambiguous-empty."""
+    if not cc_digits:
+        return None
+    try:
+        import phonenumbers
+        region = phonenumbers.region_code_for_country_code(int(cc_digits))
+        if region and region != "ZZ":
+            return region
+    except Exception:
+        pass
+    return None
+
+
+def normalize_phone_robust(raw, country_code=None, default_region: str = "IN") -> Optional[str]:
     """
-    Production-grade phone normalizer using Google's phonenumbers library.
+    Production-grade phone normalizer using Google's phonenumbers library. Returns digits-only
+    E.164 (no '+'), or None if no valid number is found.
 
-    Handles every messy CRM edge case:
-    - Multi-number fields: "8527727496, 9999346509" → "918527727496"
-    - Concatenated with +: "+277780336483+919650044539" → "277780336483"
-    - Scientific notation from Excel: "9.19E+11" → "919000000000"
-    - International: "+1 650 555 1234" → "16505551234"
-    - Indian bare: "9876543210" → "919876543210"
-    - Leading zero: "09876543210" → "919876543210"
-    - Spaces/dashes/parens: "+91 (987) 654-3210" → "919876543210"
+    `country_code` (optional): the row's numeric dialing code (e.g. "52", "+54", 91). When the
+    phone value is a bare NATIONAL number, this picks the correct region so the number is NOT
+    blindly assumed Indian (+91), and so country-specific quirks (Mexico's +52, Argentina's
+    mobile +549, etc.) are handled by phonenumbers rather than naive concatenation.
 
-    Returns:
-        First valid phone as digits-only E.164 (no +), or None if invalid.
+    Resolution order, per candidate number:
+      1. Value already in international form ("+…") → trust it.
+      2. country_code given → parse the national number under that region (correct MX/AR),
+         and also try international "+<cc><national>".
+      3. Looks like it already embeds a country code (long, no '+') → try international "+<digits>".
+      4. Fall back to the default region (India) — mainly for bare 10-digit local numbers.
     """
     import re
 
-    DEFAULT_COUNTRY = "IN"
-
     if raw is None:
         return None
-
     raw_str = str(raw).strip()
     if not raw_str:
         return None
 
-    # Handle scientific notation safely (e.g. 9.19E+11 from Excel)
+    # Excel scientific notation (e.g. 9.19E+11)
     if "E+" in raw_str.upper() or "E-" in raw_str.upper():
         try:
             raw_str = format(float(raw_str), ".0f")
         except (ValueError, OverflowError):
             pass
-
-    # Handle float with decimal (e.g. "9390000000.0")
+    # Float with decimal (e.g. "9390000000.0")
     if isinstance(raw, float):
         raw_str = format(raw, ".0f")
     elif "." in raw_str:
@@ -98,58 +115,89 @@ def normalize_phone_robust(raw) -> Optional[str]:
         except (ValueError, OverflowError):
             pass
 
-    # Split embedded + signs BEFORE other splitting
-    # "+277780336483+919650044539" → ["+277780336483", "+919650044539"]
+    # Split embedded '+' signs into separate candidates, keeping the '+' prefix.
     if raw_str.count("+") > 1:
-        # Split on + but keep the + as prefix for each part
-        plus_parts = []
-        for segment in raw_str.split("+"):
-            segment = segment.strip()
-            if segment:
-                plus_parts.append("+" + segment)
+        plus_parts = ["+" + seg.strip() for seg in raw_str.split("+") if seg.strip()]
         if plus_parts:
             raw_str = ",".join(plus_parts)
 
-    # Split multi-number fields on common separators
     parts = re.split(r"[,;/\|&\n\t]+|\bor\b|\band\b", raw_str)
+
+    cc_digits = _digits_only(country_code).lstrip("0") if country_code is not None else ""
 
     try:
         import phonenumbers
-        _has_phonenumbers = True
     except ImportError:
-        _has_phonenumbers = False
+        phonenumbers = None
         logger.warning("phonenumbers library not installed, falling back to basic normalization")
+
+    if phonenumbers is None:
+        # Best-effort fallback without the library.
+        for part in parts:
+            d = _digits_only(part).lstrip("0")
+            if not d:
+                continue
+            if cc_digits and len(d) <= 10 and not d.startswith(cc_digits):
+                d = cc_digits + d            # use the row's country code, not a hardcoded +91
+            elif not cc_digits and len(d) == 10 and d[0] in "6789":
+                d = "91" + d                 # legacy India default only when no cc is known
+            if 10 <= len(d) <= 15:
+                return d
+        return None
+
+    preferred_region = _region_for_country_code(cc_digits)
+
+    def _accept(num) -> Optional[str]:
+        try:
+            if phonenumbers.is_valid_number(num) or phonenumbers.is_possible_number(num):
+                return phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164).replace("+", "")
+        except Exception:
+            return None
+        return None
+
+    def _try(value: str, region):
+        try:
+            return _accept(phonenumbers.parse(value, region))
+        except Exception:
+            return None
 
     for part in parts:
         part = part.strip()
         if not part:
             continue
+        d = _digits_only(part)
+        if not d:
+            continue
 
-        if _has_phonenumbers:
-            try:
-                num = phonenumbers.parse(part, DEFAULT_COUNTRY)
-                if phonenumbers.is_possible_number(num):
-                    e164 = phonenumbers.format_number(
-                        num, phonenumbers.PhoneNumberFormat.E164
-                    )
-                    return e164.replace("+", "")  # Strip + for WhatsApp API
-            except phonenumbers.NumberParseException:
-                continue
-            except Exception:
-                continue
-        else:
-            # Fallback: basic normalization (same as normalize_phone)
-            digits = "".join(ch for ch in part if ch.isdigit())
-            if not digits:
-                continue
-            digits = digits.lstrip("0") or "0"
-            if len(digits) == 10 and digits[0] in "6789":
-                digits = "91" + digits
-            if 10 <= len(digits) <= 15:
-                return digits
+        # Build attempts in priority order; first valid wins.
+        attempts = []
+        if part.lstrip().startswith("+"):
+            attempts.append((part, None))                       # 1. explicit international
+        if preferred_region:
+            if cc_digits and d.startswith(cc_digits) and len(d) > 10:
+                # Already carries the cc: try the national remainder under its true region first
+                # (lets phonenumbers apply mobile rules, e.g. Argentina's +549), then trust the
+                # embedded code as-is.
+                attempts.append((d[len(cc_digits):], preferred_region))
+                attempts.append(("+" + d, None))                # 2a. national already carries the cc
+            attempts.append((d, preferred_region))              # 2b. national under its true region (MX/AR)
+            attempts.append(("+" + cc_digits + d.lstrip("0"), None))  # 2c. prefix the cc
+        if len(d) > 10:
+            attempts.append(("+" + d, None))                    # 3. cc likely embedded
+        attempts.append((d, default_region))                    # 4. legacy default (India) for bare local
+        attempts.append(("+" + d, None))                        # 5. last-ditch international
 
-    # None of the parts parsed to a valid number
-    logger.warning(f"Invalid phone — no valid number found in: {repr(raw)}")
+        seen = set()
+        for value, region in attempts:
+            key = (value, region)
+            if key in seen:
+                continue
+            seen.add(key)
+            res = _try(value, region)
+            if res and 8 <= len(res) <= 15:
+                return res
+
+    logger.warning(f"Invalid phone — no valid number found in: {repr(raw)} (cc={country_code!r})")
     return None
 
 
@@ -587,6 +635,26 @@ def clear_dedup_cache():
 # Webhook Subscription Helpers
 # ============================================================
 
+def _webhook_subscribe_tokens(primary_token: str) -> list:
+    """Tokens to try for POST /{waba-id}/subscribed_apps (customer token first)."""
+    tokens: list = []
+    for token in (
+        primary_token,
+        os.getenv("WHATSAPP_ACCESS_TOKEN"),
+        os.getenv("META_SYSTEM_USER_TOKEN"),
+    ):
+        token = (token or "").strip()
+        if token and token not in tokens:
+            tokens.append(token)
+    app_id = (os.getenv("FB_APP_ID") or os.getenv("META_APP_ID") or "").strip()
+    app_secret = (os.getenv("FB_APP_SECRET") or os.getenv("META_APP_SECRET") or "").strip()
+    if app_id and app_secret:
+        app_token = f"{app_id}|{app_secret}"
+        if app_token not in tokens:
+            tokens.append(app_token)
+    return tokens
+
+
 def subscribe_waba_to_app(waba_id: str, access_token: str) -> dict:
     """
     Subscribe WABA to Sociovia's Meta App for webhook events.
@@ -607,41 +675,58 @@ def subscribe_waba_to_app(waba_id: str, access_token: str) -> dict:
     Returns:
         Dict with success status and message/error
     """
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    api_version = os.getenv("WHATSAPP_API_VERSION", "v24.0")
     meta_graph = f"https://graph.facebook.com/{api_version}"
     
-    subscribed_fields = [
-        "messages",
-        "message_template_status_update",
-        "message_template_quality_update",
-        "template_category_update",
-        "message_echoes",
-        "smb_message_echoes",  # For coexistence mode echo messages
-    ]
+    from .provisioning_types import FULL_WEBHOOK_FIELDS
+
+    subscribed_fields = list(FULL_WEBHOOK_FIELDS)
     
-    try:
-        logger.info(f"Subscribing WABA {waba_id} to app fields: {subscribed_fields}")
-        
-        resp = requests.post(
-            f"{meta_graph}/{waba_id}/subscribed_apps",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
-            json={"subscribed_fields": subscribed_fields},
-            timeout=20,
-        )
-        
-        result = resp.json()
-        
-        if resp.status_code == 200 and result.get("success"):
-            logger.info(f"✅ WABA {waba_id} subscribed to app successfully.")
-            return {"success": True, "message": "WABA subscribed to app successfully"}
-        else:
-            error_msg = result.get("error", {}).get("message") or str(result)
-            logger.warning(f"❌ WABA {waba_id} subscription failed: {error_msg}")
-            return {"success": False, "error": error_msg}
-            
-    except Exception as e:
-        logger.exception(f"Unexpected error subscribing WABA {waba_id}: {e}")
-        return {"success": False, "error": str(e)}
+    import time
+    
+    max_retries = 3
+    base_backoff = 2
+    last_error = "Max retries exceeded"
+
+    for token in _webhook_subscribe_tokens(access_token):
+        for attempt in range(max_retries):
+            try:
+                logger.info(
+                    "Subscribing WABA %s to app fields (token attempt %s, retry %s/%s)",
+                    waba_id,
+                    "customer" if token == (access_token or "").strip() else "fallback",
+                    attempt + 1,
+                    max_retries,
+                )
+
+                resp = requests.post(
+                    f"{meta_graph}/{waba_id}/subscribed_apps",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"subscribed_fields": subscribed_fields},
+                    timeout=20,
+                )
+
+                result = resp.json()
+
+                if resp.status_code == 200 and result.get("success"):
+                    logger.info("WABA %s subscribed to app successfully.", waba_id)
+                    return {"success": True, "message": "WABA subscribed to app successfully"}
+
+                error_msg = result.get("error", {}).get("message") or str(result)
+                last_error = error_msg
+                logger.warning("WABA %s subscription failed: %s", waba_id, error_msg)
+                if attempt == max_retries - 1:
+                    break
+
+            except Exception as e:
+                last_error = str(e)
+                logger.exception("Unexpected error subscribing WABA %s: %s", waba_id, e)
+                if attempt == max_retries - 1:
+                    break
+
+            time.sleep(base_backoff * (2 ** attempt))
+
+    return {"success": False, "error": last_error}

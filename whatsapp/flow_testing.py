@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from flask import Blueprint, request, jsonify, g
 
-from models import db
+from shared_models import db
 from .models import WhatsAppFlow, WhatsAppAccount
 from .flow_validator import validate_flow_json
 from .flow_access import require_flow_access

@@ -38,11 +38,7 @@ from .production_trigger_routes import production_trigger_bp
 from .drip_routes import drip_bp
 from .template_routes import template_bp
 from .interactive_automation_routes import interactive_automation_bp
-from .flow_routes import flow_bp
-from .flow_testing import flow_testing_bp
-from .flow_endpoint import flow_endpoint_bp
-from .flow_os_routes import flow_os_bp, bookings_bp
-from .dataset_routes import dataset_bp
+from .verification_routes import verification_bp
 from .models import (
     WhatsAppAccount,
     WhatsAppConversation,
@@ -72,7 +68,6 @@ from .bulk_routes import bulk_bp
 from .coexistence_routes import coexistence_bp
 from .catalog_routes import catalog_bp
 from .tracking_routes import tracking_bp, tracking_redirect_bp
-from .scheduler_routes import scheduler_bp
 
 __all__ = [
     "whatsapp_bp",
@@ -86,17 +81,11 @@ __all__ = [
     "interactive_automation_bp",
     "bulk_bp",
     "production_trigger_bp",
-    "flow_bp",
-    "flow_testing_bp",
-    "flow_endpoint_bp",
-    "flow_os_bp",
-    "bookings_bp",
-    "dataset_bp",
     "coexistence_bp",
     "catalog_bp",
     "tracking_bp",
     "tracking_redirect_bp",
-    "scheduler_bp",
+    "verification_bp",
     "WhatsAppAccount",
     "WhatsAppConversation",
     "WhatsAppMessage",

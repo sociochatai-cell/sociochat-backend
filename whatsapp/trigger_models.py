@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from models import db
+from shared_models import db
 from sqlalchemy import func
 
 class WhatsAppTrigger(db.Model):

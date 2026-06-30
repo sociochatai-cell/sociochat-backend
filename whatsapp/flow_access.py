@@ -20,11 +20,63 @@ Usage:
         ...
 """
 
+import os
 from functools import wraps
 from typing import Optional, List, Tuple
 from flask import request, jsonify, g
 
 from .models import WhatsAppFlow, WhatsAppAccount
+
+
+def _strict_workspace_access() -> bool:
+    """Require workspace scoping on API routes (default on Cloud Run)."""
+    flag = (os.getenv("STRICT_WORKSPACE_ACCESS") or "").strip().lower()
+    if flag in {"1", "true", "yes", "on"}:
+        return True
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    return bool(os.getenv("K_SERVICE"))
+
+
+def _resolve_workspace_id() -> Optional[str]:
+    return (
+        request.headers.get("X-Workspace-ID")
+        or request.args.get("workspace_id")
+        or (request.get_json(silent=True) or {}).get("workspace_id")
+        or request.form.get("workspace_id")
+    )
+
+
+def _require_workspace_scope(account_workspace_id: Optional[str]) -> Optional[Tuple[dict, int]]:
+    user_workspace_id = _resolve_workspace_id()
+    if not user_workspace_id:
+        if _strict_workspace_access():
+            return {"success": False, "error": "workspace_id required (X-Workspace-ID header)"}, 401
+        return None
+    if account_workspace_id and str(account_workspace_id) != str(user_workspace_id):
+        return {"success": False, "error": "Access denied: resource belongs to a different workspace"}, 403
+    return None
+
+
+META_FLOW_CATEGORY_ALIASES = {
+    "LEAD_GEN": "LEAD_GENERATION",
+    "LEADS": "LEAD_GENERATION",
+    "LEAD_GENERATION": "LEAD_GENERATION",
+    "SURVEY": "SURVEY",
+    "BOOKING": "APPOINTMENT_BOOKING",
+    "APPOINTMENT_BOOKING": "APPOINTMENT_BOOKING",
+    "FEEDBACK": "SURVEY",
+    "CUSTOMER_SUPPORT": "CUSTOMER_SUPPORT",
+    "SUPPORT": "CUSTOMER_SUPPORT",
+    "CONTACT_US": "CONTACT_US",
+    "CONTACT": "CONTACT_US",
+    "SIGN_UP": "SIGN_UP",
+    "SIGNUP": "SIGN_UP",
+    "SIGN_IN": "SIGN_IN",
+    "SIGNIN": "SIGN_IN",
+    "CUSTOM": "OTHER",
+    "OTHER": "OTHER",
+}
 
 
 # ============================================================
@@ -52,16 +104,10 @@ def require_flow_access(f):
         if not account:
             return jsonify({"success": False, "error": "Flow account not found"}), 404
         
-        # Check account access (workspace-based)
-        # In production, verify user's session has access to this workspace
-        user_workspace_id = request.headers.get("X-Workspace-ID") or request.args.get("workspace_id")
-        
-        if user_workspace_id and account.workspace_id:
-            if str(account.workspace_id) != str(user_workspace_id):
-                return jsonify({
-                    "success": False, 
-                    "error": "Access denied: Flow belongs to a different workspace"
-                }), 403
+        denied = _require_workspace_scope(account.workspace_id)
+        if denied:
+            body, status = denied
+            return jsonify(body), status
         
         # Attach to request context for use in route
         g.flow = flow
@@ -94,23 +140,24 @@ def require_account_access(f):
         if not account:
             return jsonify({"success": False, "error": "Account not found"}), 404
         
-        # Check workspace access
-        user_workspace_id = request.headers.get("X-Workspace-ID") or request.args.get("workspace_id")
-        
-        if user_workspace_id and account.workspace_id:
-            if str(account.workspace_id) != str(user_workspace_id):
-                return jsonify({
-                    "success": False,
-                    "error": "Access denied: Account belongs to a different workspace"
-                }), 403
-        
+        denied = _require_workspace_scope(account.workspace_id)
+        if denied:
+            body, status = denied
+            return jsonify(body), status
+
+        user_workspace_id = _resolve_workspace_id()
+
         # Attach to context
         g.account = account
         
         # Inject into kwargs for the route handler if it expects them
         # Most of our new routes expect (account, workspace_id)
         kwargs['account'] = account
-        kwargs['workspace_id'] = str(account.workspace_id) if account.workspace_id else str(user_workspace_id) if user_workspace_id else None
+        kwargs['workspace_id'] = (
+            str(account.workspace_id)
+            if account.workspace_id
+            else str(user_workspace_id) if user_workspace_id else None
+        )
 
         return f(*args, **kwargs)
     
@@ -135,12 +182,7 @@ def validate_flow_account_match(flow_id: str, account_id: int) -> Tuple[bool, Op
     Returns:
         (is_valid, error_message)
     """
-    # Try to find by meta_flow_id first
-    flow = WhatsAppFlow.query.filter_by(meta_flow_id=flow_id).first()
-    
-    # If not found, try by local ID
-    if not flow and flow_id.isdigit():
-        flow = WhatsAppFlow.query.get(int(flow_id))
+    flow = get_flow_by_reference(flow_id)
     
     if not flow:
         return False, f"Flow '{flow_id}' not found"
@@ -192,21 +234,44 @@ def validate_template_flow_attachment(template_account_id: int, flow_id: str) ->
     Returns:
         (is_valid, error_message)
     """
-    # Find the flow by meta_flow_id
-    flow = WhatsAppFlow.query.filter_by(meta_flow_id=flow_id).first()
-    
+    flow, error = resolve_template_flow_attachment(template_account_id, flow_id)
+    return flow is not None, error
+
+
+def normalize_flow_category(category: Optional[str]) -> str:
+    """Map legacy/internal flow categories to Meta-accepted category values."""
+    normalized = str(category or "OTHER").strip().upper()
+    return META_FLOW_CATEGORY_ALIASES.get(normalized, normalized or "OTHER")
+
+
+def get_flow_by_reference(flow_id: Optional[str]) -> Optional[WhatsAppFlow]:
+    """Resolve a flow by Meta flow ID first, then local numeric ID."""
+    ref = str(flow_id or "").strip()
+    if not ref:
+        return None
+
+    flow = WhatsAppFlow.query.filter_by(meta_flow_id=ref).first()
+    if not flow and ref.isdigit():
+        flow = WhatsAppFlow.query.get(int(ref))
+    return flow
+
+
+def resolve_template_flow_attachment(
+    template_account_id: int,
+    flow_id: Optional[str],
+) -> Tuple[Optional[WhatsAppFlow], Optional[str]]:
+    """Resolve and validate a flow before attaching it to a template."""
+    flow = get_flow_by_reference(flow_id)
     if not flow:
-        return False, f"Flow with ID '{flow_id}' not found. Make sure the flow is published."
-    
-    # Same WABA check
+        return None, f"Flow with ID '{flow_id}' not found. Make sure the flow is published."
+
     if flow.account_id != template_account_id:
-        return False, "Flow must belong to the same WhatsApp Business Account as the template"
-    
-    # Status check
+        return None, "Flow must belong to the same WhatsApp Business Account as the template"
+
     if flow.status != "PUBLISHED":
-        return False, f"Only published flows can be attached to templates. Current status: {flow.status}"
-    
-    return True, None
+        return None, f"Only published flows can be attached to templates. Current status: {flow.status}"
+
+    return flow, None
 
 
 # ============================================================

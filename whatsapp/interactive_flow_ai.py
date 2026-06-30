@@ -1,10 +1,8 @@
 """
 AI-assisted draft generation for WhatsApp interactive automation flows.
 
-Produces nodes + edges compatible with the visual flow builder, including fully
-configured API nodes (headers, auth placeholders, button capture).
-
-Reuses the existing GenAI client from ``ai_chatbot`` - no new provider or env var.
+Produces nodes + edges compatible with the Launchpad visual flow builder,
+including fully configured API nodes (headers, auth placeholders, button capture).
 """
 
 from __future__ import annotations
@@ -15,7 +13,7 @@ import os
 import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .ai_chatbot import DEFAULT_MODEL, _resolve_generation_model, get_genai_client
 
@@ -231,7 +229,7 @@ def _add_quick_reply_router(
             "position": {"x": 0, "y": 0},
             "data": {
                 "label": "Quick-reply router",
-                "body": "(internal routing hub - not shown to users)",
+                "body": "(internal routing hub — not shown to users)",
                 "interactiveType": "none",
                 "buttons": [],
                 "sections": [],
@@ -474,7 +472,7 @@ def _normalize_draft(parsed: Dict[str, Any], *, brief: str = "") -> Dict[str, An
                         }
                     )
 
-            # Default/output edge - for library pick (uuid) or text fallback; NOT auto-chain success
+            # Default/output edge — for library pick (uuid) or text fallback; NOT auto-chain success
             default_tid = str(
                 raw.get("default_next_temp_id")
                 or raw.get("on_default_next")
@@ -591,30 +589,30 @@ def _normalize_draft(parsed: Dict[str, Any], *, brief: str = "") -> Dict[str, An
     }
 
 
-_SYSTEM_PROMPT = """You design production-ready WhatsApp Business interactive chatbot flows.
+_SYSTEM_PROMPT = """You design production-ready WhatsApp Business interactive chatbot flows for Sociovia.
 
 The user may provide conversation scripts AND/OR REST API documentation. When API docs are present:
 - Create one "api" node per documented endpoint (POST/GET as specified).
-- Wire the full user journey: welcome -> collect inputs -> API calls -> handle quick-reply buttons -> booking/close.
+- Wire the full user journey: welcome → collect inputs → API calls → handle quick-reply buttons → booking/close.
 
-CRITICAL - API nodes MUST be fully configured. Every api node needs ALL of:
+CRITICAL — API nodes MUST be fully configured. Every api node needs ALL of:
 1. method, url (full HTTPS URL including path)
 2. headers array (REQUIRED when docs mention Bearer/auth):
    [
      {"key": "Authorization", "value": "Bearer {{flow_api_token}}", "enabled": true},
      {"key": "Content-Type", "value": "application/json", "enabled": true}
    ]
-   NEVER put "Authorization: Bearer xxx" in the key field - key is "Authorization", value is "Bearer {{flow_api_token}}".
+   NEVER put "Authorization: Bearer xxx" in the key field — key is "Authorization", value is "Bearer {{flow_api_token}}".
 3. body_type: "json" and body string with {{placeholders}} for POST endpoints
 4. store_as when response should be saved (e.g. search_result)
 5. branches when API returns status codes in JSON (path "status", operator "equals", value "not_found", etc.)
-6. default_next_temp_id - output edge for dynamic quick-reply picks (uuid buttons) or text fallback. Do NOT use on_success_next for API nodes that show quickReplies (user must click first).
+6. default_next_temp_id — output edge for dynamic quick-reply picks (uuid buttons) or text fallback. Do NOT use on_success_next for API nodes that show quickReplies (user must click first).
 7. button_capture rules when quickReplies return ids to reuse later:
    [{"matchType": "uuid", "field": "library_id", "valueFrom": "button_id"}]
 8. returns_quick_replies: true when API response includes quickReplies array
 9. output_success: {"textPath": "message", "buttonsPath": "quickReplies"}
 
-Flow-level secrets (NOT env vars - stored in flow settings UI):
+Flow-level secrets (NOT env vars — stored in flow settings UI):
 - Include top-level "variables": {"flow_api_token": ""} when auth is required (user fills token in builder).
 - Include "flow_config": {"variableDefaults": {"demo_date": "tomorrow", "plan_type": "monthly"}} when docs mention defaults.
 
@@ -685,9 +683,9 @@ OUTPUT: Return ONE JSON object only (no markdown):
 }
 
 Rules:
-- Use 5-25 nodes for API-integrated flows; 3-15 for simple flows.
+- Use 5–25 nodes for API-integrated flows; 3–15 for simple flows.
 - Node types: message, input, template, api, end.
-- WhatsApp max 3 quick-reply buttons per message node; labels <=20 chars.
+- WhatsApp max 3 quick-reply buttons per message node; labels ≤20 chars.
 - input nodes: always set field + next_temp_id.
 - api nodes: always set headers when auth documented; always map quickReplies output.
 - keyword trigger when user says "Hi" or lists trigger words.
@@ -708,13 +706,12 @@ def generate_interactive_flow_draft(
     if not brief:
         raise ValueError("prompt is required")
     if len(brief) > 24000:
-        brief = brief[:24000] + "\n[...truncated]"
+        brief = brief[:24000] + "\n[…truncated]"
 
     client = get_genai_client()
     if client is None:
         raise RuntimeError(
-            "AI is not configured. Set GEMINI_API_KEY (or GOOGLE_API_KEY) for local dev, "
-            "or GOOGLE_APPLICATION_CREDENTIALS + GCP_PROJECT for Vertex AI."
+            "AI is not configured. Set GOOGLE_GENAI_API_KEY on whatsapp-api or enable Vertex AI."
         )
 
     model_id = _resolve_generation_model(

@@ -6,15 +6,15 @@ Processes free-text user input during interactive automation flows.
 
 Responsibilities:
 - Validate input against node-configured rules (text, number, email, phone, regex, enum, pincode)
-- Extract clean values from natural language ("My name is Prabhu" -> "Prabhu")
+- Extract clean values from natural language ("My name is Prabhu" → "Prabhu")
 - Detect correction intent ("sorry 22", "actually it's 23")
 - Substitute {{variables}} in downstream messages
 - Store collected fields in conversation state
 
 Design:
-- Stateless functions - all state is in WhatsAppConversationState.state_data
-- No database access - pure input processing logic
-- Called from InteractiveAutomationEngine input-node handling
+- Stateless functions — all state is in WhatsAppConversationState.state_data
+- No database access — pure input processing logic
+- Called from InteractiveAutomationEngine._handle_flow_continuation()
 """
 
 import logging
@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# -- Correction Detection -------------------------------------------
+# ── Correction Detection ───────────────────────────────────────────
 
 _CORRECTION_PREFIXES = (
     "sorry",
@@ -94,16 +94,16 @@ def extract_correction_value(text: str) -> str:
     return normalized
 
 
-# -- Smart Value Extraction -----------------------------------------
+# ── Smart Value Extraction ─────────────────────────────────────────
 
 def extract_field_value(text: str, field_type: str) -> str:
     """
     Extract clean value from natural language input.
 
     Examples:
-        "My name is Prabhu" -> "Prabhu"
-        "I am 21 years old" -> "21"
-        "It's male" -> "male"
+        "My name is Prabhu" → "Prabhu"
+        "I am 21 years old" → "21"
+        "It's male" → "male"
     """
     stripped = text.strip()
 
@@ -141,7 +141,7 @@ def extract_field_value(text: str, field_type: str) -> str:
     return stripped
 
 
-# -- Validation -----------------------------------------------------
+# ── Validation ─────────────────────────────────────────────────────
 
 def validate_input(
     text: str,
@@ -189,7 +189,7 @@ def validate_input(
     elif val_type == "pincode":
         return _validate_pincode(cleaned, validation_config)
     else:
-        # Unknown type - accept as text
+        # Unknown type — accept as text
         return _validate_text(cleaned, validation_config)
 
 
@@ -329,7 +329,7 @@ def _validate_pincode(
     return False, text, error or f"Please enter a valid {expected_length}-digit pincode."
 
 
-# -- Variable Substitution ------------------------------------------
+# ── Variable Substitution ──────────────────────────────────────────
 
 _VAR_PATTERN = re.compile(r"\{\{(\w+)\}\}")
 
@@ -341,7 +341,7 @@ def substitute_variables(text: str, collected_fields: Dict[str, Any]) -> str:
     Example:
         text = "Thanks {{name}}, your age is {{age}}"
         collected = {"name": "Prabhu", "age": 21}
-        -> "Thanks Prabhu, your age is 21"
+        → "Thanks Prabhu, your age is 21"
     """
     if not text or not collected_fields:
         return text or ""
@@ -356,7 +356,7 @@ def substitute_variables(text: str, collected_fields: Dict[str, Any]) -> str:
     return _VAR_PATTERN.sub(_replacer, text)
 
 
-# -- Question Builder -----------------------------------------------
+# ── Question Builder ───────────────────────────────────────────────
 
 def build_question_message(
     node_data: Dict[str, Any],
@@ -378,7 +378,7 @@ def build_question_message(
     if error_message:
         err = (error_message or "").strip()
         if err:
-            # Single outbound bubble: error first, then prompt (no extra prefix -
+            # Single outbound bubble: error first, then prompt (no extra prefix —
             # put emoji in the node's custom error text if you want it).
             parts.append(f"{err}\n\n")
 
@@ -396,12 +396,12 @@ def build_question_message(
     skip_keyword = node_data.get("skipKeyword") or node_data.get("skip_keyword")
     required = node_data.get("required", True)
     if skip_keyword and not required:
-        parts.append(f"\nType \"{skip_keyword}\" to skip this question.")
+        parts.append(f"\n💡 Type \"{skip_keyword}\" to skip this question.")
 
     return "\n".join(parts)
 
 
-# -- Process Input Response (Main Entry Point) ----------------------
+# ── Process Input Response (Main Entry Point) ──────────────────────
 
 def process_input_response(
     message_text: str,
@@ -458,12 +458,8 @@ def process_input_response(
     if max_val is not None:
         validation_config["max_value"] = max_val
 
-    # regexPattern (frontend) or pattern
-    pattern = node_data.get("regexPattern")
-    if pattern is None:
-        pattern = node_data.get("pattern")
-    if pattern is not None:
-        validation_config["pattern"] = pattern
+    if node_data.get("pattern") is not None:
+        validation_config["pattern"] = node_data.get("pattern")
 
     enum_opts = node_data.get("enumValues")
     if enum_opts is None:
@@ -505,7 +501,7 @@ def process_input_response(
         last_field = state.get_last_collected_field()
 
         if last_field and corrected_value_text:
-            # Get the last field's validation config - we need to re-validate.
+            # Get the last field's validation config — we need to re-validate.
             # For correction, we extract + validate the corrected value.
             extracted = extract_field_value(corrected_value_text, val_type)
             is_valid, cleaned, error = validate_input(extracted, validation_config)
@@ -513,6 +509,7 @@ def process_input_response(
             if is_valid:
                 # Overwrite the CURRENT field with the corrected value,
                 # because the correction applies to the question being asked.
+                # But if the user is correcting the PREVIOUS field, handle that.
                 state.set_collected_field(last_field, cleaned)
                 logger.info(
                     f"[input_handler] Correction: field '{last_field}' updated to '{cleaned}'"
@@ -533,12 +530,16 @@ def process_input_response(
                     "is_skip": False,
                 }
 
-    # Normal input: extract -> validate -> store
+    # Normal input: extract → validate → store
     extracted = extract_field_value(text, val_type)
     is_valid, cleaned, error = validate_input(extracted, validation_config)
 
     if is_valid:
         state.set_collected_field(field, cleaned)
+        if field == "location":
+            pin_digits = re.sub(r"\s", "", str(cleaned))
+            if re.fullmatch(r"\d{6}", pin_digits):
+                state.set_collected_field("pincode", pin_digits)
         state.clear_waiting_for_input()
         logger.info(f"[input_handler] Field '{field}' = '{cleaned}'")
         return {

@@ -26,7 +26,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
 # Import models
-from models import db
+from shared_models import db
 from .models import WhatsAppAccount, WhatsAppFlow
 
 # Create blueprint
@@ -267,7 +267,7 @@ def setup_flow_encryption_for_account(account) -> dict:
     Returns:
         dict with success status, endpoint URL, and any errors
     """
-    from models import db
+    from shared_models import db
     
     # Step 1: Generate keys
     private_pem, public_pem = generate_rsa_keypair()
@@ -406,6 +406,60 @@ def encrypt_response(response_data: dict, aes_key: bytes, iv: bytes) -> str:
     return base64.b64encode(encrypted).decode('utf-8')
 
 
+def get_response_version(decrypted_data: dict) -> str:
+    """Use the request's flow data version when present."""
+    return str(decrypted_data.get("version") or "3.0")
+
+
+def build_flow_response(
+    decrypted_data: dict,
+    *,
+    data: Optional[dict] = None,
+    screen: Optional[str] = None,
+) -> dict:
+    """Build a Meta-compliant flow response envelope."""
+    response = {
+        "version": get_response_version(decrypted_data),
+        "data": data or {},
+    }
+    if screen:
+        response["screen"] = screen
+    return response
+
+
+def resolve_account_for_endpoint(account_id: Optional[int] = None) -> Optional[WhatsAppAccount]:
+    """Resolve an account for the generic endpoint, falling back only in single-account setups."""
+    if account_id:
+        return WhatsAppAccount.query.get(account_id)
+
+    accounts = WhatsAppAccount.query.filter_by(is_active=True).all()
+    accounts_with_keys = [account for account in accounts if account.has_flow_keys()]
+    if len(accounts_with_keys) == 1:
+        return accounts_with_keys[0]
+    return None
+
+
+def resolve_account_for_waba(waba_id: str) -> Optional[WhatsAppAccount]:
+    """
+    Resolve the active account for a WABA, preferring the most recently updated
+    record that already has flow keys configured.
+    """
+    accounts = (
+        WhatsAppAccount.query
+        .filter_by(waba_id=waba_id, is_active=True)
+        .order_by(WhatsAppAccount.updated_at.desc(), WhatsAppAccount.id.desc())
+        .all()
+    )
+    if not accounts:
+        return None
+
+    accounts_with_keys = [account for account in accounts if account.has_flow_keys()]
+    if accounts_with_keys:
+        return accounts_with_keys[0]
+
+    return accounts[0]
+
+
 # ============================================================
 # Dynamic Data Handlers
 # ============================================================
@@ -526,6 +580,8 @@ def flow_data_endpoint():
     if request_hash in idempotency_cache:
         cached_response, cached_time = idempotency_cache[request_hash]
         if time.time() - cached_time < IDEMPOTENCY_TTL:
+            if isinstance(cached_response, str):
+                return cached_response, 200, {"Content-Type": "text/plain"}
             return jsonify(cached_response)
     
     try:
@@ -538,57 +594,83 @@ def flow_data_endpoint():
         if not all([encrypted_flow_data, encrypted_aes_key, initial_vector]):
             return jsonify({"error": "Missing encryption parameters"}), 400
         
-        # Get account ID from flow token or header
-        # In production, validate this against your flows
         account_id = data.get("account_id") or request.headers.get("X-Account-ID")
-        
-        if not account_id:
-            return jsonify({"error": "Missing account identifier"}), 400
-        
-        account_id = int(account_id)
-        
-        # Get private key for this account
-        if account_id not in private_key_cache:
-            account = WhatsAppAccount.query.get(account_id)
-            if not account or not account.flow_private_key:
+        resolved_account = resolve_account_for_endpoint(int(account_id) if str(account_id or "").isdigit() else None)
+        if not resolved_account:
+            return jsonify({
+                "error": "Unable to resolve flow account. Use the per-WABA endpoint for Meta."
+            }), 400
+
+        if resolved_account.id not in private_key_cache:
+            private_key_pem = resolved_account.get_flow_private_key()
+            if not private_key_pem:
                 return jsonify({"error": "No encryption key for this account"}), 400
-            private_key_cache[account_id] = account.flow_private_key.encode()
-        
-        private_key_pem = private_key_cache[account_id]
+            private_key_cache[resolved_account.id] = private_key_pem
+
+        private_key_pem = private_key_cache[resolved_account.id]
         
         # Decrypt the request
-        decrypted_data = decrypt_request(
+        decrypted_data, aes_key, iv = decrypt_request(
             encrypted_flow_data,
             encrypted_aes_key,
             initial_vector,
             private_key_pem
         )
         
-        # Parse request
+        # Parse request (Meta may vary action casing)
         action = decrypted_data.get("action")
         flow_id = decrypted_data.get("flow_token", "")
         screen = decrypted_data.get("screen", "")
         screen_data = decrypted_data.get("data", {})
-        
-        # Handle different actions
-        if action == "ping":
+        na = str(action or "").strip().upper()
+
+        if na == "PING":
             # Health check from Meta
-            response_data = {"data": {"status": "active"}}
-        
-        elif action == "data_exchange":
+            response_data = build_flow_response(decrypted_data, data={"status": "active"})
+        elif na == "DATA_EXCHANGE":
             # Dynamic data request
-            response_data = handle_data_exchange(flow_id, screen, screen_data, account_id)
-        
-        elif action == "COMPLETE":
-            # Flow completed - save the collected data
-            # TODO: Store response data in your system
-            response_data = {"data": {"status": "received"}}
-        
+            dynamic_response = handle_data_exchange(flow_id, screen, screen_data, resolved_account.id)
+            response_data = build_flow_response(
+                decrypted_data,
+                screen=dynamic_response.get("screen"),
+                data=dynamic_response.get("data"),
+            )
+        elif na == "INIT":
+            response_data = build_flow_response(
+                decrypted_data,
+                screen=screen or "WELCOME",
+                data=screen_data if isinstance(screen_data, dict) else {},
+            )
+        elif na == "COMPLETE":
+            # Flow completed — merge form `data` into latest inbox nfm_reply (endpoint path)
+            try:
+                from .flow_inbox_sync import merge_flow_endpoint_completion_into_latest_message
+
+                if resolved_account:
+                    merged_ok = merge_flow_endpoint_completion_into_latest_message(
+                        resolved_account, decrypted_data
+                    )
+                    current_app.logger.info(
+                        "Flow COMPLETE (generic endpoint) merge_ok=%s account_id=%s",
+                        merged_ok,
+                        resolved_account.id,
+                    )
+            except Exception:
+                current_app.logger.exception(
+                    "Failed to merge Flow COMPLETE into inbox (generic endpoint)"
+                )
+            response_data = build_flow_response(
+                decrypted_data,
+                data={"status": "received", "flow_token": flow_id},
+            )
         else:
-            response_data = {"error": f"Unknown action: {action}"}
+            response_data = build_flow_response(
+                decrypted_data,
+                data={"error": f"Unknown action: {action}"},
+            )
         
-        # Cache response for idempotency
-        idempotency_cache[request_hash] = (response_data, time.time())
+        encrypted_response = encrypt_response(response_data, aes_key, iv)
+        idempotency_cache[request_hash] = (encrypted_response, time.time())
         
         # Clean old cache entries periodically
         current_time = time.time()
@@ -599,7 +681,7 @@ def flow_data_endpoint():
         for k in keys_to_delete:
             del idempotency_cache[k]
         
-        return jsonify(response_data)
+        return encrypted_response, 200, {"Content-Type": "text/plain"}
         
     except Exception as e:
         current_app.logger.exception("Flow endpoint error: %s", e)
@@ -630,7 +712,7 @@ def flow_data_endpoint_per_tenant(waba_id: str):
     current_app.logger.info(f"=== Flow Endpoint Called for WABA: {waba_id} ===")
     
     # Get account by WABA ID
-    account = WhatsAppAccount.query.filter_by(waba_id=waba_id, is_active=True).first()
+    account = resolve_account_for_waba(waba_id)
     if not account:
         current_app.logger.warning(f"No active account found for WABA: {waba_id}")
         return jsonify({"error": "Account not found"}), 404
@@ -656,6 +738,8 @@ def flow_data_endpoint_per_tenant(waba_id: str):
     if cache_key in idempotency_cache:
         cached_response, cached_time = idempotency_cache[cache_key]
         if time.time() - cached_time < IDEMPOTENCY_TTL:
+            if isinstance(cached_response, str):
+                return cached_response, 200, {"Content-Type": "text/plain"}
             return jsonify(cached_response)
     
     try:
@@ -677,32 +761,56 @@ def flow_data_endpoint_per_tenant(waba_id: str):
             private_key_pem
         )
         
-        # Parse request
+        # Parse request (Meta may send action casing inconsistently)
         action = decrypted_data.get("action")
         flow_token = decrypted_data.get("flow_token", "")
         screen = decrypted_data.get("screen", "")
         screen_data = decrypted_data.get("data", {})
-        
-        # Handle actions
-        if action == "ping":
-            response_data = {"data": {"status": "active"}}
-        elif action == "data_exchange":
-            response_data = handle_data_exchange(flow_token, screen, screen_data, account.id)
-        elif action == "INIT":
+        na = str(action or "").strip().upper()
+
+        if na == "PING":
+            response_data = build_flow_response(decrypted_data, data={"status": "active"})
+        elif na == "DATA_EXCHANGE":
+            dynamic_response = handle_data_exchange(flow_token, screen, screen_data, account.id)
+            response_data = build_flow_response(
+                decrypted_data,
+                screen=dynamic_response.get("screen"),
+                data=dynamic_response.get("data"),
+            )
+        elif na == "INIT":
             # Initial flow load
-            response_data = {"screen": screen or "WELCOME", "data": {}}
-        elif action == "COMPLETE":
-            # Flow completed - store data
-            current_app.logger.info(f"Flow completed for WABA {waba_id}: {screen_data}")
-            response_data = {"data": {"status": "received"}}
+            response_data = build_flow_response(
+                decrypted_data,
+                screen=screen or "WELCOME",
+                data=screen_data if isinstance(screen_data, dict) else {},
+            )
+        elif na == "COMPLETE":
+            # Flow completed — merge `data` into latest inbox nfm_reply (same WABA)
+            current_app.logger.info("Flow COMPLETE for WABA %s action_data keys=%s", waba_id, list(screen_data.keys()) if isinstance(screen_data, dict) else type(screen_data))
+            try:
+                from .flow_inbox_sync import merge_flow_endpoint_completion_into_latest_message
+
+                merged_ok = merge_flow_endpoint_completion_into_latest_message(account, decrypted_data)
+                current_app.logger.info("Flow COMPLETE inbox merge_ok=%s waba=%s", merged_ok, waba_id)
+            except Exception:
+                current_app.logger.exception(
+                    f"Failed to merge Flow COMPLETE into inbox for WABA {waba_id}"
+                )
+            response_data = build_flow_response(
+                decrypted_data,
+                data={"status": "received", "flow_token": flow_token},
+            )
         else:
-            response_data = {"error": f"Unknown action: {action}"}
-        
-        # Cache response
-        idempotency_cache[cache_key] = (response_data, time.time())
+            response_data = build_flow_response(
+                decrypted_data,
+                data={"error": f"Unknown action: {action}"},
+            )
         
         # ENCRYPT response using same AES key Meta sent
         encrypted_response = encrypt_response(response_data, aes_key, iv)
+        
+        # Cache response
+        idempotency_cache[cache_key] = (encrypted_response, time.time())
         
         # Return as plain text (Base64 encoded encrypted data)
         return encrypted_response, 200, {"Content-Type": "text/plain"}
@@ -713,6 +821,7 @@ def flow_data_endpoint_per_tenant(waba_id: str):
         if "decrypt" in str(e).lower():
             return "", 421
         return jsonify({"error": "Internal server error"}), 500
+
 
 @flow_endpoint_bp.route("/keys/generate", methods=["POST"])
 def generate_encryption_keys():

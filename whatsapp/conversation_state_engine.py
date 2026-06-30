@@ -17,7 +17,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List, Tuple
 import logging
 
-from models import db
+from shared_models import db
 from whatsapp.visual_automation_models import (
     WhatsAppVisualAutomation,
     WhatsAppConversationState

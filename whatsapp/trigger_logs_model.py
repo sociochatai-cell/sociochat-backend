@@ -2,7 +2,7 @@
 Trigger Logs Model - Track all trigger invocations for debugging and analytics.
 """
 from datetime import datetime, timezone
-from models import db
+from shared_models import db
 from sqlalchemy import func, Index
 
 

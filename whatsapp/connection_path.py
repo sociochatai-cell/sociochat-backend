@@ -20,13 +20,13 @@ import requests
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
-from models import db
-from .models import WhatsAppAccount
+from shared_models import db
+from .models import WhatsAppAccount, shadow_sync_account_quality_rating
 from .encryption import encrypt_token, decrypt_token
 
 logger = logging.getLogger(__name__)
 
-META_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+META_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v24.0")
 META_GRAPH_API = f"https://graph.facebook.com/{META_API_VERSION}"
 
 
@@ -105,6 +105,203 @@ def validate_token_with_meta(access_token: str) -> Dict[str, Any]:
     except requests.exceptions.RequestException as e:
         logger.exception(f"Token validation request failed: {e}")
         return {"valid": False, "error": str(e)}
+
+
+def _meta_app_credentials() -> tuple[Optional[str], Optional[str]]:
+    """Resolve Meta app id/secret used for WhatsApp (prefer explicit WhatsApp app env)."""
+    app_id = (
+        os.getenv("WHATSAPP_APP_ID")
+        or os.getenv("META_APP_ID")
+        or os.getenv("FB_APP_ID")
+    )
+    app_secret = (
+        os.getenv("WHATSAPP_APP_SECRET")
+        or os.getenv("META_APP_SECRET")
+        or os.getenv("FB_APP_SECRET")
+    )
+    return app_id, app_secret
+
+
+def verify_messaging_send_access(
+    access_token: str,
+    phone_number_id: str,
+    waba_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Verify the token can send messages for this phone/WABA (not just read metadata).
+
+    Partner-assigned CLIENT_OWNED WABAs often fail with Meta error #200 when using a
+    personal user token or when the app lacks Advanced Access — even if Business Manager
+    shows "Full control".
+    """
+    if not access_token or not phone_number_id:
+        return {
+            "can_send": False,
+            "error": "Missing access token or phone_number_id",
+            "error_code": "MISSING_FIELDS",
+        }
+
+    details: Dict[str, Any] = {}
+    app_id, app_secret = _meta_app_credentials()
+
+    if app_id and app_secret:
+        try:
+            debug_resp = requests.get(
+                f"{META_GRAPH_API}/debug_token",
+                params={
+                    "input_token": access_token,
+                    "access_token": f"{app_id}|{app_secret}",
+                },
+                timeout=15,
+            )
+            debug_json = debug_resp.json()
+            if debug_resp.status_code != 200:
+                err = debug_json.get("error", {})
+                details["debug_error"] = err.get("message")
+                if err.get("code") == 100 and "did not match" in (err.get("message") or ""):
+                    return {
+                        "can_send": False,
+                        "error": (
+                            "This access token belongs to a different Meta app than Sociovia is "
+                            f"configured to use. Reconnect using the Sociovia WhatsApp app or paste a "
+                            f"System User token generated for app {app_id}."
+                        ),
+                        "error_code": "TOKEN_APP_MISMATCH",
+                        "details": details,
+                    }
+            else:
+                data = debug_json.get("data", {})
+                details["token_type"] = data.get("type")
+                details["token_app_id"] = data.get("app_id")
+                details["scopes"] = data.get("scopes", [])
+                token_type = data.get("type")
+                if token_type == "USER":
+                    details["hint"] = (
+                        "Personal user tokens often cannot send on client-owned partner WABAs. "
+                        "Use a System User access token from Sociovia Business Manager."
+                    )
+                if waba_id:
+                    messaging_targets: list[str] = []
+                    management_targets: list[str] = []
+                    has_messaging_granular = False
+                    for scope in data.get("granular_scopes") or []:
+                        scope_name = scope.get("scope")
+                        targets = [str(t) for t in (scope.get("target_ids") or [])]
+                        if scope_name == "whatsapp_business_messaging":
+                            has_messaging_granular = True
+                            messaging_targets = targets
+                            details["messaging_waba_targets"] = targets
+                        elif scope_name == "whatsapp_business_management":
+                            management_targets = targets
+                            details["management_waba_targets"] = targets
+
+                    # Meta often returns empty target_ids for System User tokens even when
+                    # the WABA is assigned — only block when Meta lists explicit targets
+                    # and this WABA is missing from the list.
+                    if has_messaging_granular and len(messaging_targets) > 0:
+                        if waba_id not in messaging_targets:
+                            hints = [
+                                f"In Sociovia Business Manager → System users: assign WABA {waba_id} "
+                                "to this system user with WhatsApp permissions.",
+                                "Regenerate the token and select this WhatsApp Business Account "
+                                "when Meta asks which assets to grant.",
+                                "Ensure both whatsapp_business_messaging and "
+                                "whatsapp_business_management include this WABA.",
+                            ]
+                            if waba_id in management_targets and waba_id not in messaging_targets:
+                                hints.insert(
+                                    0,
+                                    "This token has management scope for the WABA but not messaging — "
+                                    "regenerate the token and enable messaging for this asset.",
+                                )
+                            return {
+                                "can_send": False,
+                                "error": (
+                                    f"Token is not granted whatsapp_business_messaging for WABA {waba_id}."
+                                ),
+                                "error_code": "WABA_NOT_IN_MESSAGING_SCOPE",
+                                "details": details,
+                                "hints": hints,
+                            }
+                    elif has_messaging_granular and len(messaging_targets) == 0:
+                        details["granular_targets_note"] = (
+                            "debug_token returned no WABA target_ids for messaging; "
+                            "will verify with live send probe."
+                        )
+        except requests.exceptions.RequestException as e:
+            logger.warning("debug_token during send verification failed: %s", e)
+
+    if waba_id:
+        try:
+            waba_resp = requests.get(
+                f"{META_GRAPH_API}/{waba_id}",
+                params={"fields": "ownership_type,name", "access_token": access_token},
+                timeout=15,
+            )
+            if waba_resp.status_code == 200:
+                waba_data = waba_resp.json()
+                details["waba_ownership_type"] = waba_data.get("ownership_type")
+                details["waba_name"] = waba_data.get("name")
+        except requests.exceptions.RequestException:
+            pass
+
+    try:
+        probe_resp = requests.post(
+            f"{META_GRAPH_API}/{phone_number_id}/messages",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "to": "10000000000",
+                "type": "text",
+                "text": {"body": "sociovia_send_probe"},
+            },
+            timeout=15,
+        )
+        if probe_resp.status_code == 200:
+            return {"can_send": True, "details": details}
+
+        err = probe_resp.json().get("error", {})
+        code = err.get("code")
+        msg = err.get("message", "Send permission check failed")
+        details["probe_error_code"] = code
+        details["probe_message"] = msg
+
+        if code == 200:
+            ownership = details.get("waba_ownership_type")
+            hints = [
+                "In Trusthomes Business Manager → Partners → Sociovia: grant full control on the "
+                "WhatsApp account, including permission to send messages on behalf of the WABA.",
+                "In Sociovia Meta App (Sociovia.ai): ensure Advanced Access is approved for "
+                "whatsapp_business_messaging and whatsapp_business_management.",
+                "Generate a permanent System User token in Sociovia Business Manager, assign the "
+                "Trusthomes WABA to that system user, and reconnect via Manual Link in Sociovia.",
+            ]
+            if ownership == "CLIENT_OWNED":
+                hints.insert(
+                    0,
+                    "This is a partner/client-owned WABA — personal Facebook login tokens usually "
+                    "cannot send. Use a System User token instead.",
+                )
+            return {
+                "can_send": False,
+                "error": msg,
+                "error_code": "MESSAGING_PERMISSION_DENIED",
+                "details": details,
+                "hints": hints,
+            }
+
+        # Other errors (invalid recipient, etc.) mean the send endpoint accepted our auth.
+        return {"can_send": True, "details": details}
+    except requests.exceptions.RequestException as e:
+        return {
+            "can_send": False,
+            "error": f"Send permission probe failed: {e}",
+            "error_code": "PROBE_FAILED",
+            "details": details,
+        }
 
 
 def check_phone_number_status(access_token: str, phone_number_id: str) -> Dict[str, Any]:
@@ -193,51 +390,44 @@ def detect_whatsapp_connection_path(workspace_id: str) -> Dict[str, Any]:
             "can_use_manual_link": True,
         }
     
-    ws_id = str(workspace_id).strip()
-    
     # Query for existing WhatsApp account (active first, then any)
     account = WhatsAppAccount.query.filter_by(
-        workspace_id=ws_id,
+        workspace_id=workspace_id,
         is_active=True
     ).first()
     
-    def _connected_response(acct, reason: str) -> Dict[str, Any]:
+    # ============================================================
+    # FAST PATH: Active account with token + phone → return immediately
+    # No Meta API calls needed — just use what's in the DB.
+    # This is the common case and should be near-instant.
+    # ============================================================
+    if account and account.phone_number_id and account.get_access_token():
         account_summary = {
-            "id": acct.id,
-            "waba_id": acct.waba_id,
-            "phone_number": acct.display_phone_number,
-            "phone_number_id": acct.phone_number_id,
-            "verified_name": acct.custom_name or acct.verified_name,
+            "id": account.id,
+            "waba_id": account.waba_id,
+            "phone_number": account.display_phone_number,
+            "phone_number_id": account.phone_number_id,
+            "verified_name": account.custom_name or account.verified_name,
             "display_name_status": None,
-            "quality_rating": acct.quality_score,
+            "quality_rating": account.quality_score,
             "is_test_number": False,
-            "is_active": acct.is_active,
-            "is_coexistence": acct.is_coexistence,
-            "token_type": acct.token_type,
+            "is_active": account.is_active,
+            "token_type": account.token_type,
+            "is_coexistence": bool(getattr(account, "is_coexistence", False)),
         }
         return {
             "status": ConnectionStatus.CONNECTED,
             "recommended_path": None,
-            "reason": reason,
+            "reason": "WhatsApp Business account is fully connected",
             "account_summary": account_summary,
             "can_use_embedded_signup": False,
             "can_use_manual_link": True,
         }
     
-    # ============================================================
-    # FAST PATH: Active account with phone_number_id → CONNECTED
-    # Token may be re-read from env if DB decrypt fails (dev/prod secret mismatch).
-    # ============================================================
-    if account and account.phone_number_id and account.is_active:
-        return _connected_response(
-            account,
-            "WhatsApp Business account is connected for this workspace",
-        )
-    
     # If no active account, check for inactive ones (user explicitly unlinked)
     if not account:
         account = WhatsAppAccount.query.filter_by(
-            workspace_id=ws_id
+            workspace_id=workspace_id
         ).order_by(WhatsAppAccount.id.desc()).first()
         
         if account:
@@ -254,6 +444,7 @@ def detect_whatsapp_connection_path(workspace_id: str) -> Dict[str, Any]:
                 "is_test_number": False,
                 "is_active": False,
                 "token_type": account.token_type,
+                "is_coexistence": bool(getattr(account, "is_coexistence", False)),
             }
             return {
                 "status": ConnectionStatus.RELINK_REQUIRED,
@@ -293,6 +484,7 @@ def detect_whatsapp_connection_path(workspace_id: str) -> Dict[str, Any]:
         "is_test_number": False,
         "is_active": account.is_active,
         "token_type": account.token_type,
+        "is_coexistence": bool(getattr(account, "is_coexistence", False)),
     }
     
     # Check if phone_number_id is missing → PARTIAL
@@ -403,6 +595,17 @@ def connect_manual(
             "error": f"Invalid phone number ID: {phone_status.get('error', 'Phone number validation failed')}",
             "error_code": "INVALID_PHONE"
         }
+
+    # Step 2b: Verify this token can actually send (not just read phone metadata)
+    send_check = verify_messaging_send_access(access_token, phone_number_id, waba_id)
+    if not send_check.get("can_send"):
+        return {
+            "success": False,
+            "error": send_check.get("error", "Token cannot send messages for this WhatsApp account"),
+            "error_code": send_check.get("error_code", "MESSAGING_PERMISSION_DENIED"),
+            "hints": send_check.get("hints", []),
+            "details": send_check.get("details"),
+        }
     
     # Step 3: Check if this WABA+phone already exists ANYWHERE in the database
     existing_account = WhatsAppAccount.query.filter_by(
@@ -437,8 +640,11 @@ def connect_manual(
         existing_token = existing_account.get_access_token()
         if existing_token:
             existing_token_check = validate_token_with_meta(existing_token)
-            if existing_token_check.get("valid"):
-                # Don't overwrite a working token, but ensure account is active
+            existing_send_check = verify_messaging_send_access(
+                existing_token, phone_number_id, waba_id
+            )
+            if existing_token_check.get("valid") and existing_send_check.get("can_send"):
+                # Don't overwrite a token that can actually send
                 was_reactivated = False
                 if not existing_account.is_active:
                     existing_account.is_active = True
@@ -453,6 +659,12 @@ def connect_manual(
                     "account": existing_account.to_dict(),
                     "was_updated": was_reactivated
                 }
+            if existing_token_check.get("valid") and not existing_send_check.get("can_send"):
+                logger.warning(
+                    "Replacing token for account %s: valid for /me but cannot send (%s)",
+                    existing_account.id,
+                    existing_send_check.get("error_code"),
+                )
         
         # Update existing account with new token
         existing_account.set_access_token(access_token, "permanent")
@@ -461,7 +673,11 @@ def connect_manual(
         existing_account.last_synced_at = datetime.now(timezone.utc)
         existing_account.display_phone_number = phone_status.get("display_phone_number")
         existing_account.verified_name = phone_status.get("verified_name") or existing_account.verified_name
-        existing_account.quality_score = phone_status.get("quality_rating")
+        qr = phone_status.get("quality_rating")
+        if qr:
+            shadow_sync_account_quality_rating(existing_account, qr, db_session=db.session)
+        else:
+            existing_account.quality_score = None
         
         db.session.commit()
         
@@ -485,7 +701,6 @@ def connect_manual(
         phone_number_id=phone_number_id,
         display_phone_number=phone_status.get("display_phone_number"),
         verified_name=phone_status.get("verified_name"),
-        quality_score=phone_status.get("quality_rating"),
         connected_by_user_id=user_id,
         is_active=True,
     )
@@ -493,6 +708,10 @@ def connect_manual(
     new_account.last_synced_at = datetime.now(timezone.utc)
     
     db.session.add(new_account)
+    db.session.flush()
+    qr = phone_status.get("quality_rating")
+    if qr:
+        shadow_sync_account_quality_rating(new_account, qr, db_session=db.session)
     db.session.commit()
     
     logger.info(f"Created new WhatsApp account: {new_account.id} for workspace {workspace_id}")
@@ -512,12 +731,9 @@ def connect_manual(
 
 def _run_post_connection_setup(account_id: int, waba_id: str, access_token: str) -> Dict[str, Any]:
     """
-    Run post-connection setup tasks:
-    1. Subscribe WABA to webhooks
-    2. Validate webhook configuration
-    3. Log any issues for debugging
-    
-    This ensures new users don't have to manually configure webhooks.
+    Run post-connection setup via the canonical provisioning pipeline.
+    All setup (webhook subscription, warmup, templates, capability matrix)
+    is handled by the provisioning engine.
     """
     setup_results = {
         "webhook_subscription": None,
@@ -526,29 +742,32 @@ def _run_post_connection_setup(account_id: int, waba_id: str, access_token: str)
     }
     
     try:
-        from .health_check import subscribe_waba_to_webhooks, perform_health_check
+        account = WhatsAppAccount.query.get(account_id)
+        if not account:
+            setup_results["issues"].append("Account not found")
+            return setup_results
+
+        from .provisioning_engine import provision_account
+
+        result = provision_account(
+            account=account,
+            access_token=access_token,
+            source="manual_connect",
+            is_new_account=False,
+        )
         
-        # Auto-subscribe WABA to webhooks
-        success, message, details = subscribe_waba_to_webhooks(waba_id, access_token)
+        setup_results["provisioning"] = result.to_dict()
         setup_results["webhook_subscription"] = {
-            "success": success,
-            "message": message,
-            "details": details
+            "success": result.capability_matrix.get("webhook_subscribed", 
+                       __import__("types").SimpleNamespace(enabled=False)).enabled,
         }
-        
-        if not success:
-            setup_results["issues"].append(f"Webhook subscription failed: {message}")
-            logger.warning(f"⚠️ Webhook subscription failed for account {account_id}: {message}")
-        else:
-            logger.info(f"✅ Webhook subscription successful for account {account_id}")
-        
-        # Run health check
-        health_result = perform_health_check(account_id, auto_fix=True)
-        setup_results["health_check"] = health_result
-        
-        if health_result.get("overall_status") == "critical":
-            setup_results["issues"].append("Health check found critical issues")
-        
+        setup_results["health_check"] = {
+            "overall_status": "healthy" if result.readiness_score >= 70 else "warning",
+            "readiness_score": result.readiness_score,
+        }
+        if result.errors:
+            setup_results["issues"].extend(result.errors)
+
     except Exception as e:
         logger.exception(f"Post-connection setup error: {e}")
         setup_results["issues"].append(f"Setup error: {str(e)}")
