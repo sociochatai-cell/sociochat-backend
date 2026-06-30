@@ -100,7 +100,12 @@ class WhatsAppService(
             account_id: Optional account ID to query stored account directly
         """
         self.db_session = db_session or db.session
-        self.api_version = os.getenv("WHATSAPP_API_VERSION", "v24.0")
+        # Per-tenant Meta config (env fallback for T0000 / unconfigured tenants).
+        from tenant.integration import get_tenant_meta_config
+        self.api_version = (
+            get_tenant_meta_config(workspace_id=workspace_id).whatsapp_api_version
+            or os.getenv("WHATSAPP_API_VERSION", "v24.0")
+        )
 
         # Phase-2: Try to get stored account for workspace/id first
         stored_account = None

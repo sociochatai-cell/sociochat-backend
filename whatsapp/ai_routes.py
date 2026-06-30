@@ -417,8 +417,8 @@ def classify_message_intent(account_id: int, account: WhatsAppAccount, workspace
         if not message:
             return jsonify({"error": "Message is required"}), 400
         
-        # Classify intent
-        result = classify_intent(message)
+        # Classify intent (workspace-scoped so a tenant's own Gemini key is used)
+        result = classify_intent(message, workspace_id=workspace_id)
         
         return jsonify({
             "success": result.success,
@@ -500,8 +500,10 @@ def rewrite_message(account_id: int, account: WhatsAppAccount, workspace_id: str
         }), 400
     
     try:
-        # Use the same Vertex AI client as the rest of the codebase
-        client = get_genai_client()
+        # Use the same client as the rest of the codebase, scoped to the
+        # account's workspace so a tenant with its own Gemini key is billed on
+        # their own AI quota (env fallback for T0000 / unconfigured tenants).
+        client = get_genai_client(workspace_id=workspace_id)
         if not client:
             return jsonify({"success": False, "error": "AI not configured"}), 500
         

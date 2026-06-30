@@ -1600,6 +1600,21 @@ class InteractiveAutomationEngine:
             logger.exception("[interactive_engine] END-node lead hook failed (best-effort, ignored)")
 
         state.complete()
+
+        # CRM: qualify lead on flow completion (forward-only, idempotent, never raises).
+        try:
+            from SocioviaCrm.lead_ingest import advance_lead_status
+            advance_lead_status(
+                workspace_id=self.workspace_id,
+                phone=getattr(state, "phone_number", None),
+                external_id=str(state.conversation_id) if state.conversation_id is not None else None,
+                target_status="qualified",
+                reason="Completed automation flow",
+                db_session=db.session,
+            )
+        except Exception as e:
+            logger.warning(f"[interactive_engine] CRM advance_lead_status failed on flow completion: {e}")
+
         _clear_cached_active_state_id(self.workspace_id, state.conversation_id)
 
     def _deactivate_existing_active_states(self, conversation_id: int) -> None:
@@ -3924,6 +3939,40 @@ class InteractiveAutomationEngine:
             {"leadAction": synthetic_lead_action, "id": node_id},
             captured_value=captured_value,
         )
+
+        # CRM lead status update from a status-bearing lead node — best-effort,
+        # never breaks the flow. Only fires when the node explicitly carries a
+        # target "status" (mode="set" sets the exact status, otherwise it is a
+        # forward-only advance). The default stage-based path above is untouched.
+        target_status = node_data.get("status")
+        if target_status:
+            mode = node_data.get("mode", "advance")
+            try:
+                from SocioviaCrm.lead_ingest import advance_lead_status, set_lead_status
+                ext_id = str(state.conversation_id) if state.conversation_id is not None else None
+                if mode == "set":
+                    set_lead_status(
+                        workspace_id=self.workspace_id,
+                        phone=getattr(state, "phone_number", None),
+                        external_id=ext_id,
+                        target_status=target_status,
+                        reason="Set by flow node",
+                        db_session=db.session,
+                    )
+                else:
+                    advance_lead_status(
+                        workspace_id=self.workspace_id,
+                        phone=getattr(state, "phone_number", None),
+                        external_id=ext_id,
+                        target_status=target_status,
+                        reason="Advanced by flow node",
+                        db_session=db.session,
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[interactive_engine] lead node CRM status update failed "
+                    f"(mode={mode}, target={target_status}): {e}"
+                )
 
         next_node_id = self._resolve_lead_next_node_id(lead_node, source_edges)
 

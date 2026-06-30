@@ -161,8 +161,19 @@ def connect_coexistence():
 
     from . import oauth as _wa_oauth
 
-    app_id = _wa_oauth.META_APP_ID
-    app_secret = _wa_oauth.META_APP_SECRET
+    # Resolve the tenant's own Meta app (per-field env fallback for T0000 /
+    # unconfigured tenants). A real sub-tenant uses ITS OWN app_id/app_secret so
+    # the token exchange + WABA discovery happen under the tenant's Meta app.
+    try:
+        from tenant.integration import get_tenant_meta_config
+        cfg = get_tenant_meta_config(workspace_id=workspace_id)
+        app_id = cfg.app_id or _wa_oauth.META_APP_ID
+        app_secret = cfg.app_secret or _wa_oauth.META_APP_SECRET
+    except Exception as cfg_err:
+        logger.warning("coexistence/connect: tenant meta-config resolution failed (%s); using env", cfg_err)
+        app_id = _wa_oauth.META_APP_ID
+        app_secret = _wa_oauth.META_APP_SECRET
+
     if not app_id or not app_secret:
         return jsonify({
             "success": False,

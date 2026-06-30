@@ -42,8 +42,20 @@ REQUIRED_SCOPES = [
 ]
 
 
-def get_redirect_uri() -> str:
-    """Get OAuth callback URL."""
+def get_redirect_uri(workspace_id=None) -> str:
+    """Get OAuth callback URL.
+
+    When a workspace_id is supplied, honour the tenant's configured redirect URL
+    (falls back to the global .env default for T0000 / unconfigured tenants).
+    """
+    if workspace_id:
+        try:
+            from tenant.integration import get_tenant_meta_config
+            cfg = get_tenant_meta_config(workspace_id=workspace_id)
+            if cfg.redirect_url:
+                return cfg.redirect_url
+        except Exception:
+            logger.exception("get_redirect_uri tenant resolution failed; using env")
     app_base = os.getenv("APP_BASE_URL", "https://sociovia-backend-362038465411.europe-west1.run.app")
     return f"{app_base}/api/whatsapp/connect/callback"
 
@@ -64,19 +76,24 @@ def get_oauth_url(workspace_id: str, user_id: str) -> Dict[str, Any]:
     Returns:
         Dict with auth_url and state
     """
-    if not META_APP_ID:
+    # Resolve the tenant's Meta app (env fallback for T0000 / unconfigured).
+    from tenant.integration import get_tenant_meta_config
+    cfg = get_tenant_meta_config(workspace_id=workspace_id)
+    client_id = cfg.app_id or META_APP_ID
+
+    if not client_id:
         raise ValueError("META_APP_ID environment variable not set")
-    
+
     state = generate_state()
-    
+
     # Store state in session for verification
     session[f"wa_oauth_state_{workspace_id}"] = state
     session[f"wa_oauth_workspace_{state}"] = workspace_id
     session[f"wa_oauth_user_{state}"] = user_id
-    
+
     params = {
-        "client_id": META_APP_ID,
-        "redirect_uri": get_redirect_uri(),
+        "client_id": client_id,
+        "redirect_uri": get_redirect_uri(workspace_id=workspace_id),
         "state": state,
         "scope": ",".join(REQUIRED_SCOPES),
         "response_type": "code",
@@ -101,21 +118,27 @@ def exchange_code_for_token(code: str, state: str) -> Dict[str, Any]:
     Returns:
         Dict with access_token, token_type, expires_in
     """
-    if not META_APP_SECRET:
-        raise ValueError("META_APP_SECRET environment variable not set")
-    
     # Verify state
     workspace_id = session.get(f"wa_oauth_workspace_{state}")
     user_id = session.get(f"wa_oauth_user_{state}")
-    
+
     if not workspace_id or not user_id:
         raise ValueError("Invalid or expired OAuth state")
-    
+
+    # Resolve the tenant's Meta app (env fallback for T0000 / unconfigured).
+    from tenant.integration import get_tenant_meta_config
+    cfg = get_tenant_meta_config(workspace_id=workspace_id)
+    client_id = cfg.app_id or META_APP_ID
+    client_secret = cfg.app_secret or META_APP_SECRET
+
+    if not client_secret:
+        raise ValueError("META_APP_SECRET environment variable not set")
+
     # Exchange code for token
     params = {
-        "client_id": META_APP_ID,
-        "client_secret": META_APP_SECRET,
-        "redirect_uri": get_redirect_uri(),
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": get_redirect_uri(workspace_id=workspace_id),
         "code": code,
     }
     
@@ -281,30 +304,44 @@ def save_whatsapp_account(
     return account
 
 
-def exchange_short_for_long_token(short_token: str) -> Dict[str, Any]:
+def exchange_short_for_long_token(short_token: str, workspace_id=None) -> Dict[str, Any]:
     """
     Exchange a short-lived access token from Facebook SDK for a long-lived token.
-    
+
     This is used for simple Facebook OAuth login (not Embedded Signup).
     The short-lived token comes from the FB.login() callback on frontend.
-    
+
     Args:
         short_token: Short-lived access token from Facebook SDK
-        
+        workspace_id: Optional workspace ID — when supplied, the tenant's own
+            Meta app credentials are used (env fallback for T0000 / unconfigured).
+
     Returns:
         Dict with long_token, expires_in, token_type
     """
-    if not META_APP_ID:
+    # Resolve the tenant's Meta app (env fallback for T0000 / unconfigured).
+    client_id = META_APP_ID
+    client_secret = META_APP_SECRET
+    if workspace_id:
+        try:
+            from tenant.integration import get_tenant_meta_config
+            cfg = get_tenant_meta_config(workspace_id=workspace_id)
+            client_id = cfg.app_id or META_APP_ID
+            client_secret = cfg.app_secret or META_APP_SECRET
+        except Exception:
+            logger.exception("exchange_short_for_long_token tenant resolution failed; using env")
+
+    if not client_id:
         raise ValueError("META_APP_ID environment variable not set")
-    if not META_APP_SECRET:
+    if not client_secret:
         raise ValueError("META_APP_SECRET environment variable not set")
-    
+
     # Exchange short token for long-lived token
     exchange_url = f"{META_GRAPH_API}/oauth/access_token"
     params = {
         "grant_type": "fb_exchange_token",
-        "client_id": META_APP_ID,
-        "client_secret": META_APP_SECRET,
+        "client_id": client_id,
+        "client_secret": client_secret,
         "fb_exchange_token": short_token,
     }
     

@@ -24,13 +24,34 @@ def _parse_service_account_json(raw: str) -> dict:
     return json.loads(text)
 
 
-def get_sheets_credentials():
+def get_sheets_credentials(workspace_id=None):
     """
     Get Google Sheets credentials from environment variable or file.
     Returns tuple: (creds_data_dict, error_message)
     If successful: (dict, None)
     If failed: (None, error_string)
+
+    When ``workspace_id`` is supplied and that tenant has configured their own
+    Google service-account JSON, it is used first (so the tenant authorizes
+    Sheets with THEIR own service account). With no workspace, no tenant
+    override, or invalid tenant JSON, this falls back to exactly the env/file
+    resolution used before — byte-identical for T0000 / unconfigured tenants.
     """
+    # Priority 0: Per-tenant service-account JSON (tenant brings their own).
+    if workspace_id:
+        try:
+            from tenant.integration import get_tenant_ai_config
+            cfg = get_tenant_ai_config(workspace_id=workspace_id)
+            if cfg.is_custom and cfg.google_sa_json:
+                try:
+                    creds_data = _parse_service_account_json(cfg.google_sa_json)
+                    logger.info("Using tenant Google Sheets service-account JSON (workspace_id=%s)", workspace_id)
+                    return creds_data, None
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse tenant google_sa_json: {e}; falling back to env")
+        except Exception as e:
+            logger.warning(f"Tenant AI config resolution failed ({e}); falling back to env Sheets creds")
+
     # Priority 1: Check env variables for JSON string (supports multiple names)
     env_vars_to_check = [
         "GOOGLE_SHEETS_ACCOUNT_JSON",
@@ -71,20 +92,23 @@ def get_sheets_credentials():
     return None, "No Google Sheets credentials configured. Set GOOGLE_SHEETS_ACCOUNT_JSON in .env"
 
 
-def get_gspread_client():
+def get_gspread_client(workspace_id=None):
     """
     Get an authorized gspread client.
     Returns tuple: (gspread_client, error_message)
     If successful: (client, None)
     If failed: (None, error_string)
+
+    Pass ``workspace_id`` to authorize with the tenant's own Google
+    service-account JSON; omitting it falls back to the env/file creds.
     """
     try:
         import gspread
         from google.oauth2.service_account import Credentials
     except ImportError:
         return None, "gspread not installed. Run: pip install gspread"
-    
-    creds_data, error = get_sheets_credentials()
+
+    creds_data, error = get_sheets_credentials(workspace_id=workspace_id)
     if error:
         return None, error
     
@@ -791,11 +815,11 @@ def dataset_import_sheets(dataset_id: int):
     
     if not sheet_id:
         return jsonify({"success": False, "error": "Sheet URL is required"}), 400
-        
-    gc, error = get_gspread_client()
+
+    gc, error = get_gspread_client(workspace_id=getattr(dataset, "workspace_id", None))
     if error:
         return jsonify({"success": False, "error": error}), 500
-        
+
     try:
         # Extract ID
         actual_sheet_id = sheet_id
@@ -1617,8 +1641,8 @@ def sync_sheet_campaign(campaign_id: int):
                 "success": False,
                 "error": "No Google Sheet URL configured for this campaign"
             }), 400
-        
-        gc, error = get_gspread_client()
+
+        gc, error = get_gspread_client(workspace_id=getattr(campaign, "workspace_id", None))
         if error:
             return jsonify({
                 "success": False,
@@ -1813,8 +1837,8 @@ def sync_sheet_campaign_internal(campaign_id: int) -> dict:
         
         if not campaign.sheet_id:
             return {"success": False, "error": "No sheet URL configured"}
-        
-        gc, error = get_gspread_client()
+
+        gc, error = get_gspread_client(workspace_id=getattr(campaign, "workspace_id", None))
         if error:
             return {"success": False, "error": error}
         
@@ -2468,11 +2492,11 @@ def import_contacts_sheet(account_id: int, campaign_id: int, account: WhatsAppAc
     
     if not sheet_url:
         return jsonify({"error": "Sheet URL is required"}), 400
-        
-    gc, error = get_gspread_client()
+
+    gc, error = get_gspread_client(workspace_id=workspace_id)
     if error:
         return jsonify({"success": False, "error": error}), 500
-        
+
     try:
         campaign = WhatsAppDripCampaign.query.filter_by(
             id=campaign_id,

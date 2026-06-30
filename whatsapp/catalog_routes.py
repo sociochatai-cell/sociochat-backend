@@ -32,8 +32,11 @@ def _get_api_version() -> str:
 def _get_account_and_token():
     """
     Look up WhatsAppAccount by account_id or workspace_id from query params or JSON body.
-    Falls back to the first active account if neither is supplied.
-    Returns (account, access_token).
+
+    A workspace_id (or account_id) is REQUIRED — there is no global fallback to
+    "the first active account" (that would leak data across tenants). The current
+    logged-in user must own the resolved account's workspace; otherwise the
+    request is rejected. Returns (account, access_token).
     Raises ValueError with a descriptive message on failure.
     """
     from .models import WhatsAppAccount
@@ -42,15 +45,49 @@ def _get_account_and_token():
     account_id = data.get("account_id") or request.args.get("account_id")
     workspace_id = data.get("workspace_id") or request.args.get("workspace_id")
 
+    # Resolve the authenticated user defensively. If tenant context is somehow
+    # unavailable we still enforce the required-param + no-global-fallback rules
+    # below; only the ownership assertion is softened when no user is resolved.
+    current_user = None
+    try:
+        from tenant.context import get_current_user
+        current_user = get_current_user()
+    except Exception:  # pragma: no cover - tenant context import/lookup failure
+        current_user = None
+
+    def _assert_owned(ws_id):
+        """Reject the request if a user is resolved but does not own ws_id.
+
+        ``ws_id`` is the account's (String) workspace_id; ``user_owns_workspace``
+        performs the safe String->int cast internally and returns False on a
+        bad/None value, so a non-numeric or NULL workspace_id is treated as
+        "not owned" rather than crashing.
+        """
+        if current_user is None:
+            return
+        try:
+            from tenant.context import user_owns_workspace
+            owned = user_owns_workspace(current_user, ws_id)
+        except Exception:  # pragma: no cover - defensive
+            owned = False
+        if not owned:
+            raise ValueError("forbidden: workspace not owned by current user")
+
     if account_id:
         account = WhatsAppAccount.query.filter_by(id=account_id, is_active=True).first()
+        if account:
+            _assert_owned(account.workspace_id)
     elif workspace_id:
-        account = WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).first()
+        _assert_owned(str(workspace_id))
+        account = WhatsAppAccount.query.filter_by(
+            workspace_id=str(workspace_id),
+            is_active=True,
+        ).first()
     else:
-        account = WhatsAppAccount.query.filter_by(is_active=True).first()
+        raise ValueError("workspace_id is required")
 
     if not account:
-        raise ValueError("No active WhatsApp account found")
+        raise ValueError("No active WhatsApp account found for this workspace")
 
     token = account.get_access_token()
     if not token:

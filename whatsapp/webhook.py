@@ -59,8 +59,16 @@ logger = logging.getLogger(__name__)
 
 
 def send_capi_event(*args, **kwargs):
-    """Lazy import so webhook module loads even if integrations package is optional."""
-    from integrations.capi_service import send_capi_event as _send
+    """Lazy import so webhook module loads even if integrations package is optional.
+
+    CRM pipeline: events route through ``SocioviaCrm.capi_service`` (the multi-tenant
+    CRM Conversions API service). Falls back to the legacy ``integrations`` package
+    only if the CRM service is unavailable, so message processing never breaks.
+    """
+    try:
+        from SocioviaCrm.capi_service import send_capi_event as _send
+    except Exception:
+        from integrations.capi_service import send_capi_event as _send
 
     return _send(*args, **kwargs)
 
@@ -98,16 +106,70 @@ def verify_webhook_signature(payload: bytes, signature: str, app_secret: str) ->
     return verify_signature(payload, signature, app_secret)
 
 
+def _extract_phone_number_id_from_payload(payload: bytes) -> Optional[str]:
+    """Best-effort parse of metadata.phone_number_id from a raw webhook body.
+
+    Used to resolve the PER-TENANT Meta app secret for signature verification.
+    Never raises — returns None when the body can't be parsed or has no pid.
+    """
+    try:
+        data = json.loads(payload.decode("utf-8") if isinstance(payload, bytes) else payload)
+    except Exception:
+        return None
+    try:
+        for entry in (data.get("entry") or []):
+            for change in (entry.get("changes") or []):
+                pid = ((change.get("value") or {}).get("metadata") or {}).get("phone_number_id")
+                if pid:
+                    return str(pid)
+    except Exception:
+        return None
+    return None
+
+
+def _tenant_app_secret_for_payload(payload: bytes) -> Optional[str]:
+    """Resolve the tenant's Meta app secret (env-fallback) for this webhook.
+
+    Re-applies the multi-tenant pattern: a tenant using its OWN Meta app signs
+    webhooks with ITS app secret. We resolve it via
+    ``get_tenant_meta_config(phone_number_id=pid).app_secret``. Never raises.
+    """
+    pid = _extract_phone_number_id_from_payload(payload)
+    if not pid:
+        return None
+    try:
+        from tenant.integration import get_tenant_meta_config
+        cfg = get_tenant_meta_config(phone_number_id=pid)
+        return (getattr(cfg, "app_secret", None) or "").strip() or None
+    except Exception:
+        logger.exception("get_tenant_meta_config(phone_number_id=%s) failed; using env secrets", pid)
+        return None
+
+
 def verify_webhook_signature_any(payload: bytes, signature: str) -> bool:
     """
-    Verify webhook signature against every configured app secret.
+    Verify webhook signature against the per-tenant app secret, then env secrets.
 
-    Meta signs with the Facebook App Secret (``FB_APP_SECRET``). Some deployments
-    also set ``WHATSAPP_APP_SECRET`` to a different value — try all of them.
+    Multi-tenant: a tenant using its own Meta app signs with ITS app secret, so we
+    FIRST try ``get_tenant_meta_config(phone_number_id=pid).app_secret`` (resolved
+    from the payload's metadata). We then fall back to the global env secrets —
+    Meta signs SocioChat/T0000 with the Facebook App Secret (``FB_APP_SECRET``);
+    some deployments also set ``WHATSAPP_APP_SECRET`` to a different value.
     """
-    secrets = _webhook_app_secrets()
+    secrets: List[str] = []
+
+    # 1) Per-tenant secret (own Meta app) — resolved from the payload's pid.
+    tenant_secret = _tenant_app_secret_for_payload(payload)
+    if tenant_secret:
+        secrets.append(tenant_secret)
+
+    # 2) Global env secret(s) as fallback (T0000 / unconfigured tenants).
+    for secret in _webhook_app_secrets():
+        if secret not in secrets:
+            secrets.append(secret)
+
     if not secrets:
-        logger.warning("No FB_APP_SECRET / WHATSAPP_APP_SECRET configured - skipping verification")
+        logger.warning("No tenant/env app secret configured - skipping verification")
         return True
     if not signature:
         return False
@@ -120,26 +182,45 @@ def verify_webhook_signature_any(payload: bytes, signature: str) -> bool:
 def verify_webhook_challenge(mode: str, token: str, challenge: str) -> Optional[str]:
     """
     Verify webhook subscription challenge from Meta.
-    
+
+    Multi-tenant: the GET-verify request carries no tenant context, so we accept
+    the global env verify token OR ANY configured tenant's token via
+    ``tenant.integration.verify_token_matches_any`` (instead of comparing only to
+    the single ``WHATSAPP_VERIFY_TOKEN`` env value). Falls back to the env-token
+    comparison if the tenant resolver is unavailable.
+
     Args:
         mode: hub.mode parameter
         token: hub.verify_token parameter
         challenge: hub.challenge parameter
-        
+
     Returns:
         Challenge string if valid, None otherwise
     """
+    if mode != "subscribe":
+        logger.warning(f"Webhook verification failed: mode={mode}")
+        return None
+
+    try:
+        from tenant.integration import verify_token_matches_any
+        if verify_token_matches_any(token):
+            logger.info("Webhook verification successful")
+            return challenge
+        logger.warning("Webhook verification failed: token did not match env or any tenant")
+        return None
+    except Exception:
+        logger.exception("verify_token_matches_any unavailable; falling back to env token")
+
+    # Fallback: compare against the single global env token.
     verify_token = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
-    
     if not verify_token:
         logger.error("WHATSAPP_VERIFY_TOKEN not configured!")
         return None
-    
-    if mode == "subscribe" and token == verify_token:
-        logger.info("Webhook verification successful")
+    if token == verify_token:
+        logger.info("Webhook verification successful (env fallback)")
         return challenge
-    
-    logger.warning(f"Webhook verification failed: mode={mode}, token_match={token == verify_token}")
+
+    logger.warning(f"Webhook verification failed: token_match={token == verify_token}")
     return None
 
 
@@ -665,7 +746,44 @@ class WebhookProcessor:
             })
         except Exception as e:
             logger.error(f"Failed to broadcast message received event: {e}")
-        
+
+        # ============================================================
+        # CRM: Auto-capture conversation into the CRM as a Lead.
+        # Lazy import to avoid circular imports (SocioviaCrm <-> whatsapp).
+        # New conversations create a Lead; existing ones refresh
+        # last_interaction_at (dedupe-safe) and advance status -> "contacted".
+        # ALL CRM calls are isolated in try/except so a CRM failure NEVER breaks
+        # message processing (chat is the critical path).
+        # ============================================================
+        try:
+            from SocioviaCrm.lead_ingest import upsert_lead_from_conversation
+            is_new_conversation = getattr(conversation, "_is_new", False)
+            if is_new_conversation:
+                upsert_lead_from_conversation(
+                    conversation, account, db_session=self.db_session
+                )
+                logger.info(
+                    f"Auto-captured CRM lead for new conversation {conversation.id}"
+                )
+            else:
+                # Cheap refresh of last_interaction_at on an already-known lead.
+                upsert_lead_from_conversation(
+                    conversation, account, db_session=self.db_session
+                )
+                # CRM: auto-advance lead status -> contacted (a reply on an
+                # existing conversation). Forward-only/idempotent; new
+                # conversations stay "new" so this lives only in the else branch.
+                try:
+                    from SocioviaCrm.lead_ingest import advance_lead_status_from_conversation
+                    advance_lead_status_from_conversation(
+                        conversation, account, "contacted",
+                        reason="Replied on WhatsApp", db_session=self.db_session
+                    )
+                except Exception as e:
+                    logger.exception(f"Failed to advance CRM lead status to contacted: {e}")
+        except Exception as e:
+            logger.exception(f"Failed to auto-capture CRM lead from conversation: {e}")
+
         # Process automation rules (after commit to avoid blocking)
         # Handle both text messages and interactive button replies
         if msg_type == "text":
@@ -683,6 +801,38 @@ class WebhookProcessor:
                 )
             # Check for lead keywords in text messages
             self._check_for_lead_keywords(account, conversation, text_content)
+            # CRM Phase 2: buying-intent keyword rule -> advance lead to rule's
+            # status (per-workspace configurable). Forward-only/idempotent; isolated
+            # so CRM logic never breaks message processing. Runs AFTER the
+            # reply->contacted hook so cheap signals win first.
+            rule = None
+            try:
+                from SocioviaCrm.qualify_keywords import match_qualify_rule
+                from SocioviaCrm.lead_ingest import advance_lead_status_from_conversation
+                rule = match_qualify_rule(text_content, account.workspace_id)
+                if rule:
+                    advance_lead_status_from_conversation(
+                        conversation, account, rule["status"],
+                        reason=f"Keyword '{rule['keyword']}' -> {rule['status']}",
+                        db_session=self.db_session)
+            except Exception as e:
+                logger.exception(f"interest-keyword qualify hook failed: {e}")
+            # CRM Phase 3: AI fallback classifier. ONLY runs when the keyword rule
+            # did NOT match (rule is None). classify_lead_status returns None when
+            # AI is disabled / chit-chat / error, so this is cheap when off.
+            # Fail-safe — never breaks message processing.
+            if rule is None:
+                try:
+                    from SocioviaCrm.ai_status_classifier import classify_lead_status
+                    from SocioviaCrm.lead_ingest import advance_lead_status_from_conversation
+                    _st = classify_lead_status(text_content, account.workspace_id)
+                    if _st:
+                        advance_lead_status_from_conversation(
+                            conversation, account, _st,
+                            reason=f"AI classified -> {_st}",
+                            db_session=self.db_session)
+                except Exception as e:
+                    logger.exception(f"AI status classify hook failed: {e}")
         elif msg_type == "interactive":
             # Handle button replies from interactive messages
             interactive = message.get("interactive", {})
@@ -714,7 +864,18 @@ class WebhookProcessor:
                     is_flow_reply=True,
                     raw_message=message,
                 )
-            
+                # CRM: auto-advance lead status -> qualified (completed a flow).
+                # Forward-only/idempotent; isolated so CRM logic never breaks msg
+                # processing.
+                try:
+                    from SocioviaCrm.lead_ingest import advance_lead_status_from_conversation
+                    advance_lead_status_from_conversation(
+                        conversation, account, "qualified",
+                        reason="Completed WhatsApp flow", db_session=self.db_session
+                    )
+                except Exception as e:
+                    logger.exception(f"Failed to advance CRM lead status to qualified (flow): {e}")
+
             if button_payload:
                 self._process_automation(
                     account=account,
@@ -1196,11 +1357,16 @@ class WebhookProcessor:
             )
             self.db_session.add(conversation)
             self.db_session.flush()
+            # Transient marker so the CRM auto-capture hook can tell a brand-new
+            # conversation (create a Lead) from a returning one (refresh + advance).
+            conversation._is_new = True
             logger.info(f"Created conversation with: {canonical}")
-        elif user_name and conversation.user_name != user_name:
-            # Update name if it changed or was missing
-            conversation.user_name = user_name
-        
+        else:
+            conversation._is_new = False
+            if user_name and conversation.user_name != user_name:
+                # Update name if it changed or was missing
+                conversation.user_name = user_name
+
         return conversation
     
     def _process_attribution(
@@ -1341,7 +1507,18 @@ class WebhookProcessor:
                 account, conversation, ad_id=ad_id, lead_type="keyword"
             )
             logger.info(f"Keyword lead detected in conv {conversation.id}, ad_id={ad_id}")
-    
+            # CRM: auto-advance lead status -> qualified (matched interest keyword).
+            # Forward-only/idempotent; isolated so CRM logic never breaks msg
+            # processing.
+            try:
+                from SocioviaCrm.lead_ingest import advance_lead_status_from_conversation
+                advance_lead_status_from_conversation(
+                    conversation, account, "qualified",
+                    reason="Matched interest keyword", db_session=self.db_session
+                )
+            except Exception as e:
+                logger.exception(f"Failed to advance CRM lead status to qualified (keyword): {e}")
+
     @staticmethod
     def _outbound_text(msg: WhatsAppMessage) -> str:
         content = msg.content or {}

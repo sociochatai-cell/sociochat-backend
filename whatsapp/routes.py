@@ -3760,8 +3760,11 @@ def delete_template(template_id):
         return jsonify({"success": False, "error": token_error}), 400
     
     access_token = account.get_access_token()
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(
+        workspace_id=(workspace_id or account.workspace_id)
+    ).whatsapp_api_version or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+
     # Find template in database - first try by meta_template_id (string)
     template = WhatsAppTemplate.query.filter_by(
         account_id=account.id,
@@ -4201,9 +4204,12 @@ def create_template():
     # Update account_id if helper returned a different active account
     account_id = account.id
     access_token = account.get_access_token()
-    
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    
+
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(
+        workspace_id=account.workspace_id
+    ).whatsapp_api_version or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+
     # ====== INTENT ENFORCEMENT ======
     # Server-side validation to prevent Marketing disguised as Utility
     try:
@@ -4682,9 +4688,12 @@ def get_template(template_name: str):
     # Fallback to environment variables
     if not access_token:
         access_token = os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TEMP_TOKEN")
-    
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    
+
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(
+        workspace_id=(account.workspace_id if account else None)
+    ).whatsapp_api_version or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+
     if not access_token:
         return jsonify({
             "success": False,
@@ -5736,9 +5745,12 @@ def register_phone_number(account_id: int):
     # Get optional PIN from request body
     data = request.get_json(silent=True) or {}
     pin = data.get("pin", "123456")  # Default 6-digit PIN
-    
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v24.0")
-    
+
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(
+        workspace_id=account.workspace_id
+    ).whatsapp_api_version or os.getenv("WHATSAPP_API_VERSION", "v24.0")
+
     try:
         resp = http_requests.post(
             f"https://graph.facebook.com/{api_version}/{account.phone_number_id}/register",
@@ -5915,7 +5927,11 @@ def get_account_voice_call_capability(account_id: int):
         return jsonify({"success": False, "error": token_error}), 400
 
     access_token = account.get_access_token()
-    capability = _get_voice_call_capability(account, access_token)
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(
+        workspace_id=account.workspace_id
+    ).whatsapp_api_version or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    capability = _get_voice_call_capability(account, access_token, api_version)
     return jsonify(capability)
 
 
@@ -5941,8 +5957,11 @@ def get_ice_breakers(account_id: int):
         return jsonify({"success": False, "error": token_error}), 400
     
     access_token = account.get_access_token()
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(
+        workspace_id=account.workspace_id
+    ).whatsapp_api_version or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+
     try:
         # Get WhatsApp Business Profile with ice breakers
         url = f"https://graph.facebook.com/{api_version}/{account.phone_number_id}/whatsapp_business_profile"
@@ -6034,8 +6053,11 @@ def update_ice_breakers(account_id: int):
             return jsonify({"success": False, "error": f"Ice breaker {i+1} exceeds 80 character limit"}), 400
     
     access_token = account.get_access_token()
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(
+        workspace_id=account.workspace_id
+    ).whatsapp_api_version or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+
     try:
         # Build conversational automation payload
         automation_payload = {
@@ -6099,8 +6121,11 @@ def delete_ice_breakers(account_id: int):
         return jsonify({"success": False, "error": token_error}), 400
     
     access_token = account.get_access_token()
-    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    
+    from tenant.integration import get_tenant_meta_config
+    api_version = get_tenant_meta_config(
+        workspace_id=account.workspace_id
+    ).whatsapp_api_version or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+
     try:
         # Clear ice breakers by setting empty array
         url = f"https://graph.facebook.com/{api_version}/{account.phone_number_id}/conversational_automation"
@@ -6157,10 +6182,14 @@ def connect_start():
 
     from . import oauth as _wa_oauth
 
-    app_id = _wa_oauth.META_APP_ID
-    config_id = os.getenv("WHATSAPP_CONFIG_ID")
-    api_version = os.getenv("FB_API_VERSION") or os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    
+    # Per-tenant Meta credentials (falls back to env for T0000/unconfigured).
+    from tenant.integration import get_tenant_meta_config
+    cfg = get_tenant_meta_config(workspace_id=workspace_id)
+
+    app_id = cfg.app_id or _wa_oauth.META_APP_ID
+    config_id = cfg.config_id or os.getenv("WHATSAPP_CONFIG_ID")
+    api_version = cfg.fb_api_version or os.getenv("FB_API_VERSION") or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+
     if not app_id:
         return jsonify({"success": False, "error": "Meta app id not configured (META_APP_ID or FB_APP_ID)"}), 500
     
@@ -6195,10 +6224,12 @@ def connect_popup():
 
     from . import oauth as _wa_oauth
 
-    # OAuth configuration
-    app_id = _wa_oauth.META_APP_ID
-    config_id = os.getenv("WHATSAPP_CONFIG_ID")
-    api_version = os.getenv("FB_API_VERSION") or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    # OAuth configuration — per-tenant Meta credentials (env fallback for T0000/unconfigured).
+    from tenant.integration import get_tenant_meta_config
+    cfg = get_tenant_meta_config(workspace_id=workspace_id)
+    app_id = cfg.app_id or _wa_oauth.META_APP_ID
+    config_id = cfg.config_id or os.getenv("WHATSAPP_CONFIG_ID")
+    api_version = cfg.fb_api_version or os.getenv("FB_API_VERSION") or os.getenv("WHATSAPP_API_VERSION", "v22.0")
     redirect_base = os.getenv("OAUTH_REDIRECT_BASE", "https://sociovia-backend-362038465411.europe-west1.run.app")
     redirect_uri = f"{redirect_base.rstrip('/')}/api/whatsapp/connect/callback"
 
@@ -6321,9 +6352,12 @@ def connect_exchange():
     
     from . import oauth as _wa_oauth
 
-    app_id = _wa_oauth.META_APP_ID
-    app_secret = _wa_oauth.META_APP_SECRET
-    api_version = os.getenv("FB_API_VERSION") or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    # Per-tenant Meta credentials (falls back to env for T0000/unconfigured).
+    from tenant.integration import get_tenant_meta_config
+    cfg = get_tenant_meta_config(workspace_id=workspace_id)
+    app_id = cfg.app_id or _wa_oauth.META_APP_ID
+    app_secret = cfg.app_secret or _wa_oauth.META_APP_SECRET
+    api_version = cfg.fb_api_version or os.getenv("FB_API_VERSION") or os.getenv("WHATSAPP_API_VERSION", "v22.0")
 
     if not app_id or not app_secret:
         return jsonify(
@@ -6646,10 +6680,13 @@ def facebook_oauth_login():
     if not workspace_id:
         return jsonify({"success": False, "error": "workspace_id is required"}), 400
     
-    app_id = wa_oauth.META_APP_ID
-    app_secret = wa_oauth.META_APP_SECRET
-    api_version = os.getenv("FB_API_VERSION") or os.getenv("WHATSAPP_API_VERSION", "v22.0")
-    
+    # Per-tenant Meta credentials (falls back to env for T0000/unconfigured).
+    from tenant.integration import get_tenant_meta_config
+    cfg = get_tenant_meta_config(workspace_id=workspace_id)
+    app_id = cfg.app_id or wa_oauth.META_APP_ID
+    app_secret = cfg.app_secret or wa_oauth.META_APP_SECRET
+    api_version = cfg.fb_api_version or os.getenv("FB_API_VERSION") or os.getenv("WHATSAPP_API_VERSION", "v22.0")
+
     if not app_id or not app_secret:
         logger.error(
             "Facebook / Meta app credentials not configured for oauth/facebook-login "
@@ -7126,12 +7163,15 @@ def connect_callback():
 
     try:
         # Exchange code for access token
-        app_id = os.getenv("FB_APP_ID") or os.getenv("META_APP_ID")
-        app_secret = os.getenv("FB_APP_SECRET") or os.getenv("META_APP_SECRET")
-        api_version = os.getenv("FB_API_VERSION", "v22.0")
+        # Per-tenant Meta credentials (falls back to env for T0000/unconfigured).
+        from tenant.integration import get_tenant_meta_config
+        cfg = get_tenant_meta_config(workspace_id=workspace_id)
+        app_id = cfg.app_id or os.getenv("FB_APP_ID") or os.getenv("META_APP_ID")
+        app_secret = cfg.app_secret or os.getenv("FB_APP_SECRET") or os.getenv("META_APP_SECRET")
+        api_version = cfg.fb_api_version or os.getenv("FB_API_VERSION", "v22.0")
         redirect_base = os.getenv("OAUTH_REDIRECT_BASE", "https://sociovia-backend-362038465411.europe-west1.run.app")
-        redirect_uri = f"{redirect_base.rstrip('/')}/api/whatsapp/connect/callback"
-        
+        redirect_uri = cfg.redirect_url or f"{redirect_base.rstrip('/')}/api/whatsapp/connect/callback"
+
         import requests as http_requests
         
         # Token exchange
