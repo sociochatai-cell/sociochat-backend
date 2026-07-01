@@ -8,13 +8,12 @@ import time
 # Ensure the app directory is in the path
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-from runtime import app, prepare_worker_runtime
+# Target uses app.py directly (no separate runtime module). Importing it prepares
+# the DB, models, and app context that the worker needs.
+from app import app
 from core.queue.manager import get_queue_backend, start_worker
 
 logger = logging.getLogger("worker_main")
-
-# Prepare the runtime (DB only)
-prepare_worker_runtime()
 
 # Global stop event for graceful shutdown
 stop_event = threading.Event()
