@@ -92,11 +92,13 @@ def get_access_token():
     if auth_header:
         return auth_header
     
-    # Check Authorization header
-    auth = (request.headers.get("Authorization", "") or "").strip()
-    if auth.startswith("Bearer "):
-        return auth[7:].strip()
-    
+    # The request's `Authorization: Bearer` header is the USER's login JWT (added by
+    # apiClient / the fetch shim) — NOT a WhatsApp access token. Using it made Meta
+    # return 190. A genuine per-request token override uses X-WhatsApp-Token.
+    hdr = (request.headers.get("X-WhatsApp-Token") or "").strip()
+    if hdr:
+        return hdr
+
     # Check database for connected WhatsApp account
     try:
         from .models import WhatsAppAccount
@@ -121,8 +123,17 @@ def get_access_token():
                 if token:
                     return token
         else:
-            # No phone_number_id specified, try to get any active account
-            account = WhatsAppAccount.query.filter_by(is_active=True).first()
+            # No phone_number_id: prefer the account for THIS request's workspace
+            # (multi-tenant), else fall back to any active account.
+            wid = (request.headers.get("X-Workspace-ID") or request.headers.get("X-Workspace-Id")
+                   or request.args.get("workspace_id"))
+            if not wid and request.is_json:
+                wid = (request.get_json(silent=True) or {}).get("workspace_id")
+            account = None
+            if wid:
+                account = WhatsAppAccount.query.filter_by(workspace_id=str(wid), is_active=True).first()
+            if account is None:
+                account = WhatsAppAccount.query.filter_by(is_active=True).first()
             if account:
                 token = account.get_access_token()
                 if token:
