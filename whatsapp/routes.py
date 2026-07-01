@@ -92,12 +92,9 @@ def get_access_token():
     if auth_header:
         return auth_header
     
-    # The request's `Authorization: Bearer` header is the USER's login JWT (added by
-    # apiClient / the fetch shim) — NOT a WhatsApp access token. Using it made Meta
-    # return 190. A genuine per-request token override uses X-WhatsApp-Token.
-    hdr = (request.headers.get("X-WhatsApp-Token") or "").strip()
-    if hdr:
-        return hdr
+    # NOTE: the request's `Authorization: Bearer` header is the USER's login JWT
+    # (apiClient / fetch shim) — NOT a WhatsApp token. Do NOT use it (caused Meta 190).
+    # Always use the sending account's OWN token, resolved below.
 
     # Check database for connected WhatsApp account
     try:
@@ -160,6 +157,24 @@ def get_phone_number_id():
     if pid:
         return pid
     
+    # Otherwise use the phone of the current workspace's account, so phone_number_id
+    # and the token from get_access_token() always belong to the SAME account.
+    try:
+        from .models import WhatsAppAccount
+        wid = (request.headers.get("X-Workspace-ID") or request.headers.get("X-Workspace-Id")
+               or request.args.get("workspace_id"))
+        if not wid and request.is_json:
+            wid = (request.get_json(silent=True) or {}).get("workspace_id")
+        account = None
+        if wid:
+            account = WhatsAppAccount.query.filter_by(workspace_id=str(wid), is_active=True).first()
+        if account is None:
+            account = WhatsAppAccount.query.filter_by(is_active=True).first()
+        if account and account.phone_number_id:
+            return account.phone_number_id
+    except Exception:
+        pass
+
     # Fall back to environment
     return os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 
