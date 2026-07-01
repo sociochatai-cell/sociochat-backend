@@ -37,7 +37,39 @@ def init_scheduler(app):
     scheduler = BackgroundScheduler(jobstores=jobstores, executors=executors, job_defaults=job_defaults, timezone=utc)
     scheduler.start()
     logger.info("WhatsApp APScheduler started with app context support")
+
+    # Periodic in-process sweep: activates due "scheduled" campaigns (bulk + drip)
+    # and advances due drip enrollments. In production this logic is also reachable
+    # via POST /api/internal/scheduler/tick (external Cloud Scheduler), but without
+    # an in-process tick, "scheduled" campaigns just sit there forever.
+    scheduler.add_job(
+        id="whatsapp_periodic_tick",
+        func=_run_periodic_tick,
+        trigger="interval",
+        seconds=60,
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
     return scheduler
+
+
+def _run_periodic_tick():
+    """Runs the same sweep as POST /api/internal/scheduler/tick, in-process."""
+    if _flask_app is None:
+        return
+    with _flask_app.app_context():
+        try:
+            from .drip_engine import check_scheduled_campaigns, process_due_drip_enrollments
+            activated = check_scheduled_campaigns()
+            drip_stats = process_due_drip_enrollments()
+            logger.info(
+                "[periodic tick] activated_campaigns=%s drip_enrollments=%s",
+                len(activated), drip_stats,
+            )
+        except Exception:
+            logger.exception("[periodic tick] sweep failed")
 
 
 def execute_campaign_job(campaign_id):
