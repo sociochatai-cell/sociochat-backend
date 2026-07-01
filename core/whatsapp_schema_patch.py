@@ -457,8 +457,10 @@ def ensure_whatsapp_orm_columns_full(engine: Engine) -> None:
 
     insp = _sa_inspect(engine)
     added = 0
+    _crm_tables = {"leads", "contacts", "deals", "tasks", "activities", "campaigns",
+                   "capi_accounts", "capi_events", "settings"}
     for table_name, table in _db.metadata.tables.items():
-        if not table_name.startswith("whatsapp"):
+        if not table_name.startswith("whatsapp") and table_name not in _crm_tables:
             continue
         try:
             if not insp.has_table(table_name):

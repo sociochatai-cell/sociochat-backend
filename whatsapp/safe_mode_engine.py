@@ -60,7 +60,7 @@ def is_risk_allowed(account: WhatsAppAccount, risk_class: RiskClass) -> bool:
     Check if a specific risk class of automation is allowed given the account's operational mode.
     This preserves the advisory-first philosophy while safely mitigating degradation.
     """
-    mode = getattr(OperationalMode, account.operational_mode.upper(), OperationalMode.NORMAL)
+    mode = getattr(OperationalMode, (account.operational_mode or "normal").upper(), OperationalMode.NORMAL)
     
     if mode == OperationalMode.NORMAL:
         return True
