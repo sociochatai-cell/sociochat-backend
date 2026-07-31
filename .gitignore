@@ -41,3 +41,10 @@ myenv/
 __pycache__/
 *.pyc
 instance/
+
+*.dump
+
+# Backups of env files (may contain secrets) — never commit
+env.yaml.bak*
+*.bak-preswap-*
+*.bak

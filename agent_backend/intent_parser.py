@@ -361,6 +361,32 @@ OUTPUT FORMAT (strict JSON):
                 )
                 raw = response.text.strip()
 
+            # ── AI-usage metering (fail-soft, single post-merge point so the
+            #    new-SDK and legacy-SDK branches are never double-counted) ──
+            try:
+                from subscription.service import record_ai_usage, resolve_workspace_owner
+                _meter_model = "gemini-3.1-flash-lite"
+                _meter_owner, _meter_ws = (None, None)
+                if self._workspace_id:
+                    _meter_owner, _meter_ws = resolve_workspace_owner(self._workspace_id)
+                _in_tok = _out_tok = 0
+                _um = getattr(response, "usage_metadata", None)
+                if _um is not None:
+                    _in_tok = getattr(_um, "prompt_token_count", 0) or 0
+                    _out_tok = getattr(_um, "candidates_token_count", 0) or 0
+                record_ai_usage(
+                    _meter_owner,
+                    _meter_ws,
+                    "agent_intent",
+                    _meter_model,
+                    input_tokens=_in_tok,
+                    output_tokens=_out_tok,
+                    route_path="agent_backend/intent_parser.py:IntentParser.parse",
+                    _commit=True,
+                )
+            except Exception:
+                pass
+
             logger.debug("IntentParser.parse: Gemini raw response: %s", raw[:300])
 
             # Strip markdown code fences if present

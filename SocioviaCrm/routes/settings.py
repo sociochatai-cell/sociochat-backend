@@ -11,11 +11,23 @@ bp = Blueprint("settings", __name__, url_prefix="/settings")
 
 def _get_workspace_from_request():
     """
-    Prefer query param workspace_id.
-    Fallback to header X-Workspace-ID.
+    Prefer query param workspace_id. Fallback to header X-Workspace-ID.
+
+    Enforces that the authenticated caller OWNS the workspace before any settings
+    route (which can return unmasked credentials) proceeds — a single chokepoint
+    used by every route in this module. Aborts 401/403 on violation.
     """
+    from flask import abort
     ws = request.args.get("workspace_id") or request.headers.get("X-Workspace-ID")
-    return str(ws) if ws else None
+    ws = str(ws) if ws else None
+    if ws:
+        from tenant.context import get_current_user, user_owns_workspace
+        user = get_current_user()
+        if not user:
+            abort(401)
+        if not user_owns_workspace(user, ws):
+            abort(403)
+    return ws
 
 
 def _mask_value(name: str, val: str, masked_flag: bool) -> str:

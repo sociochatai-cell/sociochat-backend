@@ -80,24 +80,21 @@ def require_account_access(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         account_id = kwargs.get("account_id")
-        
+
         if not account_id:
             return jsonify({"error": "Account ID required"}), 400
-        
-        # Get account
-        account = WhatsAppAccount.query.get(account_id)
-        
-        if not account:
-            return jsonify({"error": "Account not found"}), 404
-        
-        # Use workspace from account (same as automation_routes.py)
-        workspace_id = account.workspace_id
-        
+
+        # Enforce authenticated ownership of the account's workspace (fail closed).
+        from tenant.context import resolve_owned_account
+        account, err = resolve_owned_account(account_id)
+        if err:
+            return err
+
         kwargs["account"] = account
-        kwargs["workspace_id"] = workspace_id
-        
+        kwargs["workspace_id"] = account.workspace_id
+
         return f(*args, **kwargs)
-    
+
     return decorated_function
 
 
@@ -540,7 +537,24 @@ Rewritten message:"""
             rewritten = rewritten[1:-1]
         if rewritten.startswith("'") and rewritten.endswith("'"):
             rewritten = rewritten[1:-1]
-        
+
+        # Record AI usage for billing/quota (fail-soft).
+        try:
+            from subscription.service import record_ai_usage
+            from tenant.context import get_current_user
+            _acting_user = get_current_user()
+            record_ai_usage(
+                getattr(_acting_user, "id", None),
+                int(workspace_id),
+                "ai_rewrite",
+                os.environ.get("TEXT_MODEL") or os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash",
+                route_path=request.path,
+                ip_address=request.remote_addr,
+                _commit=True,
+            )
+        except Exception:
+            pass
+
         return jsonify({
             "success": True,
             "original": message,

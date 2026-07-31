@@ -25,11 +25,60 @@ from .services import WhatsAppService
 from .template_validator import validate_template, TemplateValidator, ApprovalPath
 from .template_rewriter import rewrite_template, RewriteMode
 from .http_rate_limit import rate_limit
+from tenant.context import (
+    get_current_user,
+    resolve_owned_account,
+    resolve_owned_workspace,
+    user_owns_workspace,
+)
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_owned_template(template_id):
+    """Load a template and verify the authenticated user owns its account's
+    workspace. Returns (template, error_response). Fails CLOSED."""
+    template = WhatsAppTemplate.query.get(template_id)
+    if not template:
+        return None, (jsonify({"success": False, "error": "Template not found"}), 404)
+    account, err = resolve_owned_account(template.account_id)
+    if err:
+        return None, err
+    return template, None
+
 # Blueprint for template routes
 template_bp = Blueprint("template_routes", __name__, url_prefix="/api/whatsapp/templates")
+
+
+@template_bp.before_request
+def _enforce_template_ownership():
+    """Blueprint-wide IDOR guard. A template belongs to an account (account_id ->
+    workspace). Every ``/<template_id>`` route must be owned by the caller, and any
+    account_id/workspace_id supplied to list/create must be owned too. Fails closed.
+    """
+    if request.method == "OPTIONS":
+        return None
+    va = request.view_args or {}
+    if va.get("template_id") is not None:
+        _tpl, err = _resolve_owned_template(va["template_id"])
+        if err:
+            return err
+        return None
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "authentication_required"}), 401
+    body = request.get_json(silent=True) if request.is_json else None
+    body = body if isinstance(body, dict) else {}
+    account_id = request.args.get("account_id") or body.get("account_id")
+    workspace_id = request.args.get("workspace_id") or body.get("workspace_id")
+    if account_id:
+        _acc, err = resolve_owned_account(account_id)
+        if err:
+            return err
+    elif workspace_id:
+        if not user_owns_workspace(user, workspace_id):
+            return jsonify({"success": False, "error": "forbidden"}), 403
+    return None
 
 
 # ==============================================================
@@ -77,11 +126,14 @@ def validate_template_endpoint():
         language = data.get("language", "en_US")
         account_id = data.get("account_id")
         
-        # Check if new WABA (< 30 days old)
+        # Check if new WABA (< 30 days old). account_id is optional; when supplied
+        # it must belong to the authenticated user's workspace (fail closed).
         is_new_waba = False
         if account_id:
-            account = WhatsAppAccount.query.get(account_id)
-            if account and account.created_at:
+            account, err = resolve_owned_account(account_id)
+            if err:
+                return err
+            if account.created_at:
                 days_old = (datetime.now(timezone.utc) - account.created_at).days
                 is_new_waba = days_old < 30
         
@@ -210,11 +262,11 @@ def create_template_endpoint():
             return jsonify({"error": "name is required"}), 400
         if not components:
             return jsonify({"error": "components are required"}), 400
-        
-        # Get account
-        account = WhatsAppAccount.query.get(account_id)
-        if not account:
-            return jsonify({"error": "Account not found"}), 404
+
+        # Get account (ownership-checked: fails closed on missing user / cross-tenant)
+        account, err = resolve_owned_account(account_id)
+        if err:
+            return err
         
         # Extract body for validation
         body = ""
@@ -316,10 +368,10 @@ def create_template_endpoint():
 def get_template_details(template_id):
     """Get template details by ID (Local DB)."""
     try:
-        template = WhatsAppTemplate.query.get(template_id)
-        if not template:
-            return jsonify({"error": "Template not found"}), 404
-            
+        template, err = _resolve_owned_template(template_id)
+        if err:
+            return err
+
         return jsonify({"success": True, "template": template.to_dict()}), 200
         
     except Exception as e:
@@ -332,8 +384,12 @@ def get_template_details(template_id):
 def update_template_draft(template_id):
     """Update a draft template before submission."""
     try:
+        _, err = _resolve_owned_template(template_id)
+        if err:
+            return err
+
         data = request.get_json() or {}
-        
+
         service = WhatsAppService()
         result, success = service.update_draft_template(template_id, data)
         
@@ -356,6 +412,10 @@ def update_template_draft(template_id):
 def submit_template_endpoint(template_id):
     """Submit a local draft to Meta."""
     try:
+        _, err = _resolve_owned_template(template_id)
+        if err:
+            return err
+
         service = WhatsAppService()
         result, success = service.submit_template_to_meta(template_id)
         
@@ -377,6 +437,10 @@ def submit_template_endpoint(template_id):
 def archive_template_endpoint(template_id):
     """Archive a template (Soft delete)."""
     try:
+        _, err = _resolve_owned_template(template_id)
+        if err:
+            return err
+
         service = WhatsAppService()
         result, success = service.archive_template(template_id)
         
@@ -398,9 +462,13 @@ def archive_template_endpoint(template_id):
 def duplicate_template_endpoint(template_id):
     """Duplicate a template to a new draft."""
     try:
+        _, err = _resolve_owned_template(template_id)
+        if err:
+            return err
+
         data = request.get_json() or {}
         new_name = data.get("name")
-        
+
         service = WhatsAppService()
         result, success = service.duplicate_template(template_id, new_name)
         
@@ -422,6 +490,10 @@ def duplicate_template_endpoint(template_id):
 def delete_template_endpoint(template_id):
     """Permanently delete a template."""
     try:
+        _, err = _resolve_owned_template(template_id)
+        if err:
+            return err
+
         service = WhatsAppService()
         result, success = service.delete_template(template_id)
         
@@ -442,6 +514,10 @@ def delete_template_endpoint(template_id):
 def resubmit_template_endpoint(template_id):
     """Resubmit an existing template to Meta (Edit)."""
     try:
+        _, err = _resolve_owned_template(template_id)
+        if err:
+            return err
+
         service = WhatsAppService()
         result, success = service.edit_meta_template(template_id)
         
@@ -470,16 +546,14 @@ def upload_template_media():
         if file.filename == '':
             return jsonify({"error": "No selected file"}), 400
 
-        # Get account-specific access token
+        # Get account-specific access token (ownership-checked)
         account_id = request.form.get('account_id')
         access_token = None
         if account_id:
-            try:
-                account = WhatsAppAccount.query.get(int(account_id))
-                if account:
-                    access_token = account.get_access_token()
-            except Exception:
-                logger.warning("Could not load account %s for media upload", account_id)
+            account, err = resolve_owned_account(account_id)
+            if err:
+                return err
+            access_token = account.get_access_token()
 
         if not access_token:
             access_token = os.getenv("WHATSAPP_ACCESS_TOKEN")
@@ -542,15 +616,13 @@ def upload_template_media_url():
         if not (media_url.startswith("https://") or media_url.startswith("http://")):
             return jsonify({"success": False, "error": "URL must start with http:// or https://"}), 400
 
-        # Get account-specific access token
+        # Get account-specific access token (ownership-checked)
         access_token = None
         if account_id:
-            try:
-                account = WhatsAppAccount.query.get(int(account_id))
-                if account:
-                    access_token = account.get_access_token()
-            except Exception:
-                logger.warning("Could not load account %s for URL media upload", account_id)
+            account, err = resolve_owned_account(account_id)
+            if err:
+                return err
+            access_token = account.get_access_token()
 
         if not access_token:
             access_token = os.getenv("WHATSAPP_ACCESS_TOKEN")
@@ -649,21 +721,39 @@ def get_templates():
     """
     try:
         from .models import WhatsAppTemplate, WhatsAppAccount
-        
+
         account_id = request.args.get("account_id")
         workspace_id = request.args.get("workspace_id")
         status_filter = request.args.get("status")
         sort_option = request.args.get("sort", "date_desc")
         limit = request.args.get("limit", type=int)  # No default cap — load all
-        
-        # Resolve account_id from workspace_id if provided
-        if not account_id and workspace_id:
-            account = WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).first()
-            if account:
-                account_id = account.id
-        
+
+        # Fail CLOSED: require an authenticated user and scope to workspaces they own.
+        user = get_current_user()
+        if not user:
+            return jsonify({"success": False, "error": "authentication_required"}), 401
+
+        # If an account_id is supplied, verify ownership of its workspace.
+        if account_id:
+            _account, err = resolve_owned_account(account_id)
+            if err:
+                return err
+            account_id = _account.id
+        else:
+            # Resolve/verify the workspace (falls back to the user's own workspace).
+            workspace, err = resolve_owned_workspace(user, workspace_id)
+            if err:
+                return err
+            account = WhatsAppAccount.query.filter_by(
+                workspace_id=str(workspace.id), is_active=True
+            ).first()
+            if not account:
+                # No account for the owned workspace -> no templates to show.
+                return jsonify({"success": True, "templates": []}), 200
+            account_id = account.id
+
         query = WhatsAppTemplate.query
-        
+
         if account_id:
             query = query.filter_by(account_id=account_id)
 
@@ -721,10 +811,10 @@ def get_template_status(template_id):
     }
     """
     try:
-        template = WhatsAppTemplate.query.get(template_id)
-        if not template:
-            return jsonify({"error": "Template not found"}), 404
-        
+        template, err = _resolve_owned_template(template_id)
+        if err:
+            return err
+
         # Calculate how long it's been pending
         pending_seconds = None
         if template.submitted_at and template.status == "PENDING":
@@ -805,12 +895,12 @@ def sync_single_template(template_id):
     }
     """
     try:
-        # Get the template to find its account
-        template = WhatsAppTemplate.query.get(template_id)
-        if not template:
-            return jsonify({"success": False, "error": "Template not found"}), 404
-        
-        # Get account and token
+        # Get the template and verify ownership of its account's workspace.
+        template, err = _resolve_owned_template(template_id)
+        if err:
+            return err
+
+        # Get account and token (already verified owned by resolve above).
         account = WhatsAppAccount.query.get(template.account_id)
         if not account:
             return jsonify({"success": False, "error": "Account not found"}), 404
@@ -870,13 +960,40 @@ def get_template_analytics():
     try:
         account_id = request.args.get("account_id", type=int)
         days = request.args.get("days", 30, type=int)
-        
+
+        # Fail CLOSED: require an authenticated user and scope to owned accounts.
+        user = get_current_user()
+        if not user:
+            return jsonify({"success": False, "error": "authentication_required"}), 401
+
         # Base query
         query = WhatsAppTemplate.query
-        
+
         if account_id:
+            # Verify ownership of the requested account's workspace.
+            _account, err = resolve_owned_account(account_id)
+            if err:
+                return err
             query = query.filter_by(account_id=account_id)
-        
+        else:
+            # Scope to the account ids in the workspaces this user owns.
+            from shared_models import Workspace
+            owned_ws_ids = [
+                str(w.id) for w in Workspace.query.filter_by(user_id=user.id).all()
+            ]
+            owned_account_ids = [
+                a.id
+                for a in WhatsAppAccount.query.filter(
+                    WhatsAppAccount.workspace_id.in_(owned_ws_ids)
+                ).all()
+            ] if owned_ws_ids else []
+            if not owned_account_ids:
+                return jsonify({
+                    "total_templates": 0,
+                    "message": "No templates found in the specified period",
+                }), 200
+            query = query.filter(WhatsAppTemplate.account_id.in_(owned_account_ids))
+
         # Date filter
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         query = query.filter(WhatsAppTemplate.created_at >= cutoff)

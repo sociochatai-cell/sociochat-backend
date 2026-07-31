@@ -201,8 +201,10 @@ def list_plans():
     ).all()
 
     if not rows:
-        plans = {k: v for k, v in PLAN_FEATURES.items() if k != "beta"}
-        return jsonify({"success": True, "plans": plans})
+        # No seeded catalog yet (fresh DB / seed not run). Return an EMPTY catalog
+        # so the frontend shows its graceful empty-state — the raw PLAN_FEATURES
+        # dicts lack name/price/slug and would render broken cards.
+        return jsonify({"success": True, "plans": {}})
 
     return jsonify({"success": True, "plans": _build_plans_payload(rows)})
 

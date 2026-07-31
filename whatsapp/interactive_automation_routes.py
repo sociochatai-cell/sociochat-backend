@@ -873,6 +873,20 @@ def ai_generate_interactive_flow():
             prompt=prompt,
             workspace_id=str(workspace_id) if workspace_id else None,
         )
+        # Record AI usage for billing/quota (fail-soft).
+        try:
+            from subscription.service import record_ai_usage
+            from tenant.context import get_current_user
+            _acting_user = get_current_user()
+            record_ai_usage(
+                getattr(_acting_user, "id", None),
+                int(workspace_id) if workspace_id else None,
+                "ai_flow_generation",
+                "gemini",
+                _commit=True,
+            )
+        except Exception:
+            pass
         return jsonify({
             "success": True,
             "draft": draft,

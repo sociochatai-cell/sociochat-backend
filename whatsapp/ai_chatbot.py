@@ -715,7 +715,15 @@ def classify_intent(
         
         if not response.text:
             return IntentResult(intent="other", success=False, error="Empty response", response_time_ms=elapsed_ms)
-        
+
+        # Meter AI usage (fail-soft; must never break classification)
+        try:
+            from subscription.service import record_ai_usage, resolve_workspace_owner
+            _uid, _wid = resolve_workspace_owner(workspace_id)
+            record_ai_usage(_uid, _wid, "ai_intent", model_name or DEFAULT_MODEL)
+        except Exception:
+            pass
+
         text = response.text.strip()
         if "```" in text:
             text = re.sub(r'```json\s*|\s*```', '', text)
@@ -1149,7 +1157,15 @@ CRITICAL RULES (NEVER VIOLATE):
             # WhatsApp text body limit is 4096 characters
             if len(response_text) > 4000:
                 response_text = response_text[:3997] + "..."
-            
+
+            # Meter AI usage (fail-soft; must never break generation)
+            try:
+                from subscription.service import record_ai_usage, resolve_workspace_owner
+                _uid, _wid = resolve_workspace_owner(self.config.workspace_id)
+                record_ai_usage(_uid, _wid, "ai_chatbot", self.config.model)
+            except Exception:
+                pass
+
             tokens = 0 # Usage metadata handling differs in new SDK
             elapsed_ms = int((time.time() - start_time) * 1000)
 

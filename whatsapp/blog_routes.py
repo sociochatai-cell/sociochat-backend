@@ -40,19 +40,13 @@ MARKETING_ADMIN_EMAILS = set(
 # ============================================================
 
 def get_current_user():
-    """Get current authenticated user from session or headers."""
-    from flask import session
-    
-    # Try session first
-    user_id = session.get("user_id")
-    
-    # Fallback to header
-    if not user_id:
-        user_id = request.headers.get("X-User-Id")
-    
+    """Current user from the server session or a SIGNED Bearer JWT only.
+
+    The forgeable X-User-Id header fallback was removed (see auth_core)."""
+    from auth_core import authenticated_user_id
+    user_id = authenticated_user_id()
     if not user_id:
         return None
-    
     try:
         return User.query.get(int(user_id))
     except (ValueError, TypeError):
@@ -60,24 +54,15 @@ def get_current_user():
 
 
 def get_current_admin():
-    """Get current authenticated admin from session or headers."""
-    from flask import session
+    """Current admin from the server session or a SIGNED admin Bearer JWT only.
+
+    The forgeable X-Admin-Id header and ?admin_id= query param (either of which
+    previously granted platform-admin access to anyone) were removed."""
+    from auth_core import authenticated_admin_id
     from models import Admin
-    
-    # Try session first
-    admin_id = session.get("admin_id")
-    
-    # Fallback to X-Admin-Id header
-    if not admin_id:
-        admin_id = request.headers.get("X-Admin-Id")
-    
-    # Fallback to query parameter
-    if not admin_id:
-        admin_id = request.args.get("admin_id")
-    
+    admin_id = authenticated_admin_id()
     if not admin_id:
         return None
-    
     try:
         return Admin.query.get(int(admin_id))
     except (ValueError, TypeError):

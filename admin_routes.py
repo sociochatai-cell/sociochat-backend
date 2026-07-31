@@ -16,20 +16,47 @@ logger = logging.getLogger(__name__)
 admin_bp = Blueprint("admin", __name__)
 
 DEFAULT_ADMIN_EMAIL = os.getenv("DEFAULT_ADMIN_EMAIL", "admin@sociochat.ai").strip().lower()
-DEFAULT_ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD") or os.getenv("DEFAULT_ADMIN_PASS", "SocioChat@Admin1")
+
+# SECURITY: only an EXPLICIT env password is trustworthy. The built-in literal is a
+# dev-only convenience - it must never seed or authenticate a super-admin in a real
+# environment, otherwise anyone knowing it owns the whole platform (all tenants).
+_ADMIN_PASSWORD_FROM_ENV = os.getenv("DEFAULT_ADMIN_PASSWORD") or os.getenv("DEFAULT_ADMIN_PASS")
+_ADMIN_PASSWORD_DEV_FALLBACK = "SocioChat@Admin1"
+DEFAULT_ADMIN_PASSWORD = _ADMIN_PASSWORD_FROM_ENV or _ADMIN_PASSWORD_DEV_FALLBACK
+
+
+def _default_admin_password_allowed() -> bool:
+    """Safe to seed / bootstrap-login the default admin only when a password was
+    explicitly configured via env, or we are in a dev environment. In a non-dev
+    environment with no explicit password the built-in fallback is refused."""
+    if _ADMIN_PASSWORD_FROM_ENV:
+        return True
+    try:
+        from core.deployment_safety import is_non_dev_environment
+        return not is_non_dev_environment()
+    except Exception:
+        return False
 
 
 def ensure_default_admin() -> None:
     admin = Admin.query.filter_by(email=DEFAULT_ADMIN_EMAIL).first()
-    if not admin:
-        admin = Admin(
-            email=DEFAULT_ADMIN_EMAIL,
-            password_hash=generate_password_hash(DEFAULT_ADMIN_PASSWORD),
-            is_superadmin=True,
+    if admin:
+        return
+    if not _default_admin_password_allowed():
+        logger.error(
+            "Refusing to seed default super-admin '%s' with the built-in password in a "
+            "non-dev environment. Set DEFAULT_ADMIN_PASSWORD to a strong secret and redeploy.",
+            DEFAULT_ADMIN_EMAIL,
         )
-        db.session.add(admin)
-        db.session.commit()
-        logger.info("Default admin created: %s", DEFAULT_ADMIN_EMAIL)
+        return
+    admin = Admin(
+        email=DEFAULT_ADMIN_EMAIL,
+        password_hash=generate_password_hash(DEFAULT_ADMIN_PASSWORD),
+        is_superadmin=True,
+    )
+    db.session.add(admin)
+    db.session.commit()
+    logger.info("Default admin created: %s", DEFAULT_ADMIN_EMAIL)
 
 
 def get_current_admin():
@@ -54,6 +81,15 @@ def require_admin(f):
     return decorated
 
 
+def _sociovia_linked(user_id: int) -> bool:
+    """Whether this user has a cross-app Sociovia link (drives the admin toggle state)."""
+    try:
+        from sociovia_sync import is_user_linked
+        return is_user_linked(user_id)
+    except Exception:
+        return False
+
+
 def serialize_user(user: User) -> dict:
     return {
         "id": user.id,
@@ -69,6 +105,7 @@ def serialize_user(user: User) -> dict:
         "beta_expires_at": user.beta_expires_at.isoformat() if user.beta_expires_at else None,
         "subscription_expires_at": user.subscription_expires_at.isoformat() if user.subscription_expires_at else None,
         "created_at": user.created_at.isoformat() if user.created_at else None,
+        "sociovia_linked": _sociovia_linked(user.id),
     }
 
 
@@ -113,7 +150,7 @@ def admin_login():
             return _super_admin_response(admin)
 
         # Bootstrap login with default credentials
-        if email == DEFAULT_ADMIN_EMAIL and password == DEFAULT_ADMIN_PASSWORD:
+        if _default_admin_password_allowed() and email == DEFAULT_ADMIN_EMAIL and password == DEFAULT_ADMIN_PASSWORD:
             ensure_default_admin()
             admin = Admin.query.filter_by(email=DEFAULT_ADMIN_EMAIL).first()
             if admin:
@@ -185,14 +222,30 @@ def _internal_user_filter(query):
     users only — tenant users are managed under Tenant Management, kept fully
     separate. Legacy rows with NULL tenant_id are treated as internal.
     """
-    from sqlalchemy import or_
+    from sqlalchemy import or_, false as _sa_false
     from tenant.models import Tenant
     from tenant.branding import INTERNAL_TENANT_CODE
 
     internal = Tenant.query.filter_by(tenant_code=INTERNAL_TENANT_CODE).first()
     if internal:
         return query.filter(or_(User.tenant_id == internal.id, User.tenant_id.is_(None)))
-    return query
+    # Fail CLOSED: if the internal tenant can't be resolved, do NOT fall back to an
+    # unfiltered query (that would return every tenant's users). Return nothing.
+    return query.filter(_sa_false())
+
+
+def _get_internal_user_or_404(user_id):
+    """Fetch a user by id but ONLY within the platform's own (T0000) tenant.
+
+    The Super Admin "Users" portal manages SocioChat's own users only; other
+    tenants' users are managed under Tenant Management. This prevents admin
+    actions (approve/reject/update/impersonate) from reaching across tenants.
+    Returns (user, None) or (None, (response, status)).
+    """
+    user = _internal_user_filter(User.query).filter(User.id == user_id).first()
+    if not user:
+        return None, (jsonify({"success": False, "error": "user_not_found"}), 404)
+    return user, None
 
 
 @admin_bp.route("/api/admin/users", methods=["GET"])
@@ -216,9 +269,9 @@ def review_users(admin):
 @admin_bp.route("/api/admin/approve/<int:user_id>", methods=["POST"])
 @require_admin
 def approve_user(admin, user_id):
-    user = db.session.get(User, user_id)
-    if not user:
-        return jsonify({"success": False, "error": "user_not_found"}), 404
+    user, err = _get_internal_user_or_404(user_id)
+    if err:
+        return err
     user.status = "active"
     _audit(admin, "approved", user_id)
     db.session.commit()
@@ -230,9 +283,9 @@ def approve_user(admin, user_id):
 def reject_user(admin, user_id):
     data = request.get_json(silent=True) or {}
     reason = (data.get("reason") or "Rejected by admin").strip()
-    user = db.session.get(User, user_id)
-    if not user:
-        return jsonify({"success": False, "error": "user_not_found"}), 404
+    user, err = _get_internal_user_or_404(user_id)
+    if err:
+        return err
     user.status = "rejected"
     user.rejection_reason = reason
     _audit(admin, "rejected", user_id, {"reason": reason})
@@ -246,9 +299,9 @@ def update_user(admin, user_id):
     from subscription.constants import VALID_PLANS
     from subscription.service import change_user_plan
 
-    user = db.session.get(User, user_id)
-    if not user:
-        return jsonify({"success": False, "error": "user_not_found"}), 404
+    user, err = _get_internal_user_or_404(user_id)
+    if err:
+        return err
 
     data = request.get_json() or {}
 
@@ -280,6 +333,24 @@ def update_user(admin, user_id):
     return jsonify({"success": True, "user": serialize_user(user)})
 
 
+@admin_bp.route("/api/admin/users/<int:user_id>/sociovia-link", methods=["POST"])
+@require_admin
+def set_user_sociovia_link(admin, user_id):
+    """Per-user admin toggle: link this user to their Sociovia account (matched by
+    email) and mirror their workspaces, or unlink. This is the request the toggle
+    fires. No signup checkbox — admin-controlled, per user."""
+    user, err = _get_internal_user_or_404(user_id)
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    enable = bool(data.get("enable", True))
+    from sociovia_sync import trigger_sociovia_link
+    result = trigger_sociovia_link(user.id, user.email, enable)
+    _audit(admin, "admin_sociovia_link", user_id, {"enable": enable, "result": result})
+    db.session.commit()
+    return jsonify({"success": bool(result.get("ok")), **result, "user": serialize_user(user)}), (200 if result.get("ok") else 400)
+
+
 @admin_bp.route("/api/admin/login-as-user", methods=["POST"])
 @require_admin
 def login_as_user(admin):
@@ -287,26 +358,37 @@ def login_as_user(admin):
     user_id = data.get("user_id") or data.get("userId")
     email = (data.get("email") or "").strip().lower()
 
+    # Impersonation is restricted to the platform's OWN (T0000) users. To reach a
+    # tenant's user, a super admin must use the per-tenant impersonation flow
+    # (/api/superadmin/tenants/<id>/impersonate), which is scoped to that tenant.
     user = None
     if user_id:
         try:
-            user = db.session.get(User, int(user_id))
+            uid = int(user_id)
         except (TypeError, ValueError):
             return jsonify({"success": False, "error": "user_id_invalid"}), 400
+        user = _internal_user_filter(User.query).filter(User.id == uid).first()
     elif email:
-        user = User.query.filter_by(email=email).first()
+        user = _internal_user_filter(User.query).filter(User.email == email).first()
 
     if not user:
         return jsonify({"success": False, "error": "user_not_found"}), 404
 
     session["user_id"] = user.id
+    # Full switch to the user — drop the admin realm so the session isn't dual
+    # (dual identity made post-payment redirects resolve back to the admin).
+    session.pop("admin_id", None)
     session.modified = True
     _audit(admin, "admin_login_as_user", user.id, {"email": user.email})
     db.session.commit()
 
+    from auth_core import create_user_token
+    user_token = create_user_token(user.id, user.email)
+
     workspaces = Workspace.query.filter_by(user_id=user.id).all()
     return jsonify({
         "success": True,
+        "token": user_token,
         "user": {
             **serialize_user(user),
             "admin_override": True,

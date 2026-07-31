@@ -82,6 +82,270 @@ def get_db():
     return db.session
 
 
+# ============================================================
+# Tenant/workspace isolation helpers
+# ------------------------------------------------------------
+# The real isolation boundary is: resource -> workspace -> user -> tenant.
+# These helpers enforce that the AUTHENTICATED user owns the workspace/account
+# being accessed, so endpoints can't leak or mutate other users'/tenants' data
+# when a workspace_id filter is omitted or an account_id is passed directly.
+# ============================================================
+
+def _current_user_owned_workspace_ids():
+    """Set of workspace_id strings owned by the authenticated user.
+
+    Returns None if there is no authenticated user (caller should 401/return empty).
+    """
+    from tenant.context import get_current_user
+    from models import Workspace
+    user = get_current_user()
+    if not user:
+        return None
+    return {str(w.id) for w in Workspace.query.filter_by(user_id=user.id).all()}
+
+
+def _require_owned_account(account_id):
+    """(account, None) when the current user owns the account's workspace.
+
+    Otherwise (None, (response, status)). Auth is checked BEFORE existence so we
+    don't reveal which account ids exist to anonymous callers. Impersonation
+    (admin login-as-user) sets the session user to the impersonated user, so
+    admin support flows still work.
+    """
+    from tenant.context import get_current_user, user_owns_workspace
+    from .models import WhatsAppAccount
+    user = get_current_user()
+    if not user:
+        return None, (jsonify({"success": False, "error": "authentication_required"}), 401)
+    account = WhatsAppAccount.query.get(account_id)
+    if not account:
+        return None, (jsonify({"success": False, "error": "Account not found"}), 404)
+    if account.workspace_id and not user_owns_workspace(user, account.workspace_id):
+        logger.warning(
+            "cross_account_denied user=%s account=%s ws=%s",
+            user.id, account_id, account.workspace_id,
+        )
+        return None, (jsonify({"success": False, "error": "forbidden_account"}), 403)
+    # Agent principals must ALSO be assigned to the account's workspace — the
+    # owner-ownership check above is not enough (an agent resolves to the owner).
+    from auth_core import authenticated_agent_id
+    _agent_id = authenticated_agent_id()
+    if _agent_id is not None and account.workspace_id:
+        try:
+            from agent_auth.inbox_scope import get_agent_workspace_grant
+            if get_agent_workspace_grant(_agent_id, int(account.workspace_id)) is None:
+                logger.warning(
+                    "agent_cross_account_denied agent=%s account=%s ws=%s",
+                    _agent_id, account_id, account.workspace_id,
+                )
+                return None, (jsonify({"success": False, "error": "forbidden_account"}), 403)
+        except (TypeError, ValueError):
+            return None, (jsonify({"success": False, "error": "forbidden_account"}), 403)
+    return account, None
+
+
+def _resolve_owned_account_ids():
+    """(account_ids, err) for the authenticated caller's OWN workspaces.
+
+    ``account_ids`` is the list of ``WhatsAppAccount.id`` across every workspace
+    the caller owns (may be empty). ``err`` is a ``(response, status)`` tuple when
+    there is NO authenticated user (401), else None. Callers use this to scope
+    workspace-optional endpoints to the caller's own data instead of the whole DB.
+    """
+    from .models import WhatsAppAccount
+    owned = _current_user_owned_workspace_ids()
+    if owned is None:
+        return None, (jsonify({"success": False, "error": "authentication_required"}), 401)
+    if not owned:
+        return [], None
+    account_ids = [
+        a.id for a in WhatsAppAccount.query.filter(WhatsAppAccount.workspace_id.in_(owned)).all()
+    ]
+    return account_ids, None
+
+
+def _require_owned_workspace_arg(workspace_id):
+    """(None, err) unless the authenticated caller owns ``workspace_id``.
+
+    For endpoints that accept a client-supplied workspace_id filter. Fails CLOSED:
+    no user -> 401, supplied-but-not-owned -> 403. Returns (True, None) when the
+    caller owns it. ``workspace_id`` may be None (caller passed none); in that case
+    this returns (None, None) so the caller can fall back to its own scoping.
+    """
+    from tenant.context import get_current_user, user_owns_workspace
+    user = get_current_user()
+    if not user:
+        return None, (jsonify({"success": False, "error": "authentication_required"}), 401)
+    if workspace_id is None:
+        return None, None
+    if not user_owns_workspace(user, workspace_id):
+        logger.warning(
+            "cross_workspace_denied user=%s requested_ws=%s",
+            getattr(user, "id", None), workspace_id,
+        )
+        return None, (jsonify({"success": False, "error": "forbidden_workspace"}), 403)
+    return True, None
+
+
+def _require_owned_conversation(conversation_id):
+    """(conversation, err) when the caller owns the conversation's workspace.
+
+    A conversation belongs to exactly one WhatsAppAccount (account_id, non-null),
+    which belongs to one workspace. Verify the authenticated user owns that
+    workspace. Fails CLOSED: no user -> 401, missing conversation -> 404,
+    owned-by-another-tenant -> 403. On success returns (conversation, None).
+    """
+    from tenant.context import get_current_user, user_owns_workspace
+    from .models import WhatsAppConversation, WhatsAppAccount
+    user = get_current_user()
+    if not user:
+        return None, (jsonify({"success": False, "error": "authentication_required"}), 401)
+    conversation = get_db().get(WhatsAppConversation, conversation_id)
+    if not conversation:
+        return None, (jsonify({"success": False, "error": "Conversation not found"}), 404)
+    account = WhatsAppAccount.query.get(conversation.account_id) if conversation.account_id else None
+    workspace_id = getattr(account, "workspace_id", None) if account else None
+    if not workspace_id or not user_owns_workspace(user, workspace_id):
+        logger.warning(
+            "cross_conversation_denied user=%s conversation=%s ws=%s",
+            getattr(user, "id", None), conversation_id, workspace_id,
+        )
+        return None, (jsonify({"success": False, "error": "forbidden_conversation"}), 403)
+
+    # Level 3 (agents): a sub-login passes the ownership check above (it acts on
+    # behalf of its owner), so ALSO require that the agent has this workspace
+    # granted AND the conversation's customer phone is visible under its inbox
+    # scope. Fails CLOSED on any unresolvable workspace id.
+    from auth_core import authenticated_agent_id
+    agent_id = authenticated_agent_id()
+    if agent_id is not None:
+        from agent_auth.inbox_scope import get_agent_workspace_grant, phone_visible_to_agent
+        try:
+            _ws_int = int(workspace_id)
+        except (TypeError, ValueError):
+            _ws_int = None
+        if (
+            _ws_int is None
+            or get_agent_workspace_grant(agent_id, _ws_int) is None
+            or not phone_visible_to_agent(agent_id, _ws_int, conversation.user_phone or "")
+        ):
+            logger.warning(
+                "agent_conversation_denied agent=%s conversation=%s ws=%s",
+                agent_id, conversation_id, workspace_id,
+            )
+            return None, (jsonify({"success": False, "error": "forbidden_conversation"}), 403)
+    return conversation, None
+
+
+def _agent_send_guard(to_phone, workspace_id=None, phone_number_id=None):
+    """None when the caller may message ``to_phone``, else a (response, status) tuple.
+
+    Owners are unaffected. AGENT principals (sub-logins) may only message customer
+    phones visible under their inbox scope (Level 3) in the resolved workspace —
+    the phone-addressed /send* endpoints would otherwise bypass the narrowing
+    enforced by _require_owned_conversation. Fails CLOSED when the workspace
+    cannot be resolved for an agent request.
+    """
+    from auth_core import authenticated_agent_id
+    agent_id = authenticated_agent_id()
+    if agent_id is None:
+        return None
+    ws = workspace_id
+    if ws is None and phone_number_id:
+        from .models import WhatsAppAccount
+        _account = WhatsAppAccount.query.filter_by(phone_number_id=phone_number_id).first()
+        ws = getattr(_account, "workspace_id", None)
+    try:
+        _ws_int = int(ws)
+    except (TypeError, ValueError):
+        _ws_int = None
+    if _ws_int is None:
+        return (jsonify({
+            "success": False,
+            "error": "workspace_required",
+            "message": "Agents must select a workspace",
+        }), 403)
+    from agent_auth.inbox_scope import phone_visible_to_agent, claim_number_for_agent
+    # Already visible (scope 'all' or an existing assignment) -> allow.
+    if phone_visible_to_agent(agent_id, _ws_int, to_phone or ""):
+        return None
+    # First message to a new number: auto-claim it, or reject on conflict. The
+    # assignment (when created) is added to the session and commits atomically
+    # with the message send.
+    allowed, reason = claim_number_for_agent(agent_id, _ws_int, to_phone or "")
+    if allowed:
+        return None
+    logger.warning(
+        "agent_send_denied agent=%s ws=%s to=%s reason=%s",
+        agent_id, _ws_int, to_phone, reason,
+    )
+    return (jsonify({
+        "success": False,
+        "error": ("number_assigned_to_other" if reason == "assigned_to_other"
+                  else reason or "forbidden_conversation"),
+        "message": ("This number is already assigned to another agent."
+                    if reason == "assigned_to_other"
+                    else "You cannot message this number."),
+    }), 403)
+
+
+def _analytics_owned_scope(account_id, workspace_id):
+    """(scope_account_ids, err) for tenant-scoped analytics endpoints.
+
+    Enforces, in order, that:
+      * there is an authenticated caller (else 401);
+      * a supplied ``account_id`` is owned by the caller (else 403/404);
+      * a supplied ``workspace_id`` is owned by the caller (else 403).
+
+    Returns ``scope_account_ids`` = the list of the caller's OWN account ids, to be
+    used by the endpoint ONLY when NEITHER account_id nor workspace_id was supplied
+    (so a request with no filter is restricted to the caller's data instead of the
+    whole DB). May be an empty list (caller owns no accounts). When a specific
+    account_id/workspace_id was supplied and validated, the endpoint keeps using
+    that filter and ``scope_account_ids`` is unused.
+    """
+    if account_id:
+        try:
+            _aid = int(account_id)
+        except (TypeError, ValueError):
+            return None, (jsonify({"success": False, "error": "invalid_account_id"}), 400)
+        _acct, err = _require_owned_account(_aid)
+        if err:
+            return None, err
+        return [], None
+    _ws_ok, ws_err = _require_owned_workspace_arg(workspace_id)
+    if ws_err:
+        return None, ws_err
+    if workspace_id:
+        # Owned workspace supplied → endpoint filters by it directly.
+        return [], None
+    # Neither supplied → scope to the caller's own accounts.
+    return _resolve_owned_account_ids()
+
+
+@whatsapp_bp.before_request
+def _enforce_account_ownership():
+    """Blueprint-wide IDOR guard for ``/accounts/<int:account_id>/...`` routes.
+
+    Every account-scoped route operates on one tenant's WhatsApp account. Instead
+    of trusting each handler to check ownership (the pre-launch audit found ~22
+    account routes with NO check — readable/mutable/deletable by any caller with a
+    guessed id), enforce it once here: any request whose matched URL carries an
+    ``account_id`` must come from the authenticated owner of that account's
+    workspace. CORS preflight (OPTIONS) is exempt so it can complete without auth.
+    """
+    if request.method == "OPTIONS":
+        return None
+    account_id = (request.view_args or {}).get("account_id")
+    if account_id is None:
+        return None
+    account, err = _require_owned_account(account_id)
+    if err:
+        return err
+    g.owned_account = account
+    return None
+
+
 def get_access_token():
     """
     Get access token from request header, database, or environment.
@@ -167,9 +431,22 @@ def get_phone_number_id():
             wid = (request.get_json(silent=True) or {}).get("workspace_id")
         account = None
         if wid:
-            account = WhatsAppAccount.query.filter_by(workspace_id=str(wid), is_active=True).first()
-        if account is None:
-            account = WhatsAppAccount.query.filter_by(is_active=True).first()
+            # SECURITY: only ever resolve within the caller's OWN workspace. The
+            # previous code fell back to `WhatsAppAccount.query.filter_by(
+            # is_active=True).first()` — the first active account of ANY tenant —
+            # which let a request send from another tenant's number/token. That
+            # cross-tenant fallback is removed; if the authenticated caller does
+            # not own this workspace we resolve nothing (send fails safe).
+            owned = True
+            try:
+                from tenant.context import get_current_user, user_owns_workspace
+                _u = get_current_user()
+                if _u is not None:
+                    owned = user_owns_workspace(_u, str(wid))
+            except Exception:
+                owned = True  # tenant context unavailable; keep workspace-scoped lookup
+            if owned:
+                account = WhatsAppAccount.query.filter_by(workspace_id=str(wid), is_active=True).first()
         if account and account.phone_number_id:
             return account.phone_number_id
     except Exception:
@@ -735,9 +1012,18 @@ def proxy_media(media_id):
 def resubscribe_all():
     """
     Trigger re-subscription for all accounts to ensure smb_message_echoes is active.
-    
+
     POST /api/whatsapp/admin/resubscribe
     """
+    # Platform-wide operation over EVERY account — require a real super admin
+    # (require_admin_only is a no-op stub, so gate it explicitly here).
+    try:
+        from admin_routes import get_current_admin
+        admin = get_current_admin()
+    except Exception:
+        admin = None
+    if not admin or not getattr(admin, "is_superadmin", False):
+        return jsonify({"success": False, "error": "super_admin_required"}), 403
     success = WhatsAppService.ensure_all_waba_subscriptions()
     return jsonify({"success": success, "message": "Re-subscription task finished."})
 
@@ -772,9 +1058,13 @@ def favorite_sticker():
     data = request.get_json(silent=True) or {}
     media_id = data.get("media_id")
     workspace_id = data.get("workspace_id")
-    
+
     if not media_id or not workspace_id:
         return jsonify({"error": "media_id and workspace_id required"}), 400
+    _ok, _err = _require_owned_workspace_arg(workspace_id)
+    if _err:
+        _b, _c = _err
+        return _b, _c
         
     # Check if already favorited
     existing = WhatsAppFavoriteSticker.query.filter_by(
@@ -809,7 +1099,11 @@ def list_favorite_stickers():
     workspace_id = request.args.get("workspace_id")
     if not workspace_id:
         return jsonify({"error": "workspace_id required"}), 400
-        
+    _ok, _err = _require_owned_workspace_arg(workspace_id)
+    if _err:
+        _b, _c = _err
+        return _b, _c
+
     favorites = WhatsAppFavoriteSticker.query.filter_by(workspace_id=workspace_id).all()
     return jsonify([f.to_dict() for f in favorites])
 
@@ -824,7 +1118,11 @@ def delete_favorite_sticker(sticker_id):
     workspace_id = request.args.get("workspace_id")
     if not workspace_id:
         return jsonify({"error": "workspace_id required"}), 400
-    
+    _ok, _err = _require_owned_workspace_arg(workspace_id)
+    if _err:
+        _b, _c = _err
+        return _b, _c
+
     sticker = WhatsAppFavoriteSticker.query.filter_by(
         id=sticker_id,
         workspace_id=workspace_id
@@ -1138,7 +1436,12 @@ def send_text():
         allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="manual")
         if not allowed:
             return error_resp, 429
-        
+
+        # Level 3 (agents): target phone must be visible to the agent.
+        _agent_err = _agent_send_guard(to, phone_number_id=phone_number_id)
+        if _agent_err:
+            return _agent_err
+
         # Send
         service = WhatsAppService(get_db(), phone_number_id, g.access_token)
         result = service.send_text(to=to, text=text, preview_url=data.get("preview_url", False))
@@ -1191,7 +1494,12 @@ def send_sticker():
         allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="media")
         if not allowed:
             return error_resp, 429
-        
+
+        # Level 3 (agents): target phone must be visible to the agent.
+        _agent_err = _agent_send_guard(to, phone_number_id=phone_number_id)
+        if _agent_err:
+            return _agent_err
+
         # Send
         service = WhatsAppService(get_db(), phone_number_id, g.access_token)
         result = service.send_sticker(to=to, sticker=media_id)
@@ -1241,6 +1549,12 @@ def send_template():
         
         # Limit Check
         allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="template")
+
+        # Level 3 (agents): target phone must be visible to the agent.
+        _agent_err = _agent_send_guard(to, phone_number_id=phone_number_id)
+        if _agent_err:
+            return _agent_err
+
         token_preview = g.access_token[:30] + "..." + g.access_token[-20:] if g.access_token else "NO TOKEN"
         print(f"\n{'='*60}")
         print(f"=== SEND TEMPLATE ===")
@@ -1318,7 +1632,12 @@ def send_template_advanced():
         allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="template")
         if not allowed:
             return error_resp, 429
-        
+
+        # Level 3 (agents): target phone must be visible to the agent.
+        _agent_err = _agent_send_guard(to, phone_number_id=phone_number_id)
+        if _agent_err:
+            return _agent_err
+
         service = WhatsAppService(get_db(), phone_number_id, g.access_token)
         result = service.send_template_with_builder(
             to=to,
@@ -1393,6 +1712,12 @@ def send_flow():
         
         # Limit Check
         allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="flow")
+
+        # Level 3 (agents): target phone must be visible to the agent.
+        _agent_err = _agent_send_guard(to, phone_number_id=phone_number_id)
+        if _agent_err:
+            return _agent_err
+
         interactive_payload = {
             "type": "flow",
             "header": {
@@ -1501,10 +1826,15 @@ def send_media():
         allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="media")
         if not allowed:
             return error_resp, 429
-        
+
+        # Level 3 (agents): target phone must be visible to the agent.
+        _agent_err = _agent_send_guard(to, phone_number_id=phone_number_id)
+        if _agent_err:
+            return _agent_err
+
         # Send
         service = WhatsAppService(get_db(), phone_number_id, g.access_token)
-        
+
         if media_type == "image":
             result = service.send_image(to=to, image_url=url, image_id=media_id, caption=caption)
         elif media_type == "video":
@@ -1581,6 +1911,11 @@ def send_interactive():
         allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind="interactive")
         if not allowed:
             return error_resp, 429
+
+        # Level 3 (agents): target phone must be visible to the agent.
+        _agent_err = _agent_send_guard(data.get("to"), phone_number_id=phone_number_id)
+        if _agent_err:
+            return _agent_err
 
         service = WhatsAppService(get_db(), phone_number_id, g.access_token)
         interactive = data.get("interactive", {})
@@ -1664,9 +1999,14 @@ def send_message():
         allowed, error_resp = _enforce_message_limit(phone_number_id, send_kind=sk)
         if not allowed:
             return error_resp, 429
-        
+
+        # Level 3 (agents): target phone must be visible to the agent.
+        _agent_err = _agent_send_guard(data.get("to"), phone_number_id=phone_number_id)
+        if _agent_err:
+            return _agent_err
+
         service = WhatsAppService(get_db(), phone_number_id, g.access_token)
-        
+
         if msg_type == "text":
             to, text = validate_text_message(data)
             result = service.send_text(to=to, text=text, preview_url=data.get("preview_url", False))
@@ -1876,11 +2216,24 @@ def send_message_v2():
         workspace_id = data.get("workspace_id")
         if not workspace_id:
             return jsonify({"success": False, "error": "workspace_id is required"}), 400
-        
+
+        # SECURITY: workspace_id here comes from the request BODY, which the global
+        # before_request ownership guard (header/query only) does NOT cover. Verify
+        # the caller actually owns this workspace, else a forged body could send
+        # through another tenant's connected number.
+        _ws_ok, _ws_err = _require_owned_workspace_arg(workspace_id)
+        if _ws_err:
+            return _ws_err
+
         to = data.get("to")
         if not to:
             return jsonify({"success": False, "error": "to (recipient phone number) is required"}), 400
-        
+
+        # Level 3 (agents): target phone must be visible to the agent.
+        _agent_err = _agent_send_guard(to, workspace_id=workspace_id)
+        if _agent_err:
+            return _agent_err
+
         msg_type = data.get("type", "text")
         
         # Get the WhatsApp account for this workspace
@@ -2121,33 +2474,76 @@ def list_conversations():
         limit = min(int(request.args.get("limit", 50)), 100)
         offset = int(request.args.get("offset", 0))
         
-        # Get account IDs for workspace filtering
+        # SECURITY (tenant isolation): require an authenticated caller and scope to
+        # the caller's OWN accounts. A supplied workspace_id must be owned (else 403);
+        # when omitted we restrict to the caller's owned accounts (previously this
+        # returned conversations across ALL workspaces — a cross-tenant leak).
+        _ws_ok, _ws_err = _require_owned_workspace_arg(workspace_id)
+        if _ws_err:
+            body, code = _ws_err
+            return body, code
+
+        empty_totals = {
+            "all": 0,
+            "unread": 0,
+            "active": 0,
+            "expired": 0,
+            "needs_reply": 0,
+            "human_required": 0,
+            "opted_out": 0,
+        }
+
+        def _empty_conversations_payload():
+            payload = {
+                "success": True,
+                "conversations": [],
+                "count": 0,
+                "total_count": 0,
+                "limit": limit,
+                "offset": offset,
+            }
+            if include_totals:
+                payload["totals"] = dict(empty_totals)
+            return jsonify(payload)
+
+        # Get account IDs for filtering.
         account_ids = None
         if workspace_id:
             workspace_accounts = WhatsAppAccount.query.filter_by(workspace_id=workspace_id, is_active=True).all()
             account_ids = [a.id for a in workspace_accounts]
             if not account_ids:
-                # No accounts for this workspace
-                payload = {
-                    "success": True,
-                    "conversations": [],
-                    "count": 0,
-                    "total_count": 0,
-                    "limit": limit,
-                    "offset": offset,
-                }
-                if include_totals:
-                    payload["totals"] = {
-                        "all": 0,
-                        "unread": 0,
-                        "active": 0,
-                        "expired": 0,
-                        "needs_reply": 0,
-                        "human_required": 0,
-                        "opted_out": 0,
-                    }
-                return jsonify(payload)
-        
+                # No accounts for this (owned) workspace
+                return _empty_conversations_payload()
+        else:
+            # No workspace_id supplied → scope to the caller's OWN accounts only.
+            owned_account_ids, err = _resolve_owned_account_ids()
+            if err:
+                body, code = err
+                return body, code
+            if not owned_account_ids:
+                return _empty_conversations_payload()
+            account_ids = owned_account_ids
+
+        # Level 3 (agents): a sub-login passes the ownership checks above (it acts
+        # on behalf of its owner), so ALSO narrow the inbox to the phones visible
+        # under the agent's per-workspace inbox scope. Fails CLOSED.
+        allowed_phones = None
+        from auth_core import authenticated_agent_id
+        agent_id = authenticated_agent_id()
+        if agent_id is not None:
+            if not workspace_id:
+                return jsonify({
+                    "success": False,
+                    "error": "workspace_required",
+                    "message": "Agents must select a workspace",
+                }), 403
+            from agent_auth.inbox_scope import agent_allowed_phones
+            allowed_phones = agent_allowed_phones(agent_id, workspace_id)
+            if allowed_phones is not None and not allowed_phones:
+                # Agent sees nothing in this workspace — same shape as a normal
+                # empty result, without running the query.
+                return _empty_conversations_payload()
+
         service = ConversationService(get_db())
         conversations = service.get_conversations(
             phone_number_id=phone_number_id,
@@ -2157,6 +2553,7 @@ def list_conversations():
             account_ids=account_ids,
             category=category,
             search=search,
+            allowed_phones=allowed_phones,
         )
 
         total_count = None
@@ -2167,6 +2564,7 @@ def list_conversations():
                 status=status,
                 account_ids=account_ids,
                 search=search,
+                allowed_phones=allowed_phones,
             )
             if category:
                 total_count = totals.get(category, len(conversations))
@@ -2197,20 +2595,26 @@ def get_conversation(conversation_id: int):
     GET /api/whatsapp/conversations/<id>?message_limit=100
     """
     message_limit = min(int(request.args.get("message_limit", 50)), 200)
-    
+
+    # SECURITY: caller must own the conversation's workspace (401/404/403).
+    _conv, err = _require_owned_conversation(conversation_id)
+    if err:
+        body, code = err
+        return body, code
+
     service = ConversationService(get_db())
     conversation = service.get_conversation(
         conversation_id,
         include_messages=True,
         message_limit=message_limit,
     )
-    
+
     if not conversation:
         return jsonify({
             "success": False,
             "error": "Conversation not found"
         }), 404
-    
+
     return jsonify({
         "success": True,
         "conversation": conversation,
@@ -2229,7 +2633,13 @@ def get_messages(conversation_id: int):
     before_id = request.args.get("before_id")
     if before_id:
         before_id = int(before_id)
-    
+
+    # SECURITY: caller must own the conversation's workspace (401/404/403).
+    _conv, err = _require_owned_conversation(conversation_id)
+    if err:
+        body, code = err
+        return body, code
+
     service = ConversationService(get_db())
     messages = service.get_messages(
         conversation_id=conversation_id,
@@ -2251,6 +2661,12 @@ def mark_read(conversation_id: int):
     
     POST /api/whatsapp/conversations/<id>/read
     """
+    # SECURITY: caller must own the conversation's workspace (401/404/403).
+    _conv, err = _require_owned_conversation(conversation_id)
+    if err:
+        body, code = err
+        return body, code
+
     service = ConversationService(get_db())
     success = service.mark_conversation_read(conversation_id)
     
@@ -2271,13 +2687,14 @@ def close_conversation(conversation_id: int):
     Templates can still be sent to closed conversations.
     """
     from .models import WhatsAppConversation
-    
+
     db_session = get_db()
-    conversation = db_session.get(WhatsAppConversation, conversation_id)
-    
-    if not conversation:
-        return jsonify({"success": False, "error": "Conversation not found"}), 404
-    
+    # SECURITY: caller must own the conversation's workspace (401/404/403).
+    conversation, err = _require_owned_conversation(conversation_id)
+    if err:
+        body, code = err
+        return body, code
+
     now = datetime.now(timezone.utc)
     conversation.closed_by_agent = True
     conversation.closed_at = now
@@ -2306,13 +2723,14 @@ def reopen_conversation(conversation_id: int):
     Session status still depends on 24h rule from last inbound.
     """
     from .models import WhatsAppConversation
-    
+
     db_session = get_db()
-    conversation = db_session.get(WhatsAppConversation, conversation_id)
-    
-    if not conversation:
-        return jsonify({"success": False, "error": "Conversation not found"}), 404
-    
+    # SECURITY: caller must own the conversation's workspace (401/404/403).
+    conversation, err = _require_owned_conversation(conversation_id)
+    if err:
+        body, code = err
+        return body, code
+
     if not conversation.closed_by_agent:
         return jsonify({"success": False, "error": "Conversation is not closed by agent"}), 400
     
@@ -2342,16 +2760,17 @@ def delete_conversation(conversation_id: int):
     DELETE /api/whatsapp/conversations/<id>
     """
     from .models import WhatsAppConversation
-    
+
     db_session = get_db()
-    conversation = db_session.get(WhatsAppConversation, conversation_id)
-    
-    if not conversation:
-        return jsonify({"success": False, "error": "Conversation not found"}), 404
-        
+    # SECURITY: caller must own the conversation's workspace (401/404/403).
+    conversation, err = _require_owned_conversation(conversation_id)
+    if err:
+        body, code = err
+        return body, code
+
     db_session.delete(conversation)
     db_session.commit()
-    
+
     return jsonify({"success": True, "message": "Conversation deleted"})
 
 
@@ -2392,7 +2811,11 @@ def get_connection_path():
             "success": False,
             "error": "workspace_id parameter is required"
         }), 400
-    
+    _ok, _err = _require_owned_workspace_arg(workspace_id)
+    if _err:
+        _b, _c = _err
+        return _b, _c
+
     try:
         result = detect_whatsapp_connection_path(workspace_id)
         result["success"] = True
@@ -2451,9 +2874,19 @@ def connect_manual_account():
             }
         }), 400
     
-    # Extract user_id from session/header if available, otherwise use workspace_id
-    user_id = request.headers.get("X-User-Id") or data.get("user_id") or data["workspace_id"]
-    
+    # Identity + ownership: the caller must be authenticated and must own the
+    # workspace they are attaching this WhatsApp account (and its token) to.
+    # Previously user_id came from the forgeable X-User-Id header and any caller
+    # could connect an account into another tenant's workspace.
+    from tenant.context import get_current_user, resolve_owned_workspace
+    _current_user = get_current_user()
+    if not _current_user:
+        return jsonify({"success": False, "error": "authentication_required"}), 401
+    _ws, _err = resolve_owned_workspace(_current_user, data["workspace_id"])
+    if _err:
+        return _err
+    user_id = _current_user.id
+
     try:
         result = connect_manual(
             workspace_id=data["workspace_id"],
@@ -2502,13 +2935,15 @@ def toggle_account_status(account_id: int):
     from shared_models import db
     
     try:
-        account = WhatsAppAccount.query.get(account_id)
-        if not account:
-            return jsonify({"success": False, "error": "Account not found"}), 404
-        
+        # `require_admin_only` is a no-op stub, so enforce ownership here instead.
+        account, err = _require_owned_account(account_id)
+        if err:
+            body, code = err
+            return body, code
+
         data = request.get_json() or {}
         new_status = data.get("is_active", not account.is_active)
-        
+
         account.is_active = new_status
         db.session.commit()
         
@@ -2570,13 +3005,26 @@ def list_webhook_logs():
     GET /api/whatsapp/webhook-logs
     GET /api/whatsapp/webhook-logs?limit=50&event_type=message
     """
-    from .models import WhatsAppWebhookLog
-    
+    from .models import WhatsAppWebhookLog, WhatsAppAccount
+
     limit = min(int(request.args.get("limit", 50)), 100)
     event_type = request.args.get("event_type")
-    
-    query = WhatsAppWebhookLog.query
-    
+
+    # Raw webhook payloads are sensitive → scope to the caller's OWN accounts
+    # (by phone_number_id). Previously returned every tenant's webhook traffic.
+    owned = _current_user_owned_workspace_ids()
+    if owned is None:
+        return jsonify({"success": False, "error": "authentication_required"}), 401
+    owned_pnids = [
+        a.phone_number_id
+        for a in WhatsAppAccount.query.filter(WhatsAppAccount.workspace_id.in_(owned)).all()
+        if a.phone_number_id
+    ] if owned else []
+    if not owned_pnids:
+        return jsonify({"success": True, "logs": [], "count": 0})
+
+    query = WhatsAppWebhookLog.query.filter(WhatsAppWebhookLog.phone_number_id.in_(owned_pnids))
+
     if event_type:
         query = query.filter_by(event_type=event_type)
     
@@ -2609,22 +3057,30 @@ def get_analytics_summary():
     workspace_id = request.args.get("workspace_id")
     account_id = request.args.get("account_id")
     days_param = request.args.get("days", "7")
-    
+
+    # SECURITY (tenant isolation): scope analytics to the caller's OWN data.
+    # 401 no user / 403 supplied workspace_id/account_id not owned. When neither
+    # filter is supplied, _scope_ids restricts to the caller's own accounts.
+    _scope_ids, _scope_err = _analytics_owned_scope(account_id, workspace_id)
+    if _scope_err:
+        body, code = _scope_err
+        return body, code
+
     try:
         days = int(days_param)
     except:
         days = 7
-        
+
     db_session = get_db()
     now = datetime.now(timezone.utc)
-    
+
     # Define periods
     current_end = now
     current_start = now - timedelta(days=days)
-    
+
     prev_end = current_start
     prev_start = prev_end - timedelta(days=days)
-    
+
     # Helper to get stats for a period
     def get_period_stats(start, end):
         # Base query
@@ -2633,7 +3089,7 @@ def get_analytics_summary():
             WhatsAppMessage.created_at < end,
             WhatsAppMessage.direction == "outgoing"
         )
-        
+
         # Filter by workspace/account
         if account_id:
             q = q.join(WhatsAppConversation).filter(WhatsAppConversation.account_id == int(account_id))
@@ -2645,7 +3101,12 @@ def get_analytics_summary():
                 q = q.join(WhatsAppConversation).filter(WhatsAppConversation.account_id.in_(ids))
             else:
                 return {"sent":0, "delivered":0, "read":0, "failed":0}
-        
+        else:
+            # Neither supplied → restrict to the caller's OWN accounts only.
+            if not _scope_ids:
+                return {"sent":0, "delivered":0, "read":0, "failed":0}
+            q = q.join(WhatsAppConversation).filter(WhatsAppConversation.account_id.in_(_scope_ids))
+
         # Aggregate
         stats = q.with_entities(
             WhatsAppMessage.status, 
@@ -2730,6 +3191,12 @@ def get_analytics_trends():
     
     workspace_id = request.args.get("workspace_id")
     account_id = request.args.get("account_id")
+    # SECURITY (tenant isolation): a supplied workspace_id/account_id must be
+    # owned by the caller (401/403). Closes the cross-tenant analytics read.
+    _scope_ids, _scope_err = _analytics_owned_scope(account_id, workspace_id)
+    if _scope_err:
+        body, code = _scope_err
+        return body, code
     days_param = request.args.get("days", "7")
     try:
         days = int(days_param)
@@ -2794,6 +3261,12 @@ def generate_ai_insights():
     data = request.get_json() or {}
     workspace_id = data.get("workspace_id")
     account_id = data.get("account_id")
+    # SECURITY (tenant isolation): a supplied workspace_id/account_id must be
+    # owned by the caller (401/403). Closes the cross-tenant analytics read.
+    _scope_ids, _scope_err = _analytics_owned_scope(account_id, workspace_id)
+    if _scope_err:
+        body, code = _scope_err
+        return body, code
     days_param = data.get("days", 7)
     force_refresh = data.get("force_refresh", False)
     
@@ -2934,7 +3407,22 @@ RULES:
             "cost_inr": 0.0, # Placeholder
             "from_cache": False
         }
-        
+
+        # --- AI usage metering (fail-soft; never blocks the response) ---
+        try:
+            from subscription.service import record_ai_usage, resolve_workspace_owner
+            _meter_ws = workspace_id
+            if not _meter_ws and account_id:
+                _meter_acct = WhatsAppAccount.query.get(int(account_id))
+                _meter_ws = getattr(_meter_acct, "workspace_id", None)
+            _owner_uid, _owner_ws = resolve_workspace_owner(_meter_ws)
+            record_ai_usage(
+                _owner_uid, _owner_ws, "ai_insights", model_name,
+                _commit=True, route_path=request.path,
+            )
+        except Exception:
+            pass
+
         return jsonify(ai_data)
         
     except Exception as e:
@@ -2960,6 +3448,12 @@ def export_analytics():
     
     account_id = request.args.get("account_id")
     workspace_id = request.args.get("workspace_id")
+    # SECURITY (tenant isolation): a supplied workspace_id/account_id must be
+    # owned by the caller (401/403). Closes the cross-tenant analytics read.
+    _scope_ids, _scope_err = _analytics_owned_scope(account_id, workspace_id)
+    if _scope_err:
+        body, code = _scope_err
+        return body, code
     db_session = get_db()
     now = datetime.now(timezone.utc)
     
@@ -3099,6 +3593,12 @@ def get_analytics():
     
     account_id = request.args.get("account_id")
     workspace_id = request.args.get("workspace_id")
+    # SECURITY (tenant isolation): a supplied workspace_id/account_id must be
+    # owned by the caller (401/403). Closes the cross-tenant analytics read.
+    _scope_ids, _scope_err = _analytics_owned_scope(account_id, workspace_id)
+    if _scope_err:
+        body, code = _scope_err
+        return body, code
     conversations_only = request.args.get("conversations_only", "").lower() in {"1", "true", "yes"}
     db_session = get_db()
     now = datetime.now(timezone.utc)
@@ -3386,6 +3886,12 @@ def get_category_analytics():
     
     account_id = request.args.get("account_id")
     workspace_id = request.args.get("workspace_id")
+    # SECURITY (tenant isolation): a supplied workspace_id/account_id must be
+    # owned by the caller (401/403). Closes the cross-tenant analytics read.
+    _scope_ids, _scope_err = _analytics_owned_scope(account_id, workspace_id)
+    if _scope_err:
+        body, code = _scope_err
+        return body, code
     db_session = get_db()
     now = datetime.now(timezone.utc)
     
@@ -3503,13 +4009,14 @@ def get_conversation_insights(conversation_id: int):
     Returns: session info, message stats, templates used.
     """
     from .models import WhatsAppConversation, WhatsAppMessage
-    
+
     db_session = get_db()
-    conversation = db_session.get(WhatsAppConversation, conversation_id)
-    
-    if not conversation:
-        return jsonify({"success": False, "error": "Conversation not found"}), 404
-    
+    # SECURITY: caller must own the conversation's workspace (401/404/403).
+    conversation, err = _require_owned_conversation(conversation_id)
+    if err:
+        body, code = err
+        return body, code
+
     # Message stats for this conversation
     msg_stats = db_session.query(
         func.count(WhatsAppMessage.id).label("total"),
@@ -3661,21 +4168,41 @@ def list_templates():
     account_id = request.args.get("account_id", type=int)
     workspace_id = request.args.get("workspace_id")
     status = request.args.get("status")
-    
+
+    # If an account is targeted directly, enforce ownership of it.
+    if account_id:
+        _acct, err = _require_owned_account(account_id)
+        if err:
+            body, code = err
+            return body, code
     # Resolve account_id from workspace_id if provided
-    if not account_id and workspace_id:
+    elif workspace_id:
         account, error = get_valid_account_for_workspace(workspace_id)
         if account:
             account_id = account.id
-    
+
     # Only return templates that are not archived
     query = WhatsAppTemplate.query.filter_by(is_archived=False)
-    
+
     if account_id:
         query = query.filter_by(account_id=account_id)
+    else:
+        # No account/workspace target → scope to the caller's OWN accounts only.
+        # (Previously returned every template in the system — a cross-tenant leak.)
+        owned = _current_user_owned_workspace_ids()
+        if owned is None:
+            return jsonify({"success": False, "error": "authentication_required"}), 401
+        if not owned:
+            return jsonify({"success": True, "templates": [], "count": 0})
+        owned_account_ids = [
+            a.id for a in WhatsAppAccount.query.filter(WhatsAppAccount.workspace_id.in_(owned)).all()
+        ]
+        if not owned_account_ids:
+            return jsonify({"success": True, "templates": [], "count": 0})
+        query = query.filter(WhatsAppTemplate.account_id.in_(owned_account_ids))
     if status:
         query = query.filter_by(status=status.upper())
-    
+
     templates = query.order_by(WhatsAppTemplate.name).all()
     
     return jsonify({
@@ -3716,17 +4243,26 @@ def sync_templates():
     
     if token_error:
         return jsonify({"success": False, "error": token_error}), 400
-    
+
+    # SECURITY: account_id/workspace_id come from the request BODY (outside the
+    # global header/query ownership guard) — verify the caller owns the resolved
+    # account before syncing, else another tenant's templates could be synced/read.
+    if account:
+        _sync_own, _sync_err = _require_owned_account(account.id)
+        if _sync_err:
+            _sb, _sc = _sync_err
+            return _sb, _sc
+
     try:
         from .services import WhatsAppService
-        
+
         # Initialize service with this account
         service = WhatsAppService(
             access_token=account.get_access_token(),
             phone_number_id=account.phone_number_id,
             waba_id=account.waba_id
         )
-        
+
         # Execute sync
         sync_result = service.sync_templates()
         
@@ -3781,10 +4317,16 @@ def delete_template(template_id):
         account, token_error = get_account_with_token(account_id)
     else:
         account, token_error = get_valid_account_for_workspace(workspace_id)
-        
+
     if token_error:
         return jsonify({"success": False, "error": token_error}), 400
-    
+
+    # require_admin_only is a no-op stub → enforce workspace ownership of the account.
+    _acct, _own_err = _require_owned_account(account.id)
+    if _own_err:
+        _body, _code = _own_err
+        return _body, _code
+
     access_token = account.get_access_token()
     from tenant.integration import get_tenant_meta_config
     api_version = get_tenant_meta_config(
@@ -4157,7 +4699,20 @@ Return ONLY the cleaned template text. No explanations.
             
             confidence = "HIGH"
             notes = f"Successfully optimized for {target_category}."
-            
+
+            # --- AI usage metering (fail-soft; never blocks the response) ---
+            try:
+                from subscription.service import record_ai_usage
+                from tenant.context import get_current_user
+                _meter_user = get_current_user()
+                _meter_uid = getattr(_meter_user, "id", None)
+                record_ai_usage(
+                    _meter_uid, None, "ai_template_rewrite", text_model,
+                    _commit=True, route_path=request.path,
+                )
+            except Exception:
+                pass
+
             return jsonify({
                 "success": True,
                 "rewritten_text": rewritten_text,
@@ -4217,6 +4772,11 @@ def create_template():
     
     if not account_id:
         return jsonify({"success": False, "error": "account_id required"}), 400
+    # require_admin_only is a no-op stub → enforce workspace ownership of the account.
+    _acct, _own_err = _require_owned_account(account_id)
+    if _own_err:
+        _body, _code = _own_err
+        return _body, _code
     if not name:
         return jsonify({"success": False, "error": "name required"}), 400
     if not components:
@@ -4469,6 +5029,15 @@ def create_template():
                             }
                 api_components.append(body_comp)
             elif comp_type == "HEADER":
+                # CRITICAL: Templates with a CATALOG button do not support ANY
+                # header component. Meta rejects them with error_subcode 2388181
+                # ("Header type TEXT is not supported for templates with a
+                # CATALOG button"). Catalog templates allow only body, an
+                # optional footer, and the catalog button — so drop the header.
+                if has_catalog_button:
+                    logger.info("Skipping HEADER component: not supported for CATALOG button templates")
+                    continue
+
                 header_format = str(comp.get("format", "TEXT")).upper()
                 header_comp = {
                     "type": "HEADER",
@@ -4538,10 +5107,15 @@ def create_template():
                             norm_btn["phone_number"] = btn.get("phone_number") or btn.get("phone")
 
                     elif btn_type == "FLOW":
+                        # Meta template FLOW button requires: flow_id + flow_action + navigate_screen.
+                        # (flow_token is a SEND-time param, NOT valid in template creation — omit it.)
                         if btn.get("flow_id"):
                             norm_btn["flow_id"] = btn.get("flow_id")
-                        if btn.get("flow_token"):
-                            norm_btn["flow_token"] = btn.get("flow_token")
+                        if btn.get("flow_name"):
+                            norm_btn["flow_name"] = btn.get("flow_name")
+                        norm_btn["flow_action"] = btn.get("flow_action") or "navigate"
+                        if btn.get("navigate_screen"):
+                            norm_btn["navigate_screen"] = btn.get("navigate_screen")
 
                     elif btn_type == "COPY_CODE":
                         # Meta expects example code when creating coupon templates
@@ -4804,17 +5378,33 @@ def list_accounts():
 
     workspace_id = request.args.get("workspace_id")
     include_inactive = request.args.get("include_inactive", "false").lower() == "true"
-    
+
     query = WhatsAppAccount.query
-    
+
+    # Always scope to workspaces the authenticated caller owns. A requested
+    # workspace_id must be one the caller owns (verified here — there is NO global
+    # guard doing it), otherwise this would leak another tenant's accounts.
+    owned = _current_user_owned_workspace_ids()
+    if owned is None:
+        return jsonify({"success": False, "error": "authentication_required"}), 401
+
     if workspace_id:
+        if str(workspace_id) not in owned:
+            logger.warning("cross_workspace_denied accounts list ws=%s", workspace_id)
+            return jsonify({"success": False, "error": "forbidden_workspace"}), 403
         query = query.filter_by(workspace_id=workspace_id)
-    
+    else:
+        # No workspace filter → scope to the caller's OWN workspaces only.
+        # (Previously returned every account in the system — a cross-tenant leak.)
+        if not owned:
+            return jsonify({"success": True, "accounts": [], "count": 0})
+        query = query.filter(WhatsAppAccount.workspace_id.in_(owned))
+
     # By default, only return active accounts with tokens
     if not include_inactive:
         query = query.filter_by(is_active=True)
         query = accounts_query_with_any_token(query)
-    
+
     accounts = query.all()
     
     return jsonify({
@@ -4833,13 +5423,11 @@ def unlink_account(account_id: int):
     
     Use DELETE /api/whatsapp/accounts/<id> to permanently delete with all data.
     """
-    from .models import WhatsAppAccount
-    
-    account = WhatsAppAccount.query.get(account_id)
-    
-    if not account:
-        return jsonify({"success": False, "error": "Account not found"}), 404
-    
+    account, err = _require_owned_account(account_id)
+    if err:
+        body, code = err
+        return body, code
+
     try:
         phone_number = account.display_phone_number
         
@@ -5049,13 +5637,11 @@ def rename_account(account_id: int):
     
     Uses custom_name field which is never overwritten by Meta API during re-link.
     """
-    from .models import WhatsAppAccount
-    
-    account = WhatsAppAccount.query.get(account_id)
-    
-    if not account:
-        return jsonify({"success": False, "error": "Account not found"}), 404
-    
+    account, err = _require_owned_account(account_id)
+    if err:
+        body, code = err
+        return body, code
+
     data = request.get_json() or {}
     new_name = data.get("name", "").strip()
     
@@ -5156,9 +5742,10 @@ def migrate_account_resources(account_id: int):
     from .faq_models import WhatsAppFAQ
     from .drip_models import WhatsAppDripCampaign
 
-    target_account = WhatsAppAccount.query.get(account_id)
-    if not target_account:
-        return jsonify({"success": False, "error": "Target account not found"}), 404
+    target_account, _own_err = _require_owned_account(account_id)
+    if _own_err:
+        _body, _code = _own_err
+        return _body, _code
 
     workspace_id = str(target_account.workspace_id or "")
     if not workspace_id:
@@ -5367,15 +5954,14 @@ def update_account_token(account_id: int):
     Use this to update an expired or invalid token without reconnecting.
     After update, automatically subscribes WABA to webhooks.
     """
-    from .models import WhatsAppAccount
-    
-    account = WhatsAppAccount.query.get(account_id)
-    if not account:
-        return jsonify({"success": False, "error": "Account not found"}), 404
-    
+    account, err = _require_owned_account(account_id)
+    if err:
+        body, code = err
+        return body, code
+
     data = request.get_json() or {}
     new_token = data.get("access_token")
-    
+
     if not new_token:
         return jsonify({"success": False, "error": "access_token is required"}), 400
     
@@ -5455,21 +6041,27 @@ def update_account_token(account_id: int):
 @whatsapp_bp.route("/accounts/<int:account_id>/debug", methods=["GET"])
 def get_account_debug_info(account_id: int):
     """
-    Get account details including access token for TESTING ONLY.
-    
-    WARNING: This exposes sensitive data - use only for development/testing!
-    
+    Get account diagnostic details for the OWNER only.
+
     GET /api/whatsapp/accounts/<id>/debug
+
+    Security: previously this endpoint had NO authentication and returned the
+    DECRYPTED Meta access token for any account id — anyone could enumerate ids
+    and harvest every tenant's WhatsApp credentials. It now (1) requires the
+    authenticated caller to own the account's workspace and (2) never returns
+    the raw token, only a masked presence indicator.
     """
-    from .models import WhatsAppAccount
-    
-    account = WhatsAppAccount.query.get(account_id)
-    if not account:
-        return jsonify({"success": False, "error": "Account not found"}), 404
-    
-    # Get decrypted token
-    access_token = account.get_access_token()
-    
+    from tenant.context import resolve_owned_account
+
+    account, err = resolve_owned_account(account_id)
+    if err:
+        return err
+
+    # Never expose the decrypted token. Report only whether one is present and a
+    # short masked suffix so the owner can sanity-check which token is stored.
+    raw_token = account.get_access_token() or ""
+    token_masked = ("…" + raw_token[-4:]) if len(raw_token) >= 4 else ""
+
     return jsonify({
         "success": True,
         "account": {
@@ -5478,7 +6070,8 @@ def get_account_debug_info(account_id: int):
             "phone_number_id": account.phone_number_id,
             "display_phone_number": account.display_phone_number,
             "verified_name": account.verified_name,
-            "access_token": access_token,
+            "has_access_token": bool(raw_token),
+            "access_token_masked": token_masked,
             "token_type": account.token_type,
             "is_active": account.is_active,
             "has_flow_keys": account.has_flow_keys() if hasattr(account, 'has_flow_keys') else False,
@@ -5503,10 +6096,15 @@ def full_health_check(account_id: int):
     Returns detailed report with any issues and whether they were auto-fixed.
     """
     from .health_check import perform_health_check
-    
+
+    _acct, err = _require_owned_account(account_id)
+    if err:
+        body, code = err
+        return body, code
+
     # POST = auto-fix enabled, GET = check only
     auto_fix = request.method == "POST"
-    
+
     try:
         result = perform_health_check(account_id, auto_fix=auto_fix)
         return jsonify(result)
@@ -5529,6 +6127,13 @@ def workspace_health_check(workspace_id: str):
     
     Returns health status for all accounts in the workspace.
     """
+    # SECURITY: only the workspace owner may run/auto-fix its health check.
+    from tenant.context import get_current_user, user_owns_workspace
+    _hc_user = get_current_user()
+    if not _hc_user:
+        return jsonify({"success": False, "error": "authentication_required"}), 401
+    if not user_owns_workspace(_hc_user, workspace_id):
+        return jsonify({"success": False, "error": "forbidden"}), 403
     from .health_check import perform_workspace_health_check
     
     auto_fix = request.method == "POST"
@@ -5650,11 +6255,11 @@ def delete_account(account_id: int):
     )
     from .visual_automation_models import WhatsAppVisualAutomation, WhatsAppAutomationNode
     
-    account = WhatsAppAccount.query.get(account_id)
-    
-    if not account:
-        return jsonify({"success": False, "error": "Account not found"}), 404
-    
+    account, _own_err = _require_owned_account(account_id)
+    if _own_err:
+        _body, _code = _own_err
+        return _body, _code
+
     try:
         # Store info for logging
         phone_number = account.display_phone_number
@@ -5977,11 +6582,16 @@ def get_ice_breakers(account_id: int):
     """
     import requests
     from .models import WhatsAppAccount
-    
+
+    _acct, err = _require_owned_account(account_id)
+    if err:
+        body, code = err
+        return body, code
+
     account, token_error = get_account_with_token(account_id)
     if token_error:
         return jsonify({"success": False, "error": token_error}), 400
-    
+
     access_token = account.get_access_token()
     from tenant.integration import get_tenant_meta_config
     api_version = get_tenant_meta_config(
@@ -6056,11 +6666,16 @@ def update_ice_breakers(account_id: int):
     """
     import requests
     from .models import WhatsAppAccount
-    
+
+    _acct, err = _require_owned_account(account_id)
+    if err:
+        body, code = err
+        return body, code
+
     account, token_error = get_account_with_token(account_id)
     if token_error:
         return jsonify({"success": False, "error": token_error}), 400
-    
+
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "error": "Request body required"}), 400
@@ -6141,11 +6756,16 @@ def delete_ice_breakers(account_id: int):
     """
     import requests
     from .models import WhatsAppAccount
-    
+
+    _acct, err = _require_owned_account(account_id)
+    if err:
+        body, code = err
+        return body, code
+
     account, token_error = get_account_with_token(account_id)
     if token_error:
         return jsonify({"success": False, "error": token_error}), 400
-    
+
     access_token = account.get_access_token()
     from tenant.integration import get_tenant_meta_config
     api_version = get_tenant_meta_config(
@@ -7456,7 +8076,12 @@ def get_notification_settings():
             return jsonify({"success": False, "error": err}), 400
         if not account:
             return jsonify({"success": False, "error": err or "No WhatsApp account found"}), 404
-        
+        # resolve_workspace_or_account_param does not check ownership → enforce it here.
+        _acct_own, _own_err = _require_owned_account(account.id)
+        if _own_err:
+            _own_body, _own_code = _own_err
+            return _own_body, _own_code
+
         return jsonify({
             "success": True,
             "notification_phone_number": account.notification_phone_number,
@@ -7496,7 +8121,12 @@ def update_notification_settings():
             return jsonify({"success": False, "error": err}), 400
         if not account:
             return jsonify({"success": False, "error": err or "No WhatsApp account found"}), 404
-        
+        # resolve_workspace_or_account_param does not check ownership → enforce it here.
+        _acct_own, _own_err = _require_owned_account(account.id)
+        if _own_err:
+            _own_body, _own_code = _own_err
+            return _own_body, _own_code
+
         # Clean up phone number - remove spaces, dashes, +
         if notification_phone_number:
             notification_phone_number = notification_phone_number.replace(" ", "").replace("-", "").replace("+", "")
@@ -7557,7 +8187,12 @@ def send_notification_message():
             return jsonify({"success": False, "error": err}), 400
         if not account:
             return jsonify({"success": False, "error": err or "No WhatsApp account found"}), 404
-        
+        # resolve_workspace_or_account_param does not check ownership → enforce it here.
+        _acct_own, _own_err = _require_owned_account(account.id)
+        if _own_err:
+            _own_body, _own_code = _own_err
+            return _own_body, _own_code
+
         if not account.notification_phone_number:
             return jsonify({
                 "success": False,

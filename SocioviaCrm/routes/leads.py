@@ -48,31 +48,40 @@ def normalize_activity_type(t):
 
 
 def _get_request_user_id():
-    """
-    Try to determine user_id from:
-      1) session["user_id"]
-      2) Authorization: Bearer <id>
-      3) X-User-Id header
-    """
-    uid = session.get("user_id")
-    if uid:
-        try:
-            return int(uid)
-        except Exception:
-            return uid
+    """Resolve the user id from the server session or a SIGNED Bearer JWT only.
 
-    auth = request.headers.get("Authorization", "")
-    if auth and auth.lower().startswith("bearer "):
-        token_part = auth.split(None, 1)[1]
-        if token_part.isdigit():
-            return int(token_part)
+    Forgeable plaintext ``Bearer <digits>`` / ``X-User-Id`` paths removed — any
+    caller could previously impersonate any user id. Identity now goes through
+    auth_core, consistent with the rest of the app.
+    """
+    from auth_core import authenticated_user_id
+    return authenticated_user_id()
 
-    xuid = request.headers.get("X-User-Id")
-    if xuid:
-        try:
-            return int(xuid)
-        except Exception:
-            return xuid
+
+def _require_owned_workspace(requested_workspace_id=None):
+    """Resolve + verify the caller owns a workspace (fail CLOSED).
+
+    Returns (workspace, None) on success or (None, (response, status)) so callers
+    can ``return err``. Lazy import of tenant.context avoids circular imports.
+    """
+    from tenant.context import get_current_user, resolve_owned_workspace
+    user = get_current_user()
+    if not user:
+        return None, (jsonify({"success": False, "error": "authentication_required"}), 401)
+    return resolve_owned_workspace(user, requested_workspace_id)
+
+
+def _authorize_row(row):
+    """Verify the authenticated caller owns the workspace this CRM row belongs to.
+
+    Returns None when authorized, else an (response, status) tuple. Fails CLOSED.
+    """
+    from tenant.context import get_current_user, user_owns_workspace
+    user = get_current_user()
+    if not user:
+        return (jsonify({"success": False, "error": "authentication_required"}), 401)
+    if not user_owns_workspace(user, getattr(row, "workspace_id", None)):
+        return (jsonify({"success": False, "error": "forbidden"}), 403)
     return None
 
 
@@ -91,6 +100,13 @@ def list_leads():
     # SECURITY: workspace_id is REQUIRED to prevent data leakage across workspaces
     if not workspace_id:
         return jsonify({"error": "workspace_id is required", "code": "WORKSPACE_REQUIRED"}), 400
+
+    # SECURITY: verify the caller actually OWNS the requested workspace. Requiring
+    # the param alone still let any authenticated caller pass another tenant's id.
+    ws, err = _require_owned_workspace(workspace_id)
+    if err:
+        return err
+    workspace_id = ws.id
 
     q = db.session.query(Lead)
 
@@ -175,8 +191,11 @@ def create_lead():
     if hasattr(Lead, "workspace_id"):
         if not workspace_id_param:
             return jsonify({"error": "workspace_id query param required"}), 400
-        # In your DB it's TEXT, so keep as string
-        ws_val = workspace_id_param
+        # SECURITY: verify the caller owns the workspace they're writing into.
+        ws, err = _require_owned_workspace(workspace_id_param)
+        if err:
+            return err
+        ws_val = ws.id
     else:
         ws_val = None
 
@@ -493,6 +512,11 @@ def patch_lead(lead_id):
     if not l:
         return jsonify({"error": "not found"}), 404
 
+    # SECURITY (IDOR): verify the caller owns this lead's workspace before update.
+    auth_err = _authorize_row(l)
+    if auth_err:
+        return auth_err
+
     payload = request.get_json() or {}
     allowed = {"status", "name", "email", "phone", "company", "job_title", "score", "value", "owner_id", "source", "notes"}
 
@@ -610,8 +634,19 @@ def patch_lead(lead_id):
 def lead_activity(lead_id):
     db = current_app.db
     Activity = _get_activity_model()
+    Lead = _get_lead_model()
     if not Activity:
         return jsonify([])
+
+    # SECURITY (IDOR): only expose a lead's activity to a caller who owns the
+    # lead's workspace. Load + authorize the lead first.
+    if Lead:
+        lead_obj = db.session.get(Lead, lead_id)
+        if not lead_obj:
+            return jsonify({"error": "lead not found"}), 404
+        auth_err = _authorize_row(lead_obj)
+        if auth_err:
+            return auth_err
 
     acts = (
         db.session.query(Activity)
@@ -646,6 +681,11 @@ def add_lead_activity(lead_id):
     lead_obj = db.session.get(Lead, lead_id)
     if not lead_obj:
         return jsonify({"error": "lead not found"}), 404
+
+    # SECURITY (IDOR): only the owner of the lead's workspace may add activity.
+    auth_err = _authorize_row(lead_obj)
+    if auth_err:
+        return auth_err
 
     payload = request.get_json(silent=True) or {}
     try:

@@ -295,11 +295,12 @@ def create_flow():
         return jsonify({"success": False, "error": "account_id is required"}), 400
     if not name:
         return jsonify({"success": False, "error": "name is required"}), 400
-    
-    # Validate account exists
-    account = WhatsAppAccount.query.get(account_id)
-    if not account:
-        return jsonify({"success": False, "error": "Account not found"}), 404
+
+    # Validate account exists AND is owned by the caller's workspace.
+    from tenant.context import resolve_owned_account
+    account, _own_err = resolve_owned_account(account_id)
+    if _own_err:
+        return _own_err
         
     # Check Subscription Limit
     workspace_id = getattr(account, "workspace_id", None)
@@ -391,9 +392,15 @@ def list_flows():
     
     if not account_id:
         return jsonify({"success": False, "error": "account_id is required"}), 400
-    
+
+    # Enforce ownership of the account before listing its flows.
+    from tenant.context import resolve_owned_account
+    _acct, _own_err = resolve_owned_account(account_id)
+    if _own_err:
+        return _own_err
+
     query = WhatsAppFlow.query.filter_by(account_id=account_id)
-    
+
     if status:
         query = query.filter_by(status=status.upper())
     if category:
@@ -714,6 +721,7 @@ def publish_flow(flow_id: int):
 # ============================================================
 
 @flow_bp.route("/<int:flow_id>/clone", methods=["POST"])
+@require_flow_access
 def clone_flow(flow_id: int):
     """
     Clone a flow to create a new editable version.
@@ -724,12 +732,17 @@ def clone_flow(flow_id: int):
     - Version history
     """
     flow = WhatsAppFlow.query.get(flow_id)
-    
+
     if not flow:
         return jsonify({"success": False, "error": "Flow not found"}), 404
 
+    # Ownership check: caller must own the workspace behind this flow's account.
+    from tenant.context import resolve_owned_account
+    account, err = resolve_owned_account(flow.account_id)
+    if err:
+        return err
+
     # Check Subscription Limit (Cloning creates new flow)
-    account = WhatsAppAccount.query.get(flow.account_id)
     workspace_id = getattr(account, "workspace_id", None)
     if workspace_id:
         try:
@@ -818,13 +831,20 @@ def validate_flow():
 # ============================================================
 
 @flow_bp.route("/<int:flow_id>/deprecate", methods=["POST"])
+@require_flow_access
 def deprecate_flow(flow_id: int):
     """Mark a published flow as deprecated."""
     flow = WhatsAppFlow.query.get(flow_id)
-    
+
     if not flow:
         return jsonify({"success": False, "error": "Flow not found"}), 404
-    
+
+    # Ownership check: caller must own the workspace behind this flow's account.
+    from tenant.context import resolve_owned_account
+    _account, err = resolve_owned_account(flow.account_id)
+    if err:
+        return err
+
     if flow.status != "PUBLISHED":
         return jsonify({
             "success": False,

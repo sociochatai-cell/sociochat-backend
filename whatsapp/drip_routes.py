@@ -16,6 +16,92 @@ logger = logging.getLogger(__name__)
 drip_bp = Blueprint("drip", __name__, url_prefix="/api/whatsapp")
 
 
+@drip_bp.before_request
+def _enforce_drip_ownership():
+    """Blueprint-wide IDOR guard for drip / dataset routes.
+
+    Every drip resource belongs to a workspace — directly (workspace_id), via an
+    account (account_id -> account.workspace_id), a dataset (dataset_id ->
+    dataset.workspace_id), or a campaign (campaign_id -> campaign.workspace_id).
+    Many of these routes had NO ownership check (dataset CRUD, CSV/CRM/Sheets
+    imports, per-workspace contacts) — any caller could read/modify another
+    tenant's datasets and contacts. Enforce ownership once here. Fails closed.
+    """
+    if request.method == "OPTIONS":
+        return None
+
+    from tenant.context import get_current_user, user_owns_workspace
+
+    va = request.view_args or {}
+    user = get_current_user()
+
+    def _auth():
+        return jsonify({"success": False, "error": "authentication_required"}), 401
+
+    def _forbidden():
+        return jsonify({"success": False, "error": "forbidden"}), 403
+
+    # 1) account_id in the URL -> must own the account's workspace.
+    if va.get("account_id") is not None:
+        if not user:
+            return _auth()
+        acc = WhatsAppAccount.query.get(va["account_id"])
+        if not acc:
+            return jsonify({"success": False, "error": "account_not_found"}), 404
+        if not user_owns_workspace(user, acc.workspace_id):
+            return _forbidden()
+        return None
+
+    # 2) workspace_id in the URL -> must own it.
+    if va.get("workspace_id") is not None:
+        if not user:
+            return _auth()
+        if not user_owns_workspace(user, va["workspace_id"]):
+            return _forbidden()
+        return None
+
+    # 3) dataset_id in the URL -> must own the dataset's workspace.
+    if va.get("dataset_id") is not None:
+        if not user:
+            return _auth()
+        ds = WhatsAppDataset.query.get(va["dataset_id"])
+        if not ds:
+            return jsonify({"success": False, "error": "dataset_not_found"}), 404
+        if not user_owns_workspace(user, ds.workspace_id):
+            return _forbidden()
+        return None
+
+    # 4) campaign_id in the URL (no account_id) -> must own the campaign's workspace.
+    if va.get("campaign_id") is not None:
+        if not user:
+            return _auth()
+        camp = WhatsAppDripCampaign.query.get(va["campaign_id"])
+        if not camp:
+            return jsonify({"success": False, "error": "campaign_not_found"}), 404
+        if not user_owns_workspace(user, camp.workspace_id):
+            return _forbidden()
+        return None
+
+    # 5) No id in the URL: require auth, and verify any client-supplied
+    #    workspace_id / account_id (query, JSON body, or form).
+    if not user:
+        return _auth()
+    body = request.get_json(silent=True) if request.is_json else None
+    body = body if isinstance(body, dict) else {}
+    wid = request.args.get("workspace_id") or body.get("workspace_id") or request.form.get("workspace_id")
+    aid = request.args.get("account_id") or body.get("account_id") or request.form.get("account_id")
+    if aid:
+        acc = WhatsAppAccount.query.get(aid)
+        if not acc:
+            return jsonify({"success": False, "error": "account_not_found"}), 404
+        if not user_owns_workspace(user, acc.workspace_id):
+            return _forbidden()
+    elif wid:
+        if not user_owns_workspace(user, wid):
+            return _forbidden()
+    return None
+
+
 def _parse_service_account_json(raw: str) -> dict:
     """Parse service-account JSON; tolerate UTF-8 BOM from Windows Secret Manager exports."""
     text = (raw or "").strip()
@@ -282,13 +368,36 @@ def create_campaign(account_id: int, account: WhatsAppAccount, workspace_id: str
             db.session.add(step)
             
         db.session.commit()
-        
+
+        # Immediately enroll from the linked Google Sheet so the campaign shows a
+        # real enrolled count on creation (previously enrollment only happened on a
+        # manual "Sync Now" or the 15-min scheduler, so users saw enrolled = 0).
+        sheet_sync = None
+        if trigger_type == "google_sheet_row" and campaign.sheet_id:
+            try:
+                sheet_sync = sync_sheet_campaign_internal(campaign.id)
+                logger.info(
+                    f"Auto sheet-sync after create for campaign {campaign.id}: {sheet_sync}"
+                )
+                # sync_sheet_campaign_internal commits enrolled_count; refresh so the
+                # returned campaign dict reflects the new count.
+                try:
+                    db.session.refresh(campaign)
+                except Exception:
+                    pass
+            except Exception as sync_err:
+                logger.exception(
+                    f"Auto sheet-sync after create failed for campaign {campaign.id}: {sync_err}"
+                )
+                sheet_sync = {"success": False, "error": str(sync_err)}
+
         return jsonify({
             "success": True,
             "campaign": campaign.to_dict(),
+            "sheet_sync": sheet_sync,
             "message": "Campaign created"
         }), 201
-        
+
     except Exception as e:
         db.session.rollback()
         logger.exception(f"Error creating drip campaign: {e}")

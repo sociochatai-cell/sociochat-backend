@@ -11,7 +11,7 @@ import logging
 from sqlalchemy import func
 
 from decimal import Decimal
-from shared_models import db, User, Workspace, AIUsage
+from shared_models import db, User, Workspace, AIUsage, AIUsageDailySummary
 from subscription.constants import (
     PLAN_FEATURES, VALID_PLANS, PLAN_STARTER, PLAN_BETA, UNLIMITED,
     BILLING_SCOPE_GLOBAL, BILLING_SCOPE_PRIVATE, PLAN_SCOPE_PRIVATE,
@@ -155,9 +155,17 @@ def get_current_subscription_info(user: User) -> dict:
     def _iso(dt):
         return dt.isoformat() if dt else None
 
+    # Has the user ACTIVELY selected/paid a plan, or are they still on the
+    # auto-assigned default/tenant baseline? Only a live paid subscription (a set,
+    # non-expired expiry) counts as "selected" — so a brand-new user shows NO plan
+    # pre-highlighted on the subscription page instead of the baseline (e.g. the
+    # tenant's enterprise) appearing as "Current".
+    has_selected_plan = bool(getattr(user, "subscription_expires_at", None)) and not _is_subscription_expired(user)
+
     return {
         "plan_slug": (getattr(user, "plan", None) or "beta") if user else "beta",
         "effective_plan": get_effective_plan_slug(user),
+        "has_selected_plan": has_selected_plan,
         "billing_scope": (getattr(user, "billing_scope", None) or BILLING_SCOPE_GLOBAL),
         "is_private_slot": is_private_slot_user(user),
         "subscription_expires_at": _iso(getattr(user, "subscription_expires_at", None)),
@@ -651,6 +659,112 @@ def record_image_credits_used(user: User, workspace_id: Optional[int] = None, co
     return usage
 
 
+def resolve_workspace_owner(workspace_id) -> Tuple[Optional[int], Optional[int]]:
+    """Resolve (owner_user_id, workspace_id_int) from a workspace id that may be a
+    string (the whatsapp/CRM layers carry it as a string). Returns (None, None) if
+    it can't be resolved. Attribution follows Workspace.user_id (same rule message
+    billing uses)."""
+    try:
+        wid = int(str(workspace_id).strip())
+    except (TypeError, ValueError):
+        return None, None
+    ws = db.session.get(Workspace, wid)
+    if not ws:
+        return None, wid
+    return ws.user_id, wid
+
+
+def record_ai_usage(
+    user_id: Optional[int],
+    workspace_id: Optional[int],
+    feature: str,
+    model: str,
+    *,
+    count: int = 1,
+    cost_inr: Optional[Decimal] = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    route_path: Optional[str] = None,
+    request_id: Optional[str] = None,
+    ip_address: Optional[str] = None,
+    _commit: bool = True,
+) -> Optional[AIUsage]:
+    """Record one successful AI / image generation.
+
+    Writes an AIUsage event row (the credit gate reads these for
+    feature='image_generation') and upserts the AIUsageDailySummary rollup used by
+    the usage dashboards. Fail-SOFT: metering must NEVER break a user-facing
+    generation — any error is logged, rolled back, and swallowed.
+
+    `cost_inr` defaults to the image credit cost for feature='image_generation'
+    (1 image = 1 credit = GEMINI_IMAGE_BASE_COST) and 0 for text features
+    (report-only; they don't consume image credits).
+    """
+    if not user_id:
+        logger.warning("record_ai_usage skipped: no user_id (feature=%s)", feature)
+        return None
+
+    # int-cast / null-guard workspace_id (whatsapp/CRM carry it as a string).
+    try:
+        wid = int(workspace_id) if workspace_id not in (None, "") else None
+    except (TypeError, ValueError):
+        wid = None
+
+    if cost_inr is None:
+        cost_inr = (GEMINI_IMAGE_BASE_COST * count) if feature == "image_generation" else Decimal("0")
+
+    total_tokens = (input_tokens or 0) + (output_tokens or 0)
+
+    try:
+        event = AIUsage(
+            user_id=user_id,
+            workspace_id=wid,
+            feature=feature,
+            model=model,
+            route_path=route_path,
+            input_tokens=input_tokens or 0,
+            output_tokens=output_tokens or 0,
+            total_tokens=total_tokens,
+            cost_inr=cost_inr,
+            request_id=request_id,
+            ip_address=ip_address,
+        )
+        db.session.add(event)
+
+        today = date.today()
+        summary = AIUsageDailySummary.query.filter_by(
+            day=today, user_id=user_id, workspace_id=wid, feature=feature
+        ).first()
+        if not summary:
+            summary = AIUsageDailySummary(
+                day=today,
+                user_id=user_id,
+                workspace_id=wid,
+                feature=feature,
+                total_calls=0,
+                total_input_tokens=0,
+                total_output_tokens=0,
+                total_tokens=0,
+                total_cost_inr=Decimal("0"),
+            )
+            db.session.add(summary)
+        summary.total_calls += count
+        summary.total_input_tokens += (input_tokens or 0)
+        summary.total_output_tokens += (output_tokens or 0)
+        summary.total_tokens += total_tokens
+        summary.total_cost_inr = (summary.total_cost_inr or Decimal("0")) + cost_inr
+
+        if _commit:
+            db.session.commit()
+        else:
+            db.session.flush()
+        return event
+    except Exception:
+        logger.exception("record_ai_usage failed (feature=%s user=%s)", feature, user_id)
+        db.session.rollback()
+        return None
+
+
 def record_ad_spend(workspace_id: int, amount_paise: int) -> AdSpendTracking:
     """Record ad spend for a workspace."""
     today = date.today()
@@ -709,27 +823,50 @@ def get_user_usage_stats(user: User, workspace_id: Optional[int] = None) -> Dict
         AIUsage.created_at >= first_of_month
     ).scalar()
     image_credits_used = float(Decimal(str(total_image_cost)) / GEMINI_IMAGE_BASE_COST)
-    
+
+    # Monthly AI generations (text/LLM calls this month, excluding image gen which
+    # is surfaced separately as image credits above). Rolled up in AIUsageDailySummary.
+    ai_generations_month = db.session.query(
+        func.coalesce(func.sum(AIUsageDailySummary.total_calls), 0)
+    ).filter(
+        AIUsageDailySummary.user_id == user.id,
+        AIUsageDailySummary.day >= first_of_month,
+        AIUsageDailySummary.feature != "image_generation",
+    ).scalar()
+
     # Workspace count
     workspace_count = Workspace.query.filter_by(user_id=user.id).count()
-    
-    # Interactive flows (if workspace specified)
+
+    # Interactive flows and ad spend are enforced PER WORKSPACE (see
+    # check_flow_limit / check_ad_spend_limit). When no specific workspace is
+    # requested (the admin/summary surfaces call with workspace_id=None), fall back
+    # to the user's primary (first) workspace so the meters show real numbers
+    # instead of a misleading 0. Aggregating would mismatch the per-workspace limit.
+    scope_ws_id = workspace_id
+    if not scope_ws_id:
+        primary_ws = (Workspace.query
+                      .filter_by(user_id=user.id)
+                      .order_by(Workspace.id)
+                      .first())
+        scope_ws_id = primary_ws.id if primary_ws else None
+
+    # Interactive flows (scoped workspace)
     flow_count = 0
-    if workspace_id:
+    if scope_ws_id:
         try:
             from sqlalchemy import text as sa_text
             flow_count = db.session.execute(
                 sa_text("SELECT COUNT(*) FROM whatsapp_visual_automations WHERE workspace_id = :wid"),
-                {"wid": str(workspace_id)},
+                {"wid": str(scope_ws_id)},
             ).scalar() or 0
         except Exception:
             pass
-    
-    # Ad spend (if workspace specified)
+
+    # Ad spend (scoped workspace)
     ad_spend_inr = 0
-    if workspace_id:
+    if scope_ws_id:
         tracking = AdSpendTracking.query.filter(
-            AdSpendTracking.workspace_id == workspace_id,
+            AdSpendTracking.workspace_id == scope_ws_id,
             AdSpendTracking.billing_period_start <= today,
             AdSpendTracking.billing_period_end >= today
         ).first()
@@ -748,6 +885,8 @@ def get_user_usage_stats(user: User, workspace_id: Optional[int] = None) -> Dict
             "interactive_flows_limit": features["interactive_flows"],
             "ad_spend_inr": ad_spend_inr,
             "ad_spend_limit": features["ad_spend_limit"],
+            "ai_generations": int(ai_generations_month or 0),
+            "ai_generations_limit": -1,
         }
     }
 

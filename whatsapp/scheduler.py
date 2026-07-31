@@ -70,6 +70,14 @@ def _run_periodic_tick():
             )
         except Exception:
             logger.exception("[periodic tick] sweep failed")
+        # Recurring subscription autopay: charge any mandates due now. Isolated so
+        # a billing error never stops the campaign/drip sweep above.
+        try:
+            from payments.autopay_jobs import run_due_autopay_charges, run_due_autopay_notifications
+            run_due_autopay_notifications()  # RBI pre-debit notices (48h ahead) first
+            run_due_autopay_charges()        # then debit anything due now
+        except Exception:
+            logger.exception("[periodic tick] autopay sweep failed")
 
 
 def execute_campaign_job(campaign_id):
@@ -115,7 +123,10 @@ def execute_booking_reminder(booking_id):
 def add_booking_reminder_job(booking_id, run_date):
     """Schedule a one-off appointment reminder at run_date (a tz-aware UTC datetime)."""
     if not scheduler:
-        logger.error("Scheduler not initialized")
+        # Expected in production: the in-process scheduler is disabled and the
+        # reminder fires via the /tick DB-poll (send_due_booking_reminders), which
+        # keys off booking.remind_at. Nothing to schedule in-process here.
+        logger.debug("In-process scheduler off; booking %s reminder will fire via /tick poll", booking_id)
         return None
 
     job_id = f"booking_reminder_{booking_id}"
@@ -145,9 +156,11 @@ def add_campaign_job(campaign_id, run_date, func=None):
     The func parameter is ignored - we always use execute_campaign_job for reliability.
     """
     if not scheduler:
-        logger.error("Scheduler not initialized")
+        # Expected in production: scheduled campaigns are activated by the /tick
+        # DB-poll (check_scheduled_campaigns), so no in-process job is needed.
+        logger.debug("In-process scheduler off; campaign %s handled by /tick poll", campaign_id)
         return None
-        
+
     job_id = f"campaign_{campaign_id}"
     
     # Remove existing job if any (for rescheduling)

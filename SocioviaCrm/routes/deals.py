@@ -41,18 +41,41 @@ def _get_note_model():
 
 
 def _get_request_user_id():
-    uid = session.get("user_id")
-    if uid:
-        return uid  # keep as-is; casting handled later based on DB type
-    auth = request.headers.get("Authorization", "")
-    if auth and auth.lower().startswith("bearer "):
-        token_part = auth.split(None, 1)[1]
-        if token_part.isdigit():
-            return int(token_part)
-        return token_part
-    xuid = request.headers.get("X-User-Id")
-    if xuid:
-        return xuid
+    """Resolve the user id from the server session or a SIGNED Bearer JWT only.
+
+    Forgeable plaintext ``Bearer <digits>`` / ``X-User-Id`` paths removed — any
+    caller could previously impersonate any user id. Identity now goes through
+    auth_core, consistent with the rest of the app.
+    """
+    from auth_core import authenticated_user_id
+    return authenticated_user_id()
+
+
+def _require_owned_workspace(requested_workspace_id=None):
+    """Resolve + verify the caller owns a workspace (fail CLOSED).
+
+    Returns (workspace, None) on success or (None, (response, status)) so callers
+    can ``return err``. Lazy import of tenant.context avoids circular imports.
+    """
+    from tenant.context import get_current_user, resolve_owned_workspace
+    user = get_current_user()
+    if not user:
+        return None, (jsonify({"success": False, "error": "authentication_required"}), 401)
+    return resolve_owned_workspace(user, requested_workspace_id)
+
+
+def _authorize_row(row):
+    """Verify the authenticated caller owns the workspace this CRM row belongs to.
+
+    Returns None when authorized, else an (response, status) tuple to return.
+    Fails CLOSED: no user -> 401; workspace not owned -> 403.
+    """
+    from tenant.context import get_current_user, user_owns_workspace
+    user = get_current_user()
+    if not user:
+        return (jsonify({"success": False, "error": "authentication_required"}), 401)
+    if not user_owns_workspace(user, getattr(row, "workspace_id", None)):
+        return (jsonify({"success": False, "error": "forbidden"}), 403)
     return None
 
 
@@ -255,9 +278,17 @@ def deals_handler():
         except Exception:
             limit = 100
 
+        # SECURITY: resolve + verify the caller owns the requested workspace and
+        # ALWAYS scope to it. Previously the workspace filter was applied only when
+        # workspace_id was present (fail-OPEN -> returned every tenant's deals).
+        ws, err = _require_owned_workspace(workspace_id)
+        if err:
+            return err
+        workspace_id = ws.id
+
         q = db.session.query(Deal)
 
-        if workspace_id is not None and "workspace_id" in colnames:
+        if "workspace_id" in colnames:
             # keep workspace_id type as string (most apps store this as string), but let DB decide
             try:
                 if _column_is_integer_type(Deal, "workspace_id"):
@@ -339,7 +370,11 @@ def deals_handler():
     if "workspace_id" in colnames:
         if not workspace_q:
             return jsonify({"error": "workspace_id query param required"}), 400
-        ws_val = workspace_q
+        # SECURITY: verify the caller owns the workspace they're writing into.
+        ws, err = _require_owned_workspace(workspace_q)
+        if err:
+            return err
+        ws_val = ws.id
 
     owner_q = request.args.get("owner_id")
     owner_val = payload.get("owner_id") or owner_q or _get_request_user_id()
@@ -449,6 +484,11 @@ def deal_detail(deal_id):
     d = db.session.get(Deal, deal_id)
     if not d:
         return jsonify({"error": "not found"}), 404
+
+    # SECURITY (IDOR): verify the caller owns this deal's workspace before any op.
+    auth_err = _authorize_row(d)
+    if auth_err:
+        return auth_err
 
     colnames = _model_columns(Deal)
 
@@ -571,6 +611,10 @@ def change_stage(deal_id):
     d = db.session.get(Deal, deal_id)
     if not d:
         return jsonify({"error": "not found"}), 404
+    # SECURITY (IDOR): verify workspace ownership before mutating the deal.
+    auth_err = _authorize_row(d)
+    if auth_err:
+        return auth_err
     payload = request.get_json(silent=True) or {}
     stage = payload.get("stage")
     note = payload.get("note")
@@ -649,6 +693,10 @@ def close_deal(deal_id):
     d = db.session.get(Deal, deal_id)
     if not d:
         return jsonify({"error": "not found"}), 404
+    # SECURITY (IDOR): verify workspace ownership before closing the deal.
+    auth_err = _authorize_row(d)
+    if auth_err:
+        return auth_err
     payload = request.get_json(silent=True) or {}
     status = (payload.get("status") or "").lower()
     closed_reason = payload.get("closed_reason")
@@ -693,6 +741,16 @@ def deal_activity(deal_id):
     Activity = _get_activity_model()
     if not Deal:
         return jsonify({"error": "Deal model not configured"}), 500
+
+    # SECURITY (IDOR): the activity of a deal is only visible/writable to a caller
+    # who owns the deal's workspace. Load + authorize before exposing anything.
+    d = db.session.get(Deal, deal_id)
+    if not d:
+        return jsonify({"error": "deal not found"}), 404
+    auth_err = _authorize_row(d)
+    if auth_err:
+        return auth_err
+
     if request.method == "GET":
         if not Activity:
             return jsonify([])
@@ -713,13 +771,9 @@ def deal_activity(deal_id):
             })
         return jsonify(out)
 
-    # POST -> add activity
+    # POST -> add activity  (deal already loaded + ownership verified above)
     if not Activity:
         return jsonify({"error": "Activity model not configured"}), 500
-
-    d = db.session.get(Deal, deal_id)
-    if not d:
-        return jsonify({"error": "deal not found"}), 404
 
     payload = request.get_json(silent=True) or {}
     try:
@@ -784,6 +838,23 @@ def convert_from_lead():
     if Lead:
         lead_obj = db.session.get(Lead, lead_id)
 
+    # SECURITY (IDOR): a lead may only be converted by a caller who owns the
+    # lead's workspace — otherwise one tenant could spin the deal (and copy the
+    # source workspace_id) off another tenant's lead.
+    if lead_obj is not None:
+        auth_err = _authorize_row(lead_obj)
+        if auth_err:
+            return auth_err
+    else:
+        # No source lead: the deal is created in a client-supplied workspace, so
+        # verify ownership of it up front and use the resolved id.
+        req_ws = request.args.get("workspace_id") or (data.get("workspace_id"))
+        ws, err = _require_owned_workspace(req_ws)
+        if err:
+            return err
+        data = dict(data)
+        data["workspace_id"] = ws.id
+
     create_kwargs = {}
     if lead_obj:
         create_kwargs["name"] = data.get("name") or f"Deal from {getattr(lead_obj, 'name', 'lead')}"
@@ -797,6 +868,9 @@ def convert_from_lead():
             create_kwargs["workspace_id"] = getattr(lead_obj, "workspace_id", None)
     else:
         create_kwargs["name"] = data.get("name") or "Deal from lead"
+        # workspace_id was resolved + ownership-verified above for the no-lead case
+        if "workspace_id" in _model_columns(Deal) and data.get("workspace_id") is not None:
+            create_kwargs["workspace_id"] = data.get("workspace_id")
 
     if "owner_id" in _model_columns(Deal) and data.get("owner_id"):
         # cast based on column
@@ -868,6 +942,14 @@ def search_deals():
     Deal = _get_deal_model()
     if not Deal:
         return jsonify({"error": "Deal model not configured"}), 500
+
+    # SECURITY: resolve + verify the caller owns the workspace and ALWAYS scope
+    # the search to it (was fail-OPEN: unscoped search across all tenants).
+    ws, err = _require_owned_workspace(workspace_id)
+    if err:
+        return err
+    workspace_id = ws.id
+
     if not q:
         return jsonify({"data": []})
     colnames = _model_columns(Deal)

@@ -394,6 +394,23 @@ def classify_lead_status(text, workspace_id):
                     temperature=0.0,
                 ),
             )
+
+            # --- AI usage metering (fail-soft) ---
+            # Only workspace_id is available here; resolve the owner user id via
+            # resolve_workspace_owner. No-ops if the workspace can't be resolved.
+            try:
+                from subscription.service import record_ai_usage, resolve_workspace_owner
+                _meter_uid, _meter_wid = resolve_workspace_owner(workspace_id)
+                record_ai_usage(
+                    _meter_uid,
+                    _meter_wid,
+                    feature="crm_lead_status",
+                    model=MODEL,
+                    _commit=True,
+                )
+            except Exception:
+                pass
+            # --- end metering ---
         except Exception as e:
             logger.warning("classify_lead_status: generate_content failed: %s", e)
             return None

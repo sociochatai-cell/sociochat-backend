@@ -68,6 +68,23 @@ class ActionExecutor:
         session = session_manager.get_or_create(session_id, workspace_id)
         session.add_message("user", message)
 
+        # Route the message, then ALWAYS persist the session's final state back to
+        # the DB so the next turn — which may be served by a different gunicorn
+        # worker — resumes the multi-turn flow instead of starting over.
+        try:
+            return self._route(message, session, workspace_id, account_id, user_id)
+        finally:
+            session_manager.persist(session)
+
+    def _route(
+        self,
+        message: str,
+        session: AgentSession,
+        workspace_id: str,
+        account_id: Optional[int],
+        user_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Decide how to handle the (already-recorded) user message."""
         # 2. If we're in a multi-turn flow, try to collect the missing param
         if session.current_domain and session.current_action and session.missing_params:
             return self._handle_multiturn_input(message, session, workspace_id, account_id, user_id)

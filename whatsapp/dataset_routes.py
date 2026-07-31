@@ -41,6 +41,75 @@ def _get_workspace_id():
     )
 
 
+def _resolve_owned_workspace_id(workspace_id):
+    """Verify the authenticated user owns ``workspace_id``.
+
+    Returns (int_workspace_id, error_response). Fails CLOSED: no user -> 401,
+    not owned / bad id -> 403.
+    """
+    from tenant.context import get_current_user, resolve_owned_workspace
+
+    workspace, err = resolve_owned_workspace(get_current_user(), workspace_id)
+    if err:
+        return None, err
+    return int(workspace.id), None
+
+
+def _resolve_owned_dataset(dataset_id):
+    """Load a Dataset by id and verify the authenticated user owns its workspace.
+
+    Returns (dataset, error_response). Fails CLOSED.
+    """
+    from tenant.context import get_current_user, user_owns_workspace
+
+    ds = Dataset.query.get(dataset_id)
+    if not ds:
+        return None, _error("Dataset not found", 404)
+
+    user = get_current_user()
+    if not user:
+        return None, _error("authentication_required", 401)
+    if not user_owns_workspace(user, ds.workspace_id):
+        return None, _error("forbidden", 403)
+    return ds, None
+
+
+@dataset_bp.before_request
+def _enforce_dataset_ownership():
+    """Blueprint-wide IDOR guard. A dataset belongs to a workspace. Every
+    ``/datasets/<dataset_id>`` and ``/workspaces/<workspace_id>/...`` route must be
+    owned by the caller; any client-supplied workspace_id is verified too. Fails
+    closed. (Per-endpoint checks below are kept as defense in depth.)"""
+    if request.method == "OPTIONS":
+        return None
+    va = request.view_args or {}
+    if va.get("dataset_id") is not None:
+        _ds, err = _resolve_owned_dataset(va["dataset_id"])
+        if err:
+            return err
+        return None
+    if va.get("workspace_id") is not None:
+        _w, err = _resolve_owned_workspace_id(va["workspace_id"])
+        if err:
+            return err
+        return None
+    from tenant.context import get_current_user, user_owns_workspace
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "authentication_required"}), 401
+    body = request.get_json(silent=True) if request.is_json else None
+    body = body if isinstance(body, dict) else {}
+    wid = (
+        request.args.get("workspace_id")
+        or request.headers.get("X-Workspace-ID")
+        or body.get("workspace_id")
+        or request.form.get("workspace_id")
+    )
+    if wid and not user_owns_workspace(user, wid):
+        return jsonify({"success": False, "error": "forbidden"}), 403
+    return None
+
+
 def _success(data=None, **kwargs):
     resp = {"success": True}
     if data is not None:
@@ -60,9 +129,12 @@ def _error(msg, status=400):
 
 @dataset_bp.route("/workspaces/<workspace_id>/datasets", methods=["GET"])
 def list_datasets(workspace_id):
+    owned_ws_id, err = _resolve_owned_workspace_id(workspace_id)
+    if err:
+        return err
     datasets = (
         Dataset.query
-        .filter_by(workspace_id=int(workspace_id))
+        .filter_by(workspace_id=owned_ws_id)
         .order_by(Dataset.updated_at.desc())
         .all()
     )
@@ -72,13 +144,17 @@ def list_datasets(workspace_id):
 @dataset_bp.route("/workspaces/<workspace_id>/datasets", methods=["POST"])
 @require_feature("whatsapp_datasets")
 def create_dataset(workspace_id):
+    owned_ws_id, err = _resolve_owned_workspace_id(workspace_id)
+    if err:
+        return err
+
     body = request.get_json(silent=True) or {}
     name = body.get("name", "").strip()
     if not name:
         return _error("name is required")
 
     ds = Dataset(
-        workspace_id=int(workspace_id),
+        workspace_id=owned_ws_id,
         name=name,
         description=body.get("description", ""),
         columns=body.get("columns", []),
@@ -97,17 +173,17 @@ def create_dataset(workspace_id):
 
 @dataset_bp.route("/datasets/<int:dataset_id>", methods=["GET"])
 def get_dataset(dataset_id):
-    ds = Dataset.query.get(dataset_id)
-    if not ds:
-        return _error("Dataset not found", 404)
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
     return _success(ds.to_dict())
 
 
 @dataset_bp.route("/datasets/<int:dataset_id>", methods=["DELETE"])
 def delete_dataset(dataset_id):
-    ds = Dataset.query.get(dataset_id)
-    if not ds:
-        return _error("Dataset not found", 404)
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
     db.session.delete(ds)
     db.session.commit()
     return _success({"deleted": True})
@@ -120,9 +196,9 @@ def delete_dataset(dataset_id):
 
 @dataset_bp.route("/datasets/<int:dataset_id>/rows", methods=["GET"])
 def list_rows(dataset_id):
-    ds = Dataset.query.get(dataset_id)
-    if not ds:
-        return _error("Dataset not found", 404)
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
 
     page = int(request.args.get("page", 1))
     limit = int(request.args.get("limit", 50))
@@ -139,9 +215,9 @@ def list_rows(dataset_id):
 
 @dataset_bp.route("/datasets/<int:dataset_id>/rows", methods=["POST"])
 def add_row(dataset_id):
-    ds = Dataset.query.get(dataset_id)
-    if not ds:
-        return _error("Dataset not found", 404)
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
 
     body = request.get_json(silent=True) or {}
     row_data = body.get("data", {})
@@ -161,6 +237,10 @@ def add_row(dataset_id):
 
 @dataset_bp.route("/datasets/<int:dataset_id>/rows/<int:row_id>", methods=["PUT"])
 def update_row(dataset_id, row_id):
+    _ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
+
     row = DatasetRow.query.filter_by(id=row_id, dataset_id=dataset_id).first()
     if not row:
         return _error("Row not found", 404)
@@ -174,6 +254,10 @@ def update_row(dataset_id, row_id):
 
 @dataset_bp.route("/datasets/<int:dataset_id>/rows/<int:row_id>", methods=["DELETE"])
 def delete_row(dataset_id, row_id):
+    _ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
+
     row = DatasetRow.query.filter_by(id=row_id, dataset_id=dataset_id).first()
     if not row:
         return _error("Row not found", 404)
@@ -189,9 +273,9 @@ def delete_row(dataset_id, row_id):
 
 @dataset_bp.route("/datasets/<int:dataset_id>/columns", methods=["POST"])
 def add_column(dataset_id):
-    ds = Dataset.query.get(dataset_id)
-    if not ds:
-        return _error("Dataset not found", 404)
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
 
     body = request.get_json(silent=True) or {}
     col_name = body.get("column_name", "").strip()
@@ -210,9 +294,9 @@ def add_column(dataset_id):
 
 @dataset_bp.route("/datasets/<int:dataset_id>/columns/<path:col_name>", methods=["DELETE"])
 def remove_column(dataset_id, col_name):
-    ds = Dataset.query.get(dataset_id)
-    if not ds:
-        return _error("Dataset not found", 404)
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
 
     col_name = unquote(col_name).strip()
     cols = list(ds.columns or [])
@@ -259,9 +343,9 @@ def csv_preview():
 
 @dataset_bp.route("/datasets/<int:dataset_id>/upload-mapped", methods=["POST"])
 def upload_csv_mapped(dataset_id):
-    ds = Dataset.query.get(dataset_id)
-    if not ds:
-        return _error("Dataset not found", 404)
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
 
     if "file" not in request.files:
         return _error("No file uploaded")
@@ -308,9 +392,9 @@ def upload_csv_mapped(dataset_id):
 @dataset_bp.route("/datasets/<int:dataset_id>/upload", methods=["POST"])
 def upload_csv_simple(dataset_id):
     """Simple CSV upload (no column mapping)."""
-    ds = Dataset.query.get(dataset_id)
-    if not ds:
-        return _error("Dataset not found", 404)
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
 
     if "file" not in request.files:
         return _error("No file uploaded")
@@ -414,9 +498,9 @@ def sheets_preview():
 
 @dataset_bp.route("/datasets/<int:dataset_id>/import-sheets", methods=["POST"])
 def import_sheets(dataset_id):
-    ds = Dataset.query.get(dataset_id)
-    if not ds:
-        return _error("Dataset not found", 404)
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
 
     body = request.get_json(silent=True) or {}
     sheet_url = body.get("sheet_url", "")
@@ -470,9 +554,9 @@ def import_sheets(dataset_id):
 @dataset_bp.route("/datasets/<int:dataset_id>/sync-sheets", methods=["POST"])
 def sync_sheets(dataset_id):
     """Re-import from the same Google Sheet URL stored in source_config."""
-    ds = Dataset.query.get(dataset_id)
-    if not ds:
-        return _error("Dataset not found", 404)
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
     if ds.source_type != "google_sheets" or not ds.source_config:
         return _error("Dataset is not a Google Sheets source")
 
@@ -538,6 +622,11 @@ def crm_preview():
 
     if not ws_id:
         return _error("workspace_id is required")
+
+    # Fail CLOSED: the caller must own the workspace they are previewing.
+    ws_id, err = _resolve_owned_workspace_id(ws_id)
+    if err:
+        return err
 
     if source == "whatsapp_contacts":
         return _preview_whatsapp_contacts(ws_id)
@@ -708,18 +797,18 @@ def _preview_sociovia_from_db(source, workspace_id):
 @dataset_bp.route("/datasets/<int:dataset_id>/import-crm", methods=["POST"])
 def import_crm(dataset_id):
     """Import data from internal CRM (WhatsApp contacts or Sociovia CRM)."""
-    ds = Dataset.query.get(dataset_id)
-    if not ds:
-        return _error("Dataset not found", 404)
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
 
     body = request.get_json(silent=True) or {}
     source = body.get("source", "contacts")
-    ws_id = body.get("workspace_id")
     column_mapping = body.get("column_mapping", {})
     replace = body.get("replace", False)
 
-    if not ws_id:
-        return _error("workspace_id is required")
+    # Force the CRM query to the dataset's OWN workspace (server-derived) so a
+    # client cannot pull another tenant's contacts into their dataset.
+    ws_id = ds.workspace_id
 
     # Get preview data first
     if source == "whatsapp_contacts":
@@ -770,9 +859,9 @@ def import_crm(dataset_id):
 
 @dataset_bp.route("/datasets/<int:dataset_id>/import-hubspot", methods=["POST"])
 def import_hubspot(dataset_id):
-    ds = Dataset.query.get(dataset_id)
-    if not ds:
-        return _error("Dataset not found", 404)
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
 
     body = request.get_json(silent=True) or {}
     api_key = body.get("api_key", "").strip()
@@ -836,9 +925,9 @@ def import_hubspot(dataset_id):
 
 @dataset_bp.route("/datasets/<int:dataset_id>/import-pipedrive", methods=["POST"])
 def import_pipedrive(dataset_id):
-    ds = Dataset.query.get(dataset_id)
-    if not ds:
-        return _error("Dataset not found", 404)
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
 
     body = request.get_json(silent=True) or {}
     api_key = body.get("api_key", "").strip()
@@ -910,6 +999,7 @@ def import_sociovia(dataset_id):
     Body: { crm_url, workspace_id, data_type: "leads"|"contacts"|"deals" }
     """
     from .drip_models import WhatsAppDataset, WhatsAppDatasetRow
+    from tenant.context import get_current_user, user_owns_workspace
 
     ds = WhatsAppDataset.query.get(dataset_id)
     if not ds:
@@ -918,16 +1008,24 @@ def import_sociovia(dataset_id):
     if not ds:
         return _error("Dataset not found", 404)
 
+    # Ownership check: caller must own the dataset's workspace (fail closed).
+    _user = get_current_user()
+    if not _user:
+        return _error("authentication_required", 401)
+    if not user_owns_workspace(_user, getattr(ds, "workspace_id", None)):
+        return _error("forbidden", 403)
+
     body = request.get_json(silent=True) or {}
     crm_url = body.get("crm_url", "").strip().rstrip("/")
-    ws_id = body.get("workspace_id", "")
     data_type = body.get("data_type", "contacts")
     replace = body.get("replace", False)
 
     if not crm_url:
         return _error("crm_url is required (Sociovia backend URL)")
-    if not ws_id:
-        return _error("workspace_id is required")
+
+    # Force the CRM query to the dataset's OWN workspace (server-derived) so a
+    # client cannot pull another tenant's records into their dataset.
+    ws_id = str(ds.workspace_id)
 
     try:
         endpoint = f"{crm_url}/api/{data_type}"

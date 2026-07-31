@@ -16,8 +16,35 @@ if not _DATABASE_URI:
         "SQLALCHEMY_DATABASE_URI in your environment / .env to your PostgreSQL URL."
     )
 
+# The SECRET_KEY signs every session cookie AND every auth JWT (see auth_core). If it
+# is missing or left at a well-known dev default, anyone can forge a valid token for
+# any user/admin — a total auth bypass. So, like the DB URL above, fail fast in any
+# real (non-dev) environment instead of silently running on the guessable default.
+# Local dev (no K_SERVICE / dev env) still gets the convenience fallback.
+_KNOWN_WEAK_SECRETS = {
+    "",
+    "dev-secret-change-in-production",
+    "dev-secret-key-change-in-production",
+    "changeme",
+    "change-me",
+}
+_SECRET_KEY = (os.getenv("SECRET_KEY") or os.getenv("SESSION_SECRET") or "").strip()
+if not _SECRET_KEY or _SECRET_KEY in _KNOWN_WEAK_SECRETS:
+    try:
+        from core.deployment_safety import is_non_dev_environment
+        _is_prod = is_non_dev_environment()
+    except Exception:
+        _is_prod = False
+    if _is_prod:
+        raise RuntimeError(
+            "SECRET_KEY (or SESSION_SECRET) is not set to a strong secret. Refusing to "
+            "start in a non-dev environment because session cookies and auth JWTs would "
+            "be forgeable. Set a long random SECRET_KEY in your environment and redeploy."
+        )
+    _SECRET_KEY = _SECRET_KEY or "dev-secret-change-in-production"
+
 class Config:
-    SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-in-production")
+    SECRET_KEY = _SECRET_KEY
     SQLALCHEMY_DATABASE_URI = _DATABASE_URI
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 

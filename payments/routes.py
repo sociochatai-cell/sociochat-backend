@@ -87,7 +87,13 @@ def initiate():
     app_base = _app_base()
     if not app_base:
         return jsonify({"success": False, "error": "app_base_url_not_configured"}), 500
-    surl = f"{app_base}/api/payments/payu/return"
+    # Carry the origin the checkout started from through PayU (preserved in the
+    # surl query string) so we can return the browser to THAT origin — the tenant's
+    # own domain for white-label users — instead of the global platform host.
+    from urllib.parse import quote_plus
+    _ro = (data.get("return_origin") or "").strip()
+    _ro_q = f"?ro={quote_plus(_ro)}" if _ro.startswith(("http://", "https://")) else ""
+    surl = f"{app_base}/api/payments/payu/return{_ro_q}"
     furl = surl
 
     # ---- Resolve plan, price, payee account by layer ----
@@ -154,19 +160,56 @@ def initiate():
         user.pending_plan = slug
         user.pending_billing = billing_scope
 
+    # Recurring / auto-renew: only for user plans (not one-off tenant licenses).
+    want_recurring = bool(data.get("recurring")) and ptype == LAYER_USER_PLAN
+
     db.session.commit()
 
-    built = payu.build_payment_request(
-        cfg,
-        txnid=txnid,
-        amount_inr=price,
-        productinfo=product,
-        firstname=getattr(user, "name", "") or "Customer",
-        email=getattr(user, "email", "") or "",
-        phone=getattr(user, "phone", "") or "",
-        surl=surl,
-        furl=furl,
-    )
+    if want_recurring:
+        from datetime import datetime, timezone
+        from .mandate_service import add_billing_period, mandate_end_date
+        from .mandate_models import PayuMandate, MANDATE_PENDING
+        now = datetime.now(timezone.utc)
+        _period = getattr(row, "billing_period", None) or "monthly"
+        built = payu.build_si_registration_request(
+            cfg, txnid=txnid, amount_inr=price, productinfo=product,
+            firstname=getattr(user, "name", "") or "Customer",
+            email=getattr(user, "email", "") or "",
+            phone=getattr(user, "phone", "") or "",
+            surl=surl, furl=furl,
+            start_date=now, end_date=mandate_end_date(now),
+        )
+        try:
+            # Retire any existing live mandate for this user, then register the new one.
+            from .mandate_service import transition
+            from .mandate_models import MANDATE_ACTIVE, MANDATE_PAUSED
+            for m in PayuMandate.query.filter(
+                PayuMandate.user_id == user.id,
+                PayuMandate.status.in_([MANDATE_PENDING, MANDATE_ACTIVE, MANDATE_PAUSED]),
+            ).all():
+                m.status = "cancelled"
+            db.session.add(PayuMandate(
+                user_id=user.id, tenant_id=getattr(user, "tenant_id", None),
+                plan_slug=slug, billing_period=_period, amount=int(price),
+                currency="INR", status=MANDATE_PENDING, registration_txnid=txnid,
+                payu_mode=cfg.mode, next_charge_at=add_billing_period(now, _period),
+            ))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception("failed to create pending mandate for txn %s", txnid)
+    else:
+        built = payu.build_payment_request(
+            cfg,
+            txnid=txnid,
+            amount_inr=price,
+            productinfo=product,
+            firstname=getattr(user, "name", "") or "Customer",
+            email=getattr(user, "email", "") or "",
+            phone=getattr(user, "phone", "") or "",
+            surl=surl,
+            furl=furl,
+        )
     logger.info(
         "PayU initiate OK txnid=%s layer=%s plan=%s amount=%s mode=%s key=%s "
         "action=%s surl=%s",
@@ -229,6 +272,29 @@ def _activate_from_txn(txn: PaymentTransaction) -> None:
     txn.completed_at = now
 
 
+def _activate_mandate_if_any(txn: PaymentTransaction, posted: dict) -> None:
+    """If this successful txn registered an autopay mandate, activate it and
+    store the PayU SI reference for future recurring charges. Best-effort."""
+    try:
+        from .mandate_models import PayuMandate, MANDATE_PENDING
+        from .mandate_service import transition, MANDATE_ACTIVE
+    except Exception:
+        return
+    mandate = PayuMandate.query.filter_by(registration_txnid=txn.txnid).first()
+    if not mandate or mandate.status != MANDATE_PENDING:
+        return
+    # SI reference: explicit si_reference from the callback, else the mihpayid.
+    si_token = (posted.get("si_reference") or posted.get("mihpayid")
+                or txn.payu_payment_id or "")
+    transition(
+        mandate, MANDATE_ACTIVE,
+        si_token=str(si_token) if si_token else None,
+        payu_mode=txn.payu_mode or mandate.payu_mode,
+    )
+    logger.info("PayU autopay mandate %s ACTIVATED (txn=%s, next_charge=%s)",
+                mandate.id, txn.txnid, mandate.next_charge_at)
+
+
 def _process_payu_result(posted: dict) -> PaymentTransaction:
     """Verify a PayU callback/webhook and update the txn. Returns the txn (or
     None if the txnid is unknown)."""
@@ -269,6 +335,7 @@ def _process_payu_result(posted: dict) -> PaymentTransaction:
     if status == "success" and hash_ok and amount_ok:
         try:
             _activate_from_txn(txn)
+            _activate_mandate_if_any(txn, posted)
         except Exception:
             logger.exception("Activation failed for txn %s", txn.txnid)
             txn.status = STATUS_FAILED
@@ -298,9 +365,30 @@ def payu_return():
     fe = _frontend_base()
     txnid = (posted.get("txnid") or "").strip()
     result = "success" if (txn and txn.status == STATUS_SUCCESS) else "failed"
-    redirect_to = f"{fe}/payment/result?txnid={txnid}&status={result}"
-    logger.info("PayU /return -> redirecting to %s (txn_status=%s)",
-                redirect_to, getattr(txn, "status", None))
+
+    # Return the browser to the SAME origin the checkout started from, so the
+    # tenant's branding + session + localStorage (auth token, return path) all
+    # survive — never dump a white-label tenant's user on the platform host.
+    # Trusted origins = the platform FE and the tenant's own VERIFIED domain.
+    tenant_origin = None
+    try:
+        if txn and getattr(txn, "tenant_id", None):
+            from tenant.models import Tenant
+            t = db.session.get(Tenant, txn.tenant_id)
+            cd = (getattr(t, "custom_domain", None) or "").strip()
+            if cd and getattr(t, "domain_verified", False):
+                tenant_origin = (cd if cd.startswith(("http://", "https://")) else f"https://{cd}").rstrip("/")
+    except Exception:
+        logger.exception("payu_return: tenant origin resolution failed")
+
+    # Prefer the exact client origin (from the surl query), but only if it's an
+    # allowed origin — never open-redirect to an arbitrary host.
+    ro = (request.args.get("ro") or "").strip().rstrip("/")
+    allowed = {o for o in (fe, tenant_origin) if o}
+    base = ro if ro in allowed else (tenant_origin or fe)
+    redirect_to = f"{base}/payment/result?txnid={txnid}&status={result}"
+    logger.info("PayU /return -> redirecting to %s (txn_status=%s, ro=%s, tenant_origin=%s)",
+                redirect_to, getattr(txn, "status", None), ro, tenant_origin)
     return redirect(redirect_to, code=302)
 
 
@@ -330,3 +418,57 @@ def status(txnid):
     if txn.user_id and txn.user_id != user.id:
         return jsonify({"success": False, "error": "forbidden"}), 403
     return jsonify({"success": True, "transaction": txn.serialize()})
+
+
+# --------------------------------------------------------------------------- #
+# Autopay (recurring subscription) — user control + internal charge trigger
+# --------------------------------------------------------------------------- #
+@payments_bp.route("/autopay", methods=["GET"])
+def autopay_status():
+    """Current user's live auto-renew mandate (or none)."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "authentication_required"}), 401
+    from .mandate_models import PayuMandate, MANDATE_PENDING, MANDATE_ACTIVE, MANDATE_PAUSED
+    m = (PayuMandate.query
+         .filter(PayuMandate.user_id == user.id,
+                 PayuMandate.status.in_([MANDATE_PENDING, MANDATE_ACTIVE, MANDATE_PAUSED]))
+         .order_by(PayuMandate.id.desc()).first())
+    return jsonify({"success": True, "autopay": m.serialize() if m else None})
+
+
+@payments_bp.route("/autopay/cancel", methods=["POST"])
+def autopay_cancel():
+    """User cancels auto-renew. Local cancel is authoritative — WE initiate every
+    debit, so a cancelled mandate is never charged again regardless of PayU state.
+    The current paid period is NOT refunded; access remains until it expires."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "authentication_required"}), 401
+    from .mandate_models import PayuMandate, MANDATE_PENDING, MANDATE_ACTIVE, MANDATE_PAUSED, MANDATE_CANCELLED
+    from .mandate_service import transition
+    live = (PayuMandate.query
+            .filter(PayuMandate.user_id == user.id,
+                    PayuMandate.status.in_([MANDATE_PENDING, MANDATE_ACTIVE, MANDATE_PAUSED]))
+            .all())
+    if not live:
+        return jsonify({"success": True, "message": "No active auto-renew to cancel."})
+    for m in live:
+        transition(m, MANDATE_CANCELLED, next_charge_at=None)
+    db.session.commit()
+    return jsonify({"success": True, "message": "Auto-renew cancelled."})
+
+
+@payments_bp.route("/autopay/run", methods=["POST"])
+def autopay_run():
+    """Internal trigger for the recurring charge sweep (external cron / manual).
+    Protected by the internal-jobs secret (same as other /api/internal jobs)."""
+    import os
+    secret = (os.getenv("INTERNAL_JOB_SECRET") or os.getenv("INTERNAL_API_SECRET") or "").strip()
+    auth = (request.headers.get("Authorization") or "").strip()
+    if not secret or auth != f"Bearer {secret}":
+        return jsonify({"success": False, "error": "forbidden"}), 403
+    from .autopay_jobs import run_due_autopay_charges, run_due_autopay_notifications
+    notified = run_due_autopay_notifications()
+    charged = run_due_autopay_charges()
+    return jsonify({"success": True, "notified": notified, "charged": charged})

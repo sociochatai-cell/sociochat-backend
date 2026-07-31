@@ -37,31 +37,40 @@ def _get_activity_model():
 
 
 def _get_request_user_id():
-    """
-    Try to determine user_id from:
-      1) Flask session["user_id"]
-      2) Authorization: Bearer <id>
-      3) X-User-Id header
-    """
-    uid = session.get("user_id")
-    if uid:
-        try:
-            return int(uid)
-        except Exception:
-            return uid
+    """Resolve the user id from the server session or a SIGNED Bearer JWT only.
 
-    auth = request.headers.get("Authorization", "")
-    if auth and auth.lower().startswith("bearer "):
-        token_part = auth.split(None, 1)[1]
-        if token_part.isdigit():
-            return int(token_part)
+    Forgeable plaintext ``Bearer <digits>`` / ``X-User-Id`` paths removed — any
+    caller could previously impersonate any user id. Identity now goes through
+    auth_core, consistent with the rest of the app.
+    """
+    from auth_core import authenticated_user_id
+    return authenticated_user_id()
 
-    xuid = request.headers.get("X-User-Id")
-    if xuid:
-        try:
-            return int(xuid)
-        except Exception:
-            return xuid
+
+def _require_owned_workspace(requested_workspace_id=None):
+    """Resolve + verify the caller owns a workspace (fail CLOSED).
+
+    Returns (workspace, None) on success or (None, (response, status)) so callers
+    can ``return err``. Lazy import of tenant.context avoids circular imports.
+    """
+    from tenant.context import get_current_user, resolve_owned_workspace
+    user = get_current_user()
+    if not user:
+        return None, (jsonify({"success": False, "error": "authentication_required"}), 401)
+    return resolve_owned_workspace(user, requested_workspace_id)
+
+
+def _authorize_row(row):
+    """Verify the authenticated caller owns the workspace this CRM row belongs to.
+
+    Returns None when authorized, else an (response, status) tuple. Fails CLOSED.
+    """
+    from tenant.context import get_current_user, user_owns_workspace
+    user = get_current_user()
+    if not user:
+        return (jsonify({"success": False, "error": "authentication_required"}), 401)
+    if not user_owns_workspace(user, getattr(row, "workspace_id", None)):
+        return (jsonify({"success": False, "error": "forbidden"}), 403)
     return None
 
 
@@ -135,10 +144,17 @@ def tasks_handler():
         workspace_id = request.args.get("workspace_id")
         user_id = request.args.get("user_id")
 
+        # SECURITY: resolve + verify the caller owns the workspace and ALWAYS
+        # scope to it. Was fail-OPEN: with no workspace_id it returned every
+        # tenant's tasks.
+        ws, err = _require_owned_workspace(workspace_id)
+        if err:
+            return err
+        workspace_id = ws.id
+
         q = db.session.query(Task)
 
-        # 🔧 workspace_id is TEXT in DB → compare as string, no int() cast
-        if workspace_id is not None and "workspace_id" in colnames:
+        if "workspace_id" in colnames:
             q = q.filter(getattr(Task, "workspace_id") == workspace_id)
 
         # user_id can still be int if the column is int
@@ -201,8 +217,11 @@ def tasks_handler():
     if "workspace_id" in colnames:
         if not workspace_id_param:
             return jsonify({"error": "workspace_id query param required"}), 400
-        # 🔧 keep as string; DB column is TEXT
-        ws_val = workspace_id_param
+        # SECURITY: verify the caller owns the workspace they're writing into.
+        ws, err = _require_owned_workspace(workspace_id_param)
+        if err:
+            return err
+        ws_val = ws.id
 
     # user_id: optional if column doesn't exist, otherwise require query or session/header
     user_id_param = request.args.get("user_id")
@@ -322,6 +341,11 @@ def complete_task(task_id):
     if not t:
         return jsonify({"error": "not found"}), 404
 
+    # SECURITY (IDOR): verify the caller owns this task's workspace.
+    auth_err = _authorize_row(t)
+    if auth_err:
+        return auth_err
+
     payload = request.get_json(silent=True) or {}
     completed_val = payload.get("completed", True)
 
@@ -380,10 +404,19 @@ def bulk_complete():
     if not ids:
         return jsonify({"error": "task_ids required"}), 400
 
+    # SECURITY (IDOR): only mutate tasks in a workspace the caller owns.
+    from tenant.context import get_current_user, user_owns_workspace
+    _user = get_current_user()
+    if not _user:
+        return jsonify({"success": False, "error": "authentication_required"}), 401
+
     try:
         q = db.session.query(Task).filter(Task.id.in_(ids))
         updated = 0
         for t in q.all():
+            # Skip any task whose workspace the caller does not own.
+            if not user_owns_workspace(_user, getattr(t, "workspace_id", None)):
+                continue
             if "completed" in _model_columns(Task):
                 setattr(t, "completed", bool(completed_val))
             if completed_val and "completed_at" in _model_columns(Task):
@@ -430,6 +463,11 @@ def snooze_task(task_id):
     if not t:
         return jsonify({"error": "not found"}), 404
 
+    # SECURITY (IDOR): verify the caller owns this task's workspace.
+    auth_err = _authorize_row(t)
+    if auth_err:
+        return auth_err
+
     payload = request.get_json(silent=True) or {}
     days = int(payload.get("days", 1))
     if "due_date" not in _model_columns(Task):
@@ -475,6 +513,11 @@ def reassign_task(task_id):
     if not t:
         return jsonify({"error": "not found"}), 404
 
+    # SECURITY (IDOR): verify the caller owns this task's workspace.
+    auth_err = _authorize_row(t)
+    if auth_err:
+        return auth_err
+
     payload = request.get_json(silent=True) or {}
     new_user = payload.get("user_id")
     if new_user is None:
@@ -519,6 +562,11 @@ def task_detail(task_id):
     t = db.session.get(Task, task_id)
     if not t:
         return jsonify({"error": "not found"}), 404
+
+    # SECURITY (IDOR): verify the caller owns this task's workspace before any op.
+    auth_err = _authorize_row(t)
+    if auth_err:
+        return auth_err
 
     # ---------- GET /tasks/<task_id> ----------
     if request.method == "GET":
@@ -589,6 +637,13 @@ def search_tasks():
 
     workspace_id = request.args.get("workspace_id")
     limit = int(request.args.get("limit", 20))
+
+    # SECURITY: resolve + verify the caller owns the workspace and ALWAYS scope
+    # the search to it (was fail-OPEN when workspace_id was omitted).
+    ws, err = _require_owned_workspace(workspace_id)
+    if err:
+        return err
+    workspace_id = ws.id
 
     filters = []
     if "title" in colnames:

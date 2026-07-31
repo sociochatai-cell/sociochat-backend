@@ -40,13 +40,38 @@ DEFAULT_BRANDING = {
     "corner_radius": "",         # "" | none | small | medium | large | xl
     "support_email": "support@sociochat.ai",
     "login_background": "linear-gradient(135deg, #0a6847 0%, #128C7E 50%, #25D366 100%)",
-    # Landing-page hero fields. Default "" so the frontend supplies the visible
-    # fallback copy; a tenant override (text/URL) takes precedence when set.
+    # Landing-page hero. `landing_video_url` is DEPRECATED (the landing page is now
+    # fully image-based) and kept only so old saved values don't error; it is not
+    # rendered. Defaults below ship the shared SocioChat/Sociovia content — a tenant
+    # (super-admin only) override takes precedence per field.
     "landing_video_url": "",
-    "landing_image_url": "",
-    "landing_headline": "",
-    "landing_subheadline": "",
-    "landing_cta_text": "",
+    "landing_image_url": "/landing/hero.png",
+    "landing_headline": "Automate your WhatsApp. Multiply your sales.",
+    "landing_subheadline": "Stop drowning in manual replies. Automate conversations, send personalized broadcasts, and turn every chat into revenue — all on the official WhatsApp Business API.",
+    "landing_cta_text": "Ready to grow on WhatsApp?",
+    # Landing feature sections (7). Each has a title / description / image. Blank =
+    # fall back to these shared defaults (merge_branding handles per-field fallback).
+    "landing_feature1_title": "WhatsApp Broadcast Messaging",
+    "landing_feature1_desc": "Send one personalized message to thousands at once — no group chats, delivered privately to every recipient at 90%+ open rates.",
+    "landing_feature1_image": "/landing/feature-1-broadcast.png",
+    "landing_feature2_title": "WhatsApp Lead Alerts",
+    "landing_feature2_desc": "Get an instant WhatsApp alert the moment a new lead arrives — name, phone, source and interest included — so your team replies within minutes.",
+    "landing_feature2_image": "/landing/feature-2-lead-alerts.png",
+    "landing_feature3_title": "CRM with Kanban View",
+    "landing_feature3_desc": "See your whole sales pipeline on a drag-and-drop board. Move deals from New Lead to Closed Won and spot bottlenecks in seconds.",
+    "landing_feature3_image": "/landing/feature-3-crm-kanban.png",
+    "landing_feature4_title": "WhatsApp Drip Messaging",
+    "landing_feature4_desc": "Automated message sequences that nurture leads, recover carts and close sales 24/7 — running on autopilot at a 98% open rate.",
+    "landing_feature4_image": "/landing/feature-4-drip.png",
+    "landing_feature5_title": "WhatsApp API Triggers",
+    "landing_feature5_desc": "Fire the right message on every event — order placed, payment failed, appointment due — automatically, in under three seconds.",
+    "landing_feature5_image": "/landing/feature-5-api-triggers.png",
+    "landing_feature6_title": "Interactive Flows",
+    "landing_feature6_desc": "Guided, multi-step conversations with buttons and menus right inside the chat — instant replies that qualify leads and resolve queries 24/7.",
+    "landing_feature6_image": "/landing/feature-6-interactive-flows.png",
+    "landing_feature7_title": "WhatsApp AI Chatbot",
+    "landing_feature7_desc": "An AI chatbot trained on your products and brand voice — handles hundreds of conversations at once and escalates to a human only when needed.",
+    "landing_feature7_image": "/landing/feature-7-ai-chatbot.png",
 }
 
 # Keys that are part of the public branding payload the frontend themes from.

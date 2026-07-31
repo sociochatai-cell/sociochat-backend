@@ -67,6 +67,19 @@ def _get_db_and_campaign_model():
     return db, Campaign
 
 
+def _require_owned_workspace(requested_workspace_id=None):
+    """Resolve + verify the caller owns a workspace (fail CLOSED).
+
+    Returns (workspace, None) on success or (None, (response, status)) so callers
+    can ``return err``. Lazy import of tenant.context avoids circular imports.
+    """
+    from tenant.context import get_current_user, resolve_owned_workspace
+    user = get_current_user()
+    if not user:
+        return None, (jsonify({"success": False, "error": "authentication_required"}), 401)
+    return resolve_owned_workspace(user, requested_workspace_id)
+
+
 def _apply_workspace_and_user_filters(query, Campaign, workspace_id: Optional[str], user_id: Optional[str]):
     try:
         if workspace_id is not None and hasattr(Campaign, "workspace_id"):
@@ -145,6 +158,19 @@ def _get_fb_account_for_workspace_user(workspace_id: str, user_id: str) -> Optio
         current_app.logger.debug(
             "_get_fb_account_for_workspace_user called without workspace_id (%s)",
             workspace_id,
+        )
+        return None
+
+    # SECURITY (IDOR): the FB access token / ad account is workspace-scoped. Only
+    # return it when the AUTHENTICATED caller owns the requested workspace —
+    # otherwise any caller could pull another tenant's Meta token by passing its
+    # workspace_id. Callers already treat None as "no account" (HTTP 400).
+    from tenant.context import get_current_user, user_owns_workspace
+    _user = get_current_user()
+    if not _user or not user_owns_workspace(_user, workspace_id):
+        current_app.logger.warning(
+            "cross_workspace_fb_account_denied user=%s requested_ws=%s",
+            getattr(_user, "id", None), workspace_id,
         )
         return None
 
@@ -473,6 +499,13 @@ def list_campaigns():
     workspace_id = request.args.get("workspace_id")
     user_id = request.args.get("user_id")
 
+    # SECURITY: resolve + verify the caller owns the workspace and ALWAYS scope
+    # to it. Was fail-OPEN: with no workspace_id every tenant's campaigns leaked.
+    ws, err = _require_owned_workspace(workspace_id)
+    if err:
+        return err
+    workspace_id = ws.id
+
     try:
         db, Campaign = _get_db_and_campaign_model()
     except RuntimeError as e:
@@ -560,6 +593,12 @@ def list_campaigns():
 def get_campaign(campaign_id: str):
     workspace_id = request.args.get("workspace_id")
     user_id = request.args.get("user_id")
+
+    # SECURITY: verify workspace ownership and scope the lookup to it.
+    ws, err = _require_owned_workspace(workspace_id)
+    if err:
+        return err
+    workspace_id = ws.id
 
     try:
         db, Campaign = _get_db_and_campaign_model()
@@ -670,6 +709,12 @@ def create_campaign():
     user_id = request.args.get("user_id")
     data = request.get_json(silent=True) or {}
 
+    # SECURITY: verify the caller owns the workspace they're writing into.
+    ws, err = _require_owned_workspace(workspace_id)
+    if err:
+        return err
+    workspace_id = ws.id
+
     try:
         db, Campaign = _get_db_and_campaign_model()
     except RuntimeError as e:
@@ -714,6 +759,12 @@ def update_campaign(campaign_id: str):
     workspace_id = request.args.get("workspace_id")
     user_id = request.args.get("user_id")
     data = request.get_json(silent=True) or {}
+
+    # SECURITY: verify workspace ownership before any local update OR Meta proxy.
+    ws, err = _require_owned_workspace(workspace_id)
+    if err:
+        return err
+    workspace_id = ws.id
 
     try:
         db, Campaign = _get_db_and_campaign_model()
@@ -803,6 +854,12 @@ def delete_campaign(campaign_id: str):
     workspace_id = request.args.get("workspace_id")
     user_id = request.args.get("user_id")
 
+    # SECURITY: verify workspace ownership and scope the lookup/delete to it.
+    ws, err = _require_owned_workspace(workspace_id)
+    if err:
+        return err
+    workspace_id = ws.id
+
     try:
         db, Campaign = _get_db_and_campaign_model()
     except RuntimeError as e:
@@ -835,6 +892,12 @@ def delete_campaign(campaign_id: str):
 def _change_campaign_status(campaign_id: str, new_status: str):
     workspace_id = request.args.get("workspace_id")
     user_id = request.args.get("user_id")
+
+    # SECURITY: verify workspace ownership and scope the lookup to it.
+    ws, err = _require_owned_workspace(workspace_id)
+    if err:
+        return err
+    workspace_id = ws.id
 
     try:
         db, Campaign = _get_db_and_campaign_model()

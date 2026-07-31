@@ -150,6 +150,69 @@ def request_workspace_id():
 
 
 # --------------------------------------------------------------------------- #
+# WhatsApp-account ownership enforcement
+# --------------------------------------------------------------------------- #
+# A WhatsAppAccount belongs to a workspace (account.workspace_id), and a
+# workspace is owned by exactly one user. So "does this user own the workspace
+# behind this account?" is the isolation boundary for every /accounts/<id>/...
+# route. These helpers close the IDOR where routes did ``WhatsAppAccount.query
+# .get(account_id)`` with no ownership check.
+def user_owns_account(user, account) -> bool:
+    """True if ``user`` owns the workspace that ``account`` belongs to."""
+    if not user or account is None:
+        return False
+    return user_owns_workspace(user, getattr(account, "workspace_id", None))
+
+
+def resolve_owned_account(account_id):
+    """Return (account, error_response).
+
+    Loads a WhatsAppAccount by id and verifies the *authenticated* user owns its
+    workspace. Fails CLOSED: if no user is resolved -> 401; unknown id -> 404;
+    owned by someone else -> 403. On success returns (account, None).
+    """
+    user = get_current_user()
+    if not user:
+        return None, (jsonify({"success": False, "error": "authentication_required"}), 401)
+
+    from whatsapp.models import WhatsAppAccount
+
+    account = WhatsAppAccount.query.get(account_id)
+    if not account:
+        return None, (jsonify({"success": False, "error": "account_not_found"}), 404)
+
+    if not user_owns_account(user, account):
+        logger.warning(
+            "cross_account_denied user=%s account=%s owner_ws=%s",
+            user.id, account_id, getattr(account, "workspace_id", None),
+        )
+        return None, (jsonify({"success": False, "error": "forbidden_account"}), 403)
+
+    return account, None
+
+
+def require_account_owner(f):
+    """Decorator for ``/accounts/<int:account_id>/...`` routes.
+
+    Requires the authenticated user to own the account's workspace, then injects
+    ``account`` (and ``workspace_id``) into kwargs. Fails closed via
+    ``resolve_owned_account``.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        account_id = kwargs.get("account_id")
+        if not account_id:
+            return jsonify({"success": False, "error": "account_id_required"}), 400
+        account, err = resolve_owned_account(account_id)
+        if err:
+            return err
+        kwargs["account"] = account
+        kwargs.setdefault("workspace_id", account.workspace_id)
+        return f(*args, **kwargs)
+    return decorated
+
+
+# --------------------------------------------------------------------------- #
 # Role decorators
 # --------------------------------------------------------------------------- #
 def require_super_admin(f):

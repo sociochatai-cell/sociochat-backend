@@ -268,12 +268,16 @@ _PUBLIC_EXACT = {
     ("POST", "/api/sms/send-otp"), ("POST", "/api/sms/verify-otp"),
     ("POST", "/api/auth/sms/forgot/request"), ("POST", "/api/auth/sms/forgot/verify"),
     ("POST", "/api/admin/login"),
+    # Agent (sub-login) authentication — the agent's only pre-auth entrypoint.
+    ("POST", "/api/agent-auth/login"),
     # Public catalog / branding (loaded before login)
     ("GET", "/api/subscription/plans"),
     ("GET", "/api/tenant/by-domain"), ("GET", "/api/tenant/domain-allowed"),
     # Payment provider callbacks (verified by signed hash inside the handler)
     ("POST", "/api/payments/payu/return"), ("GET", "/api/payments/payu/return"),
     ("POST", "/api/payments/payu/webhook"),
+    # In-chat commerce PayU callback (reverse-hash verified inside the handler)
+    ("POST", "/api/whatsapp/commerce/payu/callback"), ("GET", "/api/whatsapp/commerce/payu/callback"),
     # Meta WhatsApp webhook (hub.verify_token / HMAC verified inside the handler)
     ("GET", "/api/whatsapp/webhook"), ("POST", "/api/whatsapp/webhook"),
     # External CRM lead webhooks (each verifies its own per-workspace X-Webhook-Key)
@@ -283,6 +287,8 @@ _PUBLIC_EXACT = {
     ("GET", "/api/webhook/meta/leadgen"), ("POST", "/api/webhook/meta/leadgen"),
     # Public click-tracking write (anonymous visitor clicks)
     ("POST", "/api/v1/tracking/click-to-chat"),
+    # Facebook Ads OAuth callback (identity carried in signed `state`)
+    ("GET", "/api/ctwa/oauth/callback"),
 }
 # Public path PREFIXES (families that protect themselves or are public by design).
 _PUBLIC_PREFIXES = (
@@ -290,6 +296,7 @@ _PUBLIC_PREFIXES = (
     "/api/webhook/provider/",          # keyed CRM provider webhooks
     "/api/internal/",                  # scheduler + usage events (own secret token)
     "/api/whatsapp/flows/endpoint",    # Meta-signed WhatsApp Flow data endpoint
+    "/api/whatsapp/commerce/pay/",     # customer-facing PayU redirect page (opens the link)
 )
 # Sensitive routes that sit under a public prefix / shared dynamic path — force auth.
 _FORCE_AUTH_EXACT = {
@@ -327,6 +334,18 @@ def _require_authentication():
     if authenticated_user_id() is not None or authenticated_admin_id() is not None:
         return
     return jsonify({"success": False, "error": "authentication_required"}), 401
+
+
+# ---------- Agent (sub-login) restriction gate ----------
+# Runs only for requests carrying a valid AGENT token. Blocks disabled agents,
+# owner-only families, and access to non-assigned workspaces (Level 2). Normal
+# users / admins / anonymous fall straight through. See agent_auth/gate.py.
+from agent_auth import enforce_agent_restrictions as _enforce_agent_restrictions
+
+
+@app.before_request
+def _enforce_agent_restrictions_hook():
+    return _enforce_agent_restrictions()
 
 
 # Register Auth Blueprint
@@ -368,6 +387,14 @@ app.register_blueprint(catalog_bp, url_prefix="/api/whatsapp")
 app.register_blueprint(tracking_bp)
 app.register_blueprint(tracking_redirect_bp)
 app.register_blueprint(scheduler_bp, url_prefix="/api/internal/scheduler")
+
+# Commerce payments (PayU) — per-business in-chat payment (SocioChat-only, removable)
+from whatsapp.commerce_pay import commerce_pay_bp
+app.register_blueprint(commerce_pay_bp)
+
+# CTWA + WhatsApp Status Ads (Meta Marketing API bridge)
+from ctwa.routes import ctwa_bp
+app.register_blueprint(ctwa_bp)
 app.register_blueprint(usage_events_internal_bp, url_prefix="/api/internal/whatsapp")
 
 # Source full-parity feature blueprints: warmup, onboarding, lead-growth, verification,
@@ -454,6 +481,13 @@ except Exception as e:
 from agent_backend import agent_bp
 app.register_blueprint(agent_bp)
 
+# Agent sub-login auth + management (distinct from the AI agent_bp above)
+from agent_auth import agent_auth_bp, agent_admin_bp, assignment_bp, agent_superadmin_bp
+app.register_blueprint(agent_auth_bp)
+app.register_blueprint(agent_admin_bp)
+app.register_blueprint(assignment_bp)
+app.register_blueprint(agent_superadmin_bp)
+
 
 with app.app_context():
     # Ensure link tracking + subscription tables exist
@@ -465,10 +499,45 @@ with app.app_context():
     import tenant.integration  # noqa: F401  (register tenant_integration table)
     import tenant.sms_otp  # noqa: F401  (register phone_otps table)
     import payments.models  # noqa: F401  (register payment_transactions table)
+    import payments.mandate_models  # noqa: F401  (register payu_mandates + charges tables)
     from whatsapp import dataset_models  # noqa: F401
     from whatsapp import flow_os_models  # noqa: F401
+    from agent_backend import session_models  # noqa: F401  (register agent_sessions table)
+    import agent_auth.models  # noqa: F401  (register workspace_agents + agent_workspaces tables)
+    import whatsapp.commerce_pay.models  # noqa: F401  (register workspace_payment_configs)
+    import ctwa.models  # noqa: F401  (register ctwa_campaigns table)
 
     db.create_all()
+
+    # commerce_pay self-heal (SocioChat-only payments; removable)
+    try:
+        from whatsapp.commerce_pay import ensure_commerce_pay_schema
+        ensure_commerce_pay_schema(db.engine)
+    except Exception as e:
+        logger.warning(f"commerce_pay schema patch skipped: {e}")
+
+    # PayU autopay (recurring subscription) mandate tables self-heal
+    try:
+        from payments.mandate_schema import ensure_mandate_schema
+        ensure_mandate_schema(db.engine)
+    except Exception as e:
+        logger.warning(f"payu mandate schema patch skipped: {e}")
+
+    # ctwa self-heal: add newly-introduced columns (e.g. create_leads) to an
+    # already-provisioned ctwa_campaigns table that create_all() can't ALTER.
+    try:
+        from ctwa.models import ensure_ctwa_schema
+        ensure_ctwa_schema(db.engine)
+    except Exception as e:
+        logger.warning(f"ctwa schema patch skipped: {e}")
+
+    # agent_auth self-heal: create_all() won't ALTER existing agent tables, so add
+    # the Level-3 columns/tables (inbox_scope, auto_assign, assignments) if missing.
+    try:
+        from agent_auth.schema_patch import ensure_agent_auth_schema
+        ensure_agent_auth_schema(db.engine)
+    except Exception as e:
+        logger.warning(f"agent_auth schema patch skipped: {e}")
 
     # WhatsApp schema patch: add new ORM columns to EXISTING whatsapp_accounts (+ operational
     # tables) that create_all() cannot add on an already-provisioned (prod) DB. Idempotent;
@@ -554,7 +623,12 @@ with app.app_context():
     try:
         ensure_default_admin()
         from subscription.seed import seed_subscription_catalog
-        seed_subscription_catalog()
+        # Set SEED_FORCE_ACCESS=1 for ONE release to re-apply the plan feature/limit
+        # matrix onto existing plans (e.g. a pricing/gating change), then remove it —
+        # normal boots leave admin portal edits untouched.
+        import os as _os
+        _force_seed = _os.getenv("SEED_FORCE_ACCESS", "").strip().lower() in ("1", "true", "yes")
+        seed_subscription_catalog(force_access=_force_seed)
     except Exception as e:
         logger.warning(f"Admin/subscription seed skipped: {e}")
 
@@ -592,13 +666,38 @@ with app.app_context():
     except Exception as e:
         logger.warning(f"CRM blueprint registration skipped: {e}")
 
-    # Start APScheduler for drip/bulk campaign jobs
-    try:
-        from whatsapp.scheduler import init_scheduler
-        init_scheduler(app)
-        logger.info("WhatsApp APScheduler initialized")
-    except Exception as e:
-        logger.warning(f"APScheduler init skipped: {e}")
+    # In-process APScheduler: OFF by default in production. Cloud Run runs several
+    # gunicorn workers AND a separate worker process, each of which would start its
+    # own scheduler against the shared jobstore -> the periodic tick and every job
+    # double-fire (duplicate campaign sends / booking reminders). In production the
+    # periodic sweep is driven by GCP Cloud Scheduler -> POST
+    # /api/internal/scheduler/tick (which now also fires due booking reminders).
+    # Set RUN_INPROCESS_SCHEDULER=1 to force it on (e.g. one dedicated process);
+    # it defaults ON only in a dev environment.
+    def _run_inprocess_scheduler() -> bool:
+        raw = (os.getenv("RUN_INPROCESS_SCHEDULER") or "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+        try:
+            from core.deployment_safety import is_non_dev_environment
+            return not is_non_dev_environment()
+        except Exception:
+            return False
+
+    if _run_inprocess_scheduler():
+        try:
+            from whatsapp.scheduler import init_scheduler
+            init_scheduler(app)
+            logger.info("WhatsApp APScheduler initialized (in-process)")
+        except Exception as e:
+            logger.warning(f"APScheduler init skipped: {e}")
+    else:
+        logger.info(
+            "In-process APScheduler disabled — periodic work is driven by Cloud "
+            "Scheduler -> POST /api/internal/scheduler/tick."
+        )
 
     # Initialize notification engine
     try:
@@ -676,18 +775,70 @@ def api_me():
 
 @app.route("/api/workspaces", methods=["GET"])
 def api_workspaces():
-    """List workspaces for the authenticated user."""
+    """List workspaces for the authenticated user.
+
+    Returns each workspace's related info (business details + WhatsApp
+    connection status) so the Manage page can display it. The lightweight
+    id/name/business_name fields are preserved for the header switcher.
+    """
     user = get_current_user()
     if not user:
         return jsonify({"success": False, "error": "Not authenticated"}), 401
 
     workspaces = Workspace.query.filter_by(user_id=user.id).all()
+
+    # Agent principals only ever see the workspaces they are assigned to (Level 2).
+    from auth_core import authenticated_agent_id
+    if authenticated_agent_id() is not None:
+        from agent_auth.security import get_current_agent
+        _agent = get_current_agent()
+        _allowed = set(_agent.get_allowed_workspace_ids()) if _agent else set()
+        workspaces = [ws for ws in workspaces if ws.id in _allowed]
+
+    # Map workspace_id -> active WhatsApp account (if any) in one query so we
+    # can surface a "connected" badge without N+1 lookups. workspace_id is a
+    # String column on WhatsAppAccount, so compare against str(ws.id).
+    wa_by_ws = {}
+    try:
+        from whatsapp.models import WhatsAppAccount
+        ws_ids = [str(ws.id) for ws in workspaces]
+        if ws_ids:
+            accounts = WhatsAppAccount.query.filter(
+                WhatsAppAccount.workspace_id.in_(ws_ids),
+                WhatsAppAccount.is_active == True,  # noqa: E712
+            ).all()
+            for acc in accounts:
+                # Keep the first active account per workspace.
+                wa_by_ws.setdefault(str(acc.workspace_id), acc)
+    except Exception:
+        # WhatsApp status is best-effort; never fail the whole list on it.
+        wa_by_ws = {}
+
+    def serialize(ws):
+        wa = wa_by_ws.get(str(ws.id))
+        return {
+            "id": ws.id,
+            "name": ws.business_name or f"Workspace {ws.id}",
+            "business_name": ws.business_name,
+            "business_type": ws.business_type,
+            "industry": ws.industry,
+            "city": ws.city,
+            "country": ws.country,
+            "website": ws.website,
+            "description": ws.description,
+            "logo_path": ws.logo_path,
+            "created_at": ws.created_at.isoformat() if ws.created_at else None,
+            "whatsapp": {
+                "connected": bool(wa),
+                "phone_number": wa.display_phone_number if wa else None,
+                "verified_name": (wa.custom_name or wa.verified_name) if wa else None,
+                "quality_score": wa.quality_score if wa else None,
+            },
+        }
+
     return jsonify({
         "success": True,
-        "workspaces": [
-            {"id": ws.id, "name": ws.business_name or f"Workspace {ws.id}", "business_name": ws.business_name}
-            for ws in workspaces
-        ]
+        "workspaces": [serialize(ws) for ws in workspaces],
     })
 
 
@@ -753,6 +904,15 @@ def create_workspace():
     db.session.add(workspace)
     db.session.commit()
 
+    # Phase-2 cross-app sync: mirror this new workspace into Sociovia for linked
+    # users. No-op unless SOCIOVIA_WORKSPACE_SYNC_ENABLED=1 and the user is linked.
+    # Failure-isolated so a sync problem can never break workspace creation.
+    try:
+        from sociovia_sync import mirror_workspace_to_sociovia
+        mirror_workspace_to_sociovia(user.id, workspace.id, workspace.business_name)
+    except Exception:
+        pass
+
     return jsonify({
         "success": True,
         "workspace": {
@@ -797,6 +957,14 @@ def delete_workspace(workspace_id):
             "error": "workspace_delete_failed",
             "message": "Could not delete this workspace; it may still have linked data.",
         }), 409
+
+    # Phase-2 cross-app sync: mirror the deletion into Sociovia for linked
+    # workspaces (no-op unless enabled + previously mirrored). Failure-isolated.
+    try:
+        from sociovia_sync import mirror_workspace_delete_to_sociovia
+        mirror_workspace_delete_to_sociovia(workspace_id)
+    except Exception:
+        pass
 
     return jsonify({"success": True})
 

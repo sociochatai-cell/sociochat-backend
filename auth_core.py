@@ -77,6 +77,25 @@ def create_admin_token(admin_id, email=None) -> str:
     return jwt.encode(payload, _signing_secret(), algorithm=JWT_ALG)
 
 
+def create_agent_token(agent_id, owner_user_id, tenant_id=None) -> str:
+    """Signed JWT proving an AGENT (restricted sub-login) identity.
+
+    Carries `typ='agent'` + `agent_id`, and `owner_user_id` so the agent resolves
+    to its owner account for existing data-ownership checks. Agent-specific
+    narrowing (allowed workspaces/features) is enforced separately at the
+    before_request agent gate — never inferred from this token alone.
+    """
+    payload = {
+        "typ": "agent",
+        "agent_id": int(agent_id),
+        "owner_user_id": int(owner_user_id),
+        "tenant_id": int(tenant_id) if tenant_id is not None else None,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS),
+        "iat": datetime.now(timezone.utc),
+    }
+    return jwt.encode(payload, _signing_secret(), algorithm=JWT_ALG)
+
+
 def _verified_bearer_payload():
     """Return the payload of a SIGNATURE-VERIFIED Bearer JWT, or None.
 
@@ -115,7 +134,11 @@ def authenticated_user_id():
     if uid is None:
         payload = _verified_bearer_payload()
         if payload is not None:
-            uid = payload.get("user_id") or payload.get("uid") or payload.get("sub")
+            if payload.get("typ") == "agent":
+                # An agent acts on behalf of its owner account for ownership checks.
+                uid = payload.get("owner_user_id")
+            else:
+                uid = payload.get("user_id") or payload.get("uid") or payload.get("sub")
     return _coerce_int(uid)
 
 
@@ -128,3 +151,28 @@ def authenticated_admin_id():
         if payload is not None and (payload.get("is_admin") or payload.get("admin_id") is not None):
             aid = payload.get("admin_id")
     return _coerce_int(aid)
+
+
+def authenticated_agent_id():
+    """Resolve workspace_agents.id from a SIGNED agent-token (typ='agent').
+
+    None if the request is not a proven agent. Agents authenticate ONLY via the
+    Bearer token (no server session) — the SPA stores it under its own key.
+    """
+    payload = _verified_bearer_payload()
+    if payload is not None and payload.get("typ") == "agent":
+        return _coerce_int(payload.get("agent_id"))
+    return None
+
+
+def authenticated_agent_context():
+    """Return (agent_id, owner_user_id, tenant_id) for an agent request, or
+    (None, None, None). Convenience for the agent gate + profile endpoint."""
+    payload = _verified_bearer_payload()
+    if payload is not None and payload.get("typ") == "agent":
+        return (
+            _coerce_int(payload.get("agent_id")),
+            _coerce_int(payload.get("owner_user_id")),
+            _coerce_int(payload.get("tenant_id")),
+        )
+    return (None, None, None)

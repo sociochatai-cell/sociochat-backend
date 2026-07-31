@@ -595,6 +595,7 @@ class ConversationService:
         status: Optional[str] = None,
         account_ids: Optional[List[int]] = None,
         search: Optional[str] = None,
+        allowed_phones: Optional[List[str]] = None,
     ):
         query = WhatsAppConversation.query
 
@@ -605,6 +606,11 @@ class ConversationService:
 
         if account_ids:
             query = query.filter(WhatsAppConversation.account_id.in_(account_ids))
+
+        # Level 3 (agents): narrow to the caller's visible customer phones.
+        # None = no narrowing; [] = sees nothing (in_([]) matches no rows).
+        if allowed_phones is not None:
+            query = query.filter(WhatsAppConversation.user_phone.in_(allowed_phones))
 
         if status:
             query = query.filter(WhatsAppConversation.status == status)
@@ -626,6 +632,7 @@ class ConversationService:
         status: Optional[str] = None,
         account_ids: Optional[List[int]] = None,
         search: Optional[str] = None,
+        allowed_phones: Optional[List[str]] = None,
     ) -> Dict[str, int]:
         """Count conversations per inbox filter category."""
         categories = (
@@ -644,6 +651,7 @@ class ConversationService:
                 status=status,
                 account_ids=account_ids,
                 search=search,
+                allowed_phones=allowed_phones,
             )
             q = _apply_inbox_category_filter(q, cat)
             totals[cat] = q.count()
@@ -658,6 +666,7 @@ class ConversationService:
         account_ids: Optional[List[int]] = None,
         category: Optional[str] = None,
         search: Optional[str] = None,
+        allowed_phones: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Get list of conversations, optionally filtered by inbox category."""
         query = self._base_conversation_query(
@@ -665,6 +674,7 @@ class ConversationService:
             status=status,
             account_ids=account_ids,
             search=search,
+            allowed_phones=allowed_phones,
         )
         query = _apply_inbox_category_filter(query, category)
 

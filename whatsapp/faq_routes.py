@@ -45,22 +45,21 @@ def require_account_access(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         account_id = kwargs.get("account_id")
-        
+
         if not account_id:
             return jsonify({"error": "Account ID required"}), 400
-        
-        account = WhatsAppAccount.query.get(account_id)
-        
-        if not account:
-            return jsonify({"error": "Account not found"}), 404
-        
-        workspace_id = account.workspace_id
-        
+
+        # Enforce authenticated ownership of the account's workspace (fail closed).
+        from tenant.context import resolve_owned_account
+        account, err = resolve_owned_account(account_id)
+        if err:
+            return err
+
         kwargs["account"] = account
-        kwargs["workspace_id"] = workspace_id
-        
+        kwargs["workspace_id"] = account.workspace_id
+
         return f(*args, **kwargs)
-    
+
     return decorated_function
 
 

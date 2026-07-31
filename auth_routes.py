@@ -91,6 +91,12 @@ def signup():
     else:
         tenant = Tenant.query.filter_by(tenant_code=INTERNAL_TENANT_CODE).first()
 
+    # Fail CLOSED: never create a user with a NULL tenant_id (that would sit outside
+    # every tenant's isolation). If the tenant can't be resolved (e.g. T0000 missing),
+    # reject the signup rather than orphaning the user.
+    if tenant is None and "Invalid tenant code" not in errors:
+        errors.append("Tenant could not be resolved; signup unavailable")
+
     tenant_id = tenant.id if tenant else None
 
     # Email is unique PER TENANT, so scope the duplicate check to the tenant.
@@ -283,15 +289,9 @@ def login():
 @auth_bp.route("/me", methods=["GET"])
 def me():
     """Get current authenticated user info."""
+    # Identity comes only from the session or a signed Bearer JWT (auth_core).
+    # The old X-User-Id header fallback here let anyone read any user's profile.
     user = get_current_user()
-    if not user:
-        # Fallback: check X-User-Id header
-        user_id = request.headers.get("X-User-Id")
-        if user_id:
-            try:
-                user = User.query.get(int(user_id))
-            except Exception:
-                pass
     if not user:
         return jsonify({"success": False, "error": "Not authenticated"}), 401
 
@@ -459,6 +459,55 @@ def logout():
     """Clear server-side session."""
     session.pop("user_id", None)
     return jsonify({"success": True, "message": "Logged out"}), 200
+
+
+@auth_bp.route("/exit-impersonation", methods=["POST"])
+def exit_impersonation():
+    """Universal "return to admin/owner" — re-establish the server session from
+    the (client-restored) Bearer token, for ANY impersonation realm:
+
+      * admin token (is_admin / admin_id)  →  session['admin_id'], drop user_id
+      * user token  (user_id)              →  session['user_id'],  drop admin_id
+
+    Impersonation sets session['user_id'] to the target, and auth_core resolves
+    identity from the SESSION before the Bearer token — so restoring the admin/
+    owner token on the client alone is NOT enough; this endpoint flips the session
+    back. It reads the presented token DIRECTLY (not authenticated_* helpers, which
+    would read the impersonated session first). It only switches the session to
+    match a signature-verified token the caller already holds, so it cannot
+    escalate privilege — at worst it de-escalates to whoever the token proves.
+    """
+    from auth_core import _verified_bearer_payload
+
+    payload = _verified_bearer_payload()
+    if not payload:
+        # No valid token — just drop any impersonated identity.
+        session.pop("user_id", None)
+        session.pop("admin_id", None)
+        session.modified = True
+        return jsonify({"success": True, "restored": None})
+
+    # Admin realm — but only when the token actually carries a usable admin_id.
+    # (An is_admin token with a missing/null admin_id must NOT reach int(None); it
+    # falls through to the user branch / clean clear. Mirrors authenticated_admin_id.)
+    aid = payload.get("admin_id")
+    if aid is not None:
+        session["admin_id"] = int(aid)
+        session.pop("user_id", None)
+        session.modified = True
+        return jsonify({"success": True, "restored": "admin"})
+
+    uid = payload.get("user_id") or payload.get("uid") or payload.get("sub")
+    if uid is not None:
+        session["user_id"] = int(uid)
+        session.pop("admin_id", None)
+        session.modified = True
+        return jsonify({"success": True, "restored": "user"})
+
+    session.pop("user_id", None)
+    session.pop("admin_id", None)
+    session.modified = True
+    return jsonify({"success": True, "restored": None})
 
 
 # ── Forgot Password ──

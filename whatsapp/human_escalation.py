@@ -498,6 +498,16 @@ def send_cart_notification_email_bg(
             return
 
         recipients = resolve_template_notification_emails(account)
+        # Extra commerce notification recipients (SocioChat Payments settings; removable).
+        try:
+            from whatsapp.commerce_pay.models import WorkspacePaymentConfig
+            _cfg = WorkspacePaymentConfig.query.filter_by(workspace_id=int(account.workspace_id)).first()
+            if _cfg:
+                for _e in _cfg.notify_emails_list():
+                    if _e not in recipients:
+                        recipients.append(_e)
+        except Exception as _ce:
+            logger.debug(f"[human_escalation] commerce notify_emails merge skipped: {_ce}")
         print(f"[human_escalation] cart-email resolved recipients={recipients}")
         if not recipients:
             logger.warning(f"[human_escalation] No notification email resolved for Catalog Cart on account {account_id}")

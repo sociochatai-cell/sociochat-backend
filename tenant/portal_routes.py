@@ -320,6 +320,16 @@ def reset_tenant_user_password(admin_user, user_id):
 @tenant_bp.route("/admin/users/<int:user_id>", methods=["DELETE"])
 @require_tenant_admin
 def delete_tenant_user(admin_user, user_id):
+    # Destructive action — require the admin to re-enter their OWN password.
+    from werkzeug.security import check_password_hash
+    confirm_pw = (
+        request.headers.get("X-Confirm-Password")
+        or (request.get_json(silent=True) or {}).get("password")
+        or ""
+    )
+    if not confirm_pw or not check_password_hash(admin_user.password_hash, confirm_pw):
+        return jsonify({"success": False, "error": "invalid_password"}), 403
+
     if user_id == admin_user.id:
         return jsonify({"success": False, "error": "cannot_delete_self"}), 400
     target = db.session.get(User, user_id)
@@ -378,6 +388,21 @@ def impersonate_tenant_user(admin_user, user_id):
             {"id": w.id, "business_name": w.business_name} for w in workspaces
         ],
     })
+
+
+# --------------------------------------------------------------------------- #
+# Tenant Admin — per-user usage (own tenant only)
+# --------------------------------------------------------------------------- #
+@tenant_bp.route("/admin/users/<int:user_id>/usage", methods=["GET"])
+@require_tenant_admin
+def admin_get_user_usage(admin_user, user_id):
+    """Usage/exhaustion stats for one of the admin's OWN tenant users."""
+    target = db.session.get(User, user_id)
+    if not target or target.tenant_id != admin_user.tenant_id:
+        return jsonify({"success": False, "error": "user_not_in_tenant"}), 404
+
+    from subscription.service import get_user_usage_stats
+    return jsonify({"success": True, **get_user_usage_stats(target)})
 
 
 # --------------------------------------------------------------------------- #

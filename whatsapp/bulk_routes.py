@@ -19,6 +19,59 @@ logger = logging.getLogger(__name__)
 bulk_bp = Blueprint("bulk", __name__, url_prefix="/api/whatsapp/bulk")
 
 
+def _resolve_owned_campaign(campaign_id):
+    """Load a WhatsAppDripCampaign by id and verify the authenticated user owns
+    its workspace. Returns (campaign, error_response). Fails CLOSED."""
+    from tenant.context import get_current_user, user_owns_workspace
+
+    campaign = WhatsAppDripCampaign.query.get(campaign_id)
+    if not campaign:
+        return None, (jsonify({"success": False, "error": "Campaign not found"}), 404)
+
+    user = get_current_user()
+    if not user:
+        return None, (jsonify({"success": False, "error": "authentication_required"}), 401)
+    if not user_owns_workspace(user, campaign.workspace_id):
+        return None, (jsonify({"success": False, "error": "forbidden"}), 403)
+    return campaign, None
+
+
+@bulk_bp.before_request
+def _enforce_bulk_ownership():
+    """Blueprint-wide IDOR guard. A bulk campaign belongs to a workspace. Every
+    ``/campaigns/<campaign_id>`` route must be owned by the caller; any supplied
+    account_id / workspace_id must be owned too. Fails closed."""
+    if request.method == "OPTIONS":
+        return None
+    va = request.view_args or {}
+    if va.get("campaign_id") is not None:
+        _c, err = _resolve_owned_campaign(va["campaign_id"])
+        if err:
+            return err
+        return None
+    from tenant.context import get_current_user, resolve_owned_account, user_owns_workspace
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "authentication_required"}), 401
+    if va.get("account_id") is not None:
+        _a, err = resolve_owned_account(va["account_id"])
+        if err:
+            return err
+        return None
+    body = request.get_json(silent=True) if request.is_json else None
+    body = body if isinstance(body, dict) else {}
+    account_id = request.args.get("account_id") or body.get("account_id")
+    workspace_id = request.args.get("workspace_id") or body.get("workspace_id")
+    if account_id:
+        _a, err = resolve_owned_account(account_id)
+        if err:
+            return err
+    elif workspace_id:
+        if not user_owns_workspace(user, workspace_id):
+            return jsonify({"success": False, "error": "forbidden"}), 403
+    return None
+
+
 def _safe_dt_iso(value):
     if not value:
         return None
@@ -437,12 +490,20 @@ def _recipient_matches_smart_filter(recipient, smart_filter):
 @bulk_bp.route("/campaigns", methods=["GET"])
 def list_campaigns():
     """List bulk messaging campaigns (trigger_type='manual')."""
+    from tenant.context import get_current_user, resolve_owned_workspace
+
     workspace_id = request.args.get("workspace_id")
     status = request.args.get("status")
-    
+
     if not workspace_id:
         return jsonify({"success": False, "error": "Workspace ID required"}), 400
-        
+
+    # Fail CLOSED: the caller must own the requested workspace.
+    workspace, err = resolve_owned_workspace(get_current_user(), workspace_id)
+    if err:
+        return err
+    workspace_id = str(workspace.id)
+
     query = WhatsAppDripCampaign.query.filter_by(
         workspace_id=workspace_id,
         trigger_type="manual"  # Filter for bulk campaigns
@@ -567,23 +628,18 @@ def create_campaign(account: WhatsAppAccount, workspace_id: str):
 @bulk_bp.route("/campaigns/<int:campaign_id>", methods=["GET"])
 def get_campaign(campaign_id: int):
     """Get single bulk campaign details."""
-    workspace_id = request.args.get("workspace_id")
-    
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": "Access denied"}), 403
-        
+    campaign, err = _resolve_owned_campaign(campaign_id)
+    if err:
+        return err
+
     return jsonify({"success": True, "campaign": campaign.to_dict()})
 
 @bulk_bp.route("/campaigns/<int:campaign_id>/stats", methods=["GET"])
 def get_campaign_stats(campaign_id: int):
     """Get live stats for a campaign."""
-    workspace_id = request.args.get("workspace_id")
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": "Access denied"}), 403
+    campaign, err = _resolve_owned_campaign(campaign_id)
+    if err:
+        return err
 
     try:
         # Enrollment-level stats
@@ -660,11 +716,9 @@ def get_campaign_stats(campaign_id: int):
 @bulk_bp.route("/campaigns/<int:campaign_id>/summary", methods=["GET"])
 def get_campaign_summary(campaign_id: int):
     """Return canonical recipient summary counts for campaign intelligence tabs."""
-    workspace_id = request.args.get("workspace_id")
-
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": "Access denied"}), 403
+    campaign, err = _resolve_owned_campaign(campaign_id)
+    if err:
+        return err
 
     summary, _, _ = _build_campaign_intelligence(campaign)
 
@@ -692,16 +746,15 @@ def get_campaign_summary(campaign_id: int):
 @bulk_bp.route("/campaigns/<int:campaign_id>/intelligence", methods=["GET"])
 def get_campaign_intelligence(campaign_id: int):
     """Recipient-level intelligence for all campaign segments."""
-    workspace_id = request.args.get("workspace_id")
     segment = request.args.get("segment", "all")
     smart_filter = request.args.get("smart_filter")
     search = (request.args.get("search") or "").strip().lower()
     limit = min(max(int(request.args.get("limit", 300)), 1), 1000)
     offset = max(int(request.args.get("offset", 0)), 0)
 
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": "Access denied"}), 403
+    campaign, err = _resolve_owned_campaign(campaign_id)
+    if err:
+        return err
 
     summary, recipients, _ = _build_campaign_intelligence(campaign)
     filtered = []
@@ -733,7 +786,6 @@ def get_campaign_intelligence(campaign_id: int):
 @bulk_bp.route("/campaigns/<int:campaign_id>/retarget", methods=["POST"])
 def retarget_campaign_recipients(campaign_id: int):
     """Create a new campaign from selected/segmented recipients and send immediately."""
-    workspace_id = request.args.get("workspace_id") or (request.get_json() or {}).get("workspace_id")
     payload = request.get_json() or {}
     segment = str(payload.get("segment") or "all")
     smart_filter = payload.get("smart_filter")
@@ -741,9 +793,9 @@ def retarget_campaign_recipients(campaign_id: int):
     has_explicit_selection = isinstance(explicit_phones, list) and len(explicit_phones) > 0
     send_now = bool(payload.get("send_now", True))
 
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": "Access denied"}), 403
+    campaign, err = _resolve_owned_campaign(campaign_id)
+    if err:
+        return err
 
     summary, recipients, enrollment_by_phone = _build_campaign_intelligence(campaign)
 
@@ -854,8 +906,10 @@ def retarget_campaign_recipients(campaign_id: int):
 @bulk_bp.route("/campaigns/<int:campaign_id>/failed", methods=["GET"])
 def get_campaign_failed_messages(campaign_id: int):
     """Get details of failed message deliveries for a campaign."""
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    
+    campaign, err = _resolve_owned_campaign(campaign_id)
+    if err:
+        return err
+
     # Get messages that failed delivery (webhook reported failure)
     failed_messages = db.session.query(
         WhatsAppMessage.id,
@@ -902,9 +956,11 @@ def resubscribe_campaign_webhooks(campaign_id: int):
     
     Use this to fix webhook delivery issues when status updates stop arriving.
     """
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
+    campaign, err = _resolve_owned_campaign(campaign_id)
+    if err:
+        return err
     account = WhatsAppAccount.query.get(campaign.account_id)
-    
+
     if not account:
         return jsonify({"success": False, "error": "Account not found"}), 404
     
@@ -927,13 +983,22 @@ def resubscribe_campaign_webhooks(campaign_id: int):
 @bulk_bp.route("/crm-audience", methods=["GET"])
 def get_crm_audience():
     """Fetch CRM audience (Leads or Contacts) for bulk messaging."""
+    from tenant.context import get_current_user, resolve_owned_workspace
+
     workspace_id = request.args.get("workspace_id")
     source = request.args.get("source", "leads") # leads or contacts
     search = request.args.get("search")
-    
+
     if not workspace_id:
         return jsonify({"success": False, "error": "Workspace ID required"}), 400
-        
+
+    # Fail CLOSED: the caller must own the requested workspace before we export
+    # its CRM contacts/leads.
+    workspace, err = resolve_owned_workspace(get_current_user(), workspace_id)
+    if err:
+        return err
+    workspace_id = str(workspace.id)
+
     # Access dynamic CRM models
     from flask import current_app
     crm_models = getattr(current_app, "crm_models", None)
@@ -1004,19 +1069,17 @@ def get_crm_audience():
 @rate_limit("whatsapp.bulk.recipients")
 def add_recipients(campaign_id: int):
     """Add recipients to a bulk campaign."""
-    workspace_id = request.args.get("workspace_id")
     data = request.get_json() or {}
     recipients = data.get("recipients", [])
     enable_tracking_url = bool(data.get("enable_tracking_url", True))
-    
+
     if not recipients:
         return jsonify({"success": False, "error": "No recipients provided"}), 400
-        
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": "Access denied"}), 403
-        
+
+    campaign, err = _resolve_owned_campaign(campaign_id)
+    if err:
+        return err
+
     added_count = 0
     duplicates_count = 0
     invalid_count = 0
@@ -1081,14 +1144,12 @@ def add_recipients(campaign_id: int):
 @rate_limit("whatsapp.bulk.schedule")
 def schedule_campaign(campaign_id: int):
     """Schedule or send a campaign."""
-    workspace_id = request.args.get("workspace_id") or (request.get_json() or {}).get("workspace_id")
     data = request.get_json() or {}
-    
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": f"Access denied. Campaign WS: {campaign.workspace_id}, Req WS: {workspace_id}"}), 403
-        
+
+    campaign, err = _resolve_owned_campaign(campaign_id)
+    if err:
+        return err
+
     scheduled_at_str = data.get("scheduled_at")
     
     if scheduled_at_str:
@@ -1122,13 +1183,10 @@ def schedule_campaign(campaign_id: int):
 @bulk_bp.route("/campaigns/<int:campaign_id>/pause", methods=["POST"])
 def pause_campaign(campaign_id: int):
     """Pause a running campaign."""
-    workspace_id = request.args.get("workspace_id") or (request.get_json() or {}).get("workspace_id")
-    
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": "Access denied"}), 403
-        
+    campaign, err = _resolve_owned_campaign(campaign_id)
+    if err:
+        return err
+
     if campaign.status == "running":
         campaign.status = "paused"
         db.session.commit()
@@ -1138,13 +1196,10 @@ def pause_campaign(campaign_id: int):
 @bulk_bp.route("/campaigns/<int:campaign_id>/resume", methods=["POST"])
 def resume_campaign(campaign_id: int):
     """Resume a paused campaign."""
-    workspace_id = request.args.get("workspace_id") or (request.get_json() or {}).get("workspace_id")
-    
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": "Access denied"}), 403
-        
+    campaign, err = _resolve_owned_campaign(campaign_id)
+    if err:
+        return err
+
     if campaign.status == "paused":
         campaign.status = "running"
         db.session.commit()
@@ -1154,14 +1209,12 @@ def resume_campaign(campaign_id: int):
 @bulk_bp.route("/campaigns/<int:campaign_id>", methods=["DELETE"])
 def delete_campaign(campaign_id: int):
     """Delete a campaign."""
-    workspace_id = request.args.get("workspace_id") or (request.get_json() or {}).get("workspace_id")
     force = request.args.get("force") == "true"
-    
-    campaign = WhatsAppDripCampaign.query.get_or_404(campaign_id)
-    
-    if workspace_id and str(campaign.workspace_id) != str(workspace_id):
-        return jsonify({"success": False, "error": "Access denied"}), 403
-        
+
+    campaign, err = _resolve_owned_campaign(campaign_id)
+    if err:
+        return err
+
     if campaign.status == "running" and not force:
         return jsonify({"success": False, "error": "Cannot delete running campaign. Stop it first or use force=true"}), 400
         

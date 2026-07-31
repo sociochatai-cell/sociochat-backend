@@ -48,12 +48,22 @@ def _resolve_workspace_id() -> Optional[str]:
 
 
 def _require_workspace_scope(account_workspace_id: Optional[str]) -> Optional[Tuple[dict, int]]:
-    user_workspace_id = _resolve_workspace_id()
-    if not user_workspace_id:
-        if _strict_workspace_access():
-            return {"success": False, "error": "workspace_id required (X-Workspace-ID header)"}, 401
-        return None
-    if account_workspace_id and str(account_workspace_id) != str(user_workspace_id):
+    """Return (body, status) to abort with, or None when access is allowed.
+
+    The real isolation check is OWNERSHIP: the authenticated user must own the
+    workspace the resource (account/flow) belongs to.
+
+    The previous implementation only compared the resource's workspace_id to a
+    CLIENT-SUPPLIED ``X-Workspace-ID`` — which the caller fully controls, so it
+    provided no protection (an attacker just sends the victim's workspace_id).
+    Identity now comes from the session / signed JWT via tenant.context, and a
+    missing/other-tenant workspace fails closed.
+    """
+    from tenant.context import get_current_user, user_owns_workspace
+    user = get_current_user()
+    if not user:
+        return {"success": False, "error": "authentication_required"}, 401
+    if not user_owns_workspace(user, account_workspace_id):
         return {"success": False, "error": "Access denied: resource belongs to a different workspace"}, 403
     return None
 
@@ -292,41 +302,41 @@ def check_user_workspace_access(user_id: str, workspace_id: str) -> bool:
     Returns:
         True if user has access, False otherwise
     """
-    # TODO: Implement based on your user/workspace model
-    # Example:
-    # from models import WorkspaceMember
-    # member = WorkspaceMember.query.filter_by(
-    #     user_id=user_id, 
-    #     workspace_id=workspace_id
-    # ).first()
-    # return member is not None
-    
-    # For now, allow all access (implement in production)
-    return True
+    # A workspace is owned by exactly one user (Workspace.user_id). Access ==
+    # ownership. (Previously this returned True for everyone — an allow-all stub.)
+    try:
+        from models import Workspace
+        ws = Workspace.query.filter_by(id=int(workspace_id)).first()
+        return bool(ws and str(ws.user_id) == str(user_id))
+    except (TypeError, ValueError):
+        return False
 
 
 def get_user_account_ids(user_id: str) -> List[int]:
     """
     Get all WhatsApp account IDs a user has access to.
-    
+
     Args:
         user_id: The authenticated user's ID
-        
+
     Returns:
         List of account IDs the user can access
     """
-    # TODO: Implement based on your user/workspace/account relationships
-    # Example:
-    # accounts = WhatsAppAccount.query.join(
-    #     WorkspaceMember, 
-    #     WhatsAppAccount.workspace_id == WorkspaceMember.workspace_id
-    # ).filter(
-    #     WorkspaceMember.user_id == user_id
-    # ).all()
-    # return [a.id for a in accounts]
-    
-    # For now, return all accounts (implement in production)
-    return [a.id for a in WhatsAppAccount.query.all()]
+    # Scope to the workspaces this user OWNS. (Previously returned EVERY account in
+    # the system — a cross-tenant leak whenever a caller used this for filtering.)
+    try:
+        from models import Workspace
+        ws_ids = {str(w.id) for w in Workspace.query.filter_by(user_id=user_id).all()}
+    except Exception:
+        return []
+    if not ws_ids:
+        return []
+    return [
+        a.id
+        for a in WhatsAppAccount.query.filter(
+            WhatsAppAccount.workspace_id.in_(ws_ids)
+        ).all()
+    ]
 
 
 # ============================================================

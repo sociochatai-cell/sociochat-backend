@@ -47,6 +47,16 @@ def _extract_submissions(account_id: int) -> List[Dict[str, Any]]:
     submissions: List[Dict[str, Any]] = []
     for msg, conv in rows:
         content = msg.content or {}
+        # content is a JSON column, so non-dict rows (e.g. a plain text body, or a
+        # double-encoded JSON string) come back as a str — guard/parse before .get()
+        # so the submissions list never 500s on such rows.
+        if isinstance(content, str):
+            try:
+                content = json.loads(content)
+            except (ValueError, TypeError):
+                content = None
+        if not isinstance(content, dict):
+            continue
         if content.get("interactive_type") != "nfm_reply":
             continue
         response_json = _parse_response_json(content.get("response_json"))
@@ -59,6 +69,23 @@ def _extract_submissions(account_id: int) -> List[Dict[str, Any]]:
             if not flow and str(flow_id).isdigit():
                 flow = WhatsAppFlow.query.filter_by(account_id=account_id, id=int(flow_id)).first()
 
+        # Derive a friendly form TYPE so the Submissions tab can group lead-capture /
+        # feedback / booking / custom. Prefer the flow's Meta category; fall back to the
+        # response shape (date+time → a booking).
+        flow_category = (getattr(flow, "category", None) or "") if flow else ""
+        _cat = flow_category.upper()
+        if "BOOK" in _cat or "APPOINT" in _cat:
+            form_type = "booking"
+        elif "LEAD" in _cat:
+            form_type = "lead"
+        elif "SURVEY" in _cat or "FEEDBACK" in _cat:
+            form_type = "feedback"
+        elif any(k in response_json for k in ("booking_date", "preferred_date", "appointment_date")) \
+                and any(k in response_json for k in ("preferred_time_slot", "booking_time", "time_slot", "appointment_time")):
+            form_type = "booking"
+        else:
+            form_type = "custom"
+
         submissions.append({
             "id": msg.id,
             "flow_id": flow.id if flow else None,
@@ -66,6 +93,8 @@ def _extract_submissions(account_id: int) -> List[Dict[str, Any]]:
             "conversation_id": conv.id,
             "response_json": response_json,
             "status": content.get("submission_status", "received"),
+            "flow_category": flow_category or None,
+            "form_type": form_type,
             # created_at is stored in UTC but the DateTime column is timezone-naive,
             # so stamp it as UTC here. Without the "+00:00" marker the browser reads
             # it as LOCAL time and shows every submission shifted by the UTC offset.
@@ -246,8 +275,16 @@ def list_bookings():
 
     query = WhatsAppFormBooking.query.filter_by(account_id=account_id)
     if date:
-        query = query.filter_by(booking_date=date)
-    bookings = query.order_by(WhatsAppFormBooking.booking_time.asc()).all()
+        # Show the selected date's bookings PLUS any pending booking (regardless of
+        # date) — pending ones need review/confirm and must not be hidden by the filter.
+        from sqlalchemy import or_
+        query = query.filter(or_(
+            WhatsAppFormBooking.booking_date == date,
+            WhatsAppFormBooking.status == "pending",
+        ))
+    bookings = query.order_by(
+        WhatsAppFormBooking.booking_date.asc(), WhatsAppFormBooking.booking_time.asc()
+    ).all()
     return jsonify({"success": True, "bookings": [b.to_dict() for b in bookings]})
 
 
@@ -267,6 +304,7 @@ def booking_analytics():
 
     total = len(all_bookings)
     confirmed = sum(1 for b in all_bookings if b.status == "confirmed")
+    pending = sum(1 for b in all_bookings if b.status == "pending")
     cancelled = sum(1 for b in all_bookings if b.status == "cancelled")
     today_count = sum(1 for b in all_bookings if b.booking_date == today and b.status != "cancelled")
     cancel_rate = round((cancelled / total * 100) if total else 0, 1)
@@ -275,6 +313,7 @@ def booking_analytics():
         "success": True,
         "total_bookings": total,
         "confirmed": confirmed,
+        "pending": pending,
         "cancelled": cancelled,
         "today_bookings": today_count,
         "cancellation_rate": cancel_rate,
@@ -290,6 +329,37 @@ def slot_capacity():
     return jsonify({"success": True, "slots": _generate_slots(account_id, date)})
 
 
+@bookings_bp.route("/slot-times", methods=["GET"])
+def slot_times():
+    """Distinct time-slot LABELS from the configured active business hours — used to
+    populate a WhatsApp form's time dropdown at build time (a published static Meta flow
+    can't vary by weekday, so we take the union across all active days)."""
+    account_id = request.args.get("account_id", type=int)
+    if not account_id:
+        return jsonify({"success": False, "error": "account_id is required"}), 400
+    rows = WhatsAppFormBusinessHours.query.filter_by(account_id=account_id, is_active=True).all()
+    mins_set = set()
+    for h in rows:
+        try:
+            oh, om = map(int, (h.open_time or "09:00").split(":"))
+            ch, cm = map(int, (h.close_time or "17:00").split(":"))
+        except (ValueError, AttributeError):
+            continue
+        step = max(5, h.slot_duration_minutes or 30)
+        m, end = oh * 60 + om, ch * 60 + cm
+        while m < end:
+            mins_set.add(m)
+            m += step
+
+    def _label(mins: int) -> str:
+        h24, mm = mins // 60, mins % 60
+        period = "AM" if h24 < 12 else "PM"
+        h12 = h24 % 12 or 12
+        return f"{h12}:{mm:02d} {period}"
+
+    return jsonify({"success": True, "times": [_label(m) for m in sorted(mins_set)]})
+
+
 @bookings_bp.route("/<int:booking_id>/cancel", methods=["PUT"])
 def cancel_booking(booking_id: int):
     booking = WhatsAppFormBooking.query.get(booking_id)
@@ -298,6 +368,33 @@ def cancel_booking(booking_id: int):
     data = request.get_json(silent=True) or {}
     booking.status = "cancelled"
     booking.notes = data.get("reason") or booking.notes
+    db.session.commit()
+    return jsonify({"success": True, "booking": booking.to_dict()})
+
+
+@bookings_bp.route("/<int:booking_id>/confirm", methods=["PUT"])
+def confirm_booking(booking_id: int):
+    """Confirm a PENDING booking (optionally correcting date/time) and schedule its
+    1-hour-before reminder. Body: { "booking_date": "YYYY-MM-DD", "booking_time": "HH:MM" }
+    (both optional — omit to keep what the customer submitted)."""
+    booking = WhatsAppFormBooking.query.get(booking_id)
+    if not booking:
+        return jsonify({"success": False, "error": "Booking not found"}), 404
+    data = request.get_json(silent=True) or {}
+    new_date = _normalize_booking_date(data.get("booking_date")) if data.get("booking_date") else None
+    if new_date:
+        booking.booking_date = str(new_date)[:10]
+    if data.get("booking_time"):
+        booking.booking_time = str(data["booking_time"])[:8]
+    booking.status = "confirmed"
+    # (Re)schedule the reminder now that the slot is final. Isolated so a scheduling
+    # hiccup never blocks confirming the booking itself.
+    try:
+        db.session.flush()
+        from .booking_reminders import schedule_booking_reminder
+        schedule_booking_reminder(booking)
+    except Exception as reminder_err:
+        logger.warning("Could not schedule reminder for booking %s: %s", booking_id, reminder_err)
     db.session.commit()
     return jsonify({"success": True, "booking": booking.to_dict()})
 
@@ -413,6 +510,8 @@ def maybe_create_booking_from_submission(
         or response_json.get("date")
         or response_json.get("appointment_date")
         or response_json.get("preferred_date")
+        or response_json.get("selected_date")
+        or response_json.get("appointment_day")
     )
     time_val = (
         response_json.get("booking_time")
@@ -420,6 +519,10 @@ def maybe_create_booking_from_submission(
         or response_json.get("appointment_time")
         or response_json.get("slot")
         or response_json.get("preferred_time")
+        or response_json.get("time_slot")
+        or response_json.get("appointment_slot")
+        or response_json.get("selected_time")
+        or response_json.get("preferred_time_slot")
     )
     if not date_val or not time_val:
         return
@@ -441,6 +544,9 @@ def maybe_create_booking_from_submission(
         flow = WhatsAppFlow.query.filter_by(account_id=account_id, meta_flow_id=str(flow_id)).first()
         local_flow_id = flow.id if flow else None
 
+    # New submissions land as PENDING — the operator reviews/corrects the slot in the
+    # Bookings tab and confirms it. The reminder is scheduled only on confirm (see
+    # confirm_booking), so an unconfirmed request never pings the customer.
     booking = WhatsAppFormBooking(
         account_id=account_id,
         flow_id=local_flow_id,
@@ -450,17 +556,11 @@ def maybe_create_booking_from_submission(
         booking_date=str(date_val)[:10],
         booking_time=str(time_val)[:8],
         service_type=str(service) if service else None,
-        status="confirmed",
+        status="pending",
     )
     db.session.add(booking)
-
-    # Schedule an appointment reminder at the exact booked time (minus lead time).
     # flush() assigns booking.id without committing; the caller commits the txn.
-    # Isolated so a scheduling hiccup never blocks creating the booking itself.
     try:
         db.session.flush()
-        from .booking_reminders import schedule_booking_reminder
-        schedule_booking_reminder(booking)
-    except Exception as reminder_err:
-        logger.warning("Could not schedule reminder for booking %s: %s",
-                       getattr(booking, "id", "?"), reminder_err)
+    except Exception:
+        pass

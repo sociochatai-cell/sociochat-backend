@@ -194,11 +194,21 @@ def impersonate(admin, tenant_id):
         return jsonify({"success": False, "error": "no_user_in_tenant"}), 404
 
     session["user_id"] = user.id
+    # Impersonation is a FULL switch to the user — end the admin realm so the
+    # session isn't both admin and user (which made post-payment/redirect land
+    # back on the admin dashboard). Mirrors admin_routes.tenant-admin login.
+    session.pop("admin_id", None)
     session.modified = True
+
+    # Issue a USER token so the client can replace the admin Bearer — otherwise
+    # /auth/me keeps resolving the admin identity (works cross-origin too).
+    from auth_core import create_user_token
+    user_token = create_user_token(user.id, user.email)
 
     workspaces = Workspace.query.filter_by(user_id=user.id).all()
     return jsonify({
         "success": True,
+        "token": user_token,
         "user": {
             "id": user.id, "name": user.name, "email": user.email,
             "role": user.role, "tenant_id": user.tenant_id,
@@ -241,6 +251,20 @@ def list_tenant_users(admin, tenant_id):
 
 
 @superadmin_bp.route(
+    "/tenants/<int:tenant_id>/users/<int:user_id>/usage", methods=["GET"]
+)
+@require_super_admin
+def get_tenant_user_usage(admin, tenant_id, user_id):
+    """Usage/exhaustion stats for a specific user within a tenant."""
+    user = db.session.get(User, user_id)
+    if not user or user.tenant_id != tenant_id:
+        return jsonify({"success": False, "error": "user_not_in_tenant"}), 404
+
+    from subscription.service import get_user_usage_stats
+    return jsonify({"success": True, **get_user_usage_stats(user)})
+
+
+@superadmin_bp.route(
     "/tenants/<int:tenant_id>/users/<int:user_id>/reset-password", methods=["POST"]
 )
 @require_super_admin
@@ -261,6 +285,43 @@ def reset_tenant_user_password(admin, tenant_id, user_id):
         getattr(admin, "email", admin), user.id, tenant_id,
     )
     return jsonify({"success": True, "email": user.email, "password": new_pw})
+
+
+@superadmin_bp.route(
+    "/tenants/<int:tenant_id>/users/<int:user_id>", methods=["DELETE"]
+)
+@require_super_admin
+def delete_tenant_user(admin, tenant_id, user_id):
+    """Permanently delete a tenant user. Requires the super-admin to re-enter
+    their OWN password (sent as X-Confirm-Password) to confirm the action."""
+    from werkzeug.security import check_password_hash
+
+    confirm_pw = (
+        request.headers.get("X-Confirm-Password")
+        or (request.get_json(silent=True) or {}).get("password")
+        or ""
+    )
+    if not confirm_pw or not check_password_hash(getattr(admin, "password_hash", "") or "", confirm_pw):
+        return jsonify({"success": False, "error": "invalid_password"}), 403
+
+    user = db.session.get(User, user_id)
+    if not user or user.tenant_id != tenant_id:
+        return jsonify({"success": False, "error": "user_not_in_tenant"}), 404
+
+    # Don't remove the tenant's last admin (would orphan the tenant).
+    if user.role == "tenant_admin":
+        remaining = User.query.filter_by(tenant_id=tenant_id, role="tenant_admin").count()
+        if remaining <= 1:
+            return jsonify({"success": False, "error": "cannot_delete_last_admin"}), 400
+
+    Workspace.query.filter_by(user_id=user.id).delete(synchronize_session=False)
+    db.session.delete(user)
+    db.session.commit()
+    logger.info(
+        "superadmin %s DELETED user %s in tenant %s",
+        getattr(admin, "email", admin), user_id, tenant_id,
+    )
+    return jsonify({"success": True})
 
 
 # --------------------------------------------------------------------------- #
@@ -338,7 +399,7 @@ def list_plans(admin):
         from subscription.constants import VALID_PLANS
         slugs = list(VALID_PLANS)
     except Exception:
-        slugs = ["beta", "starter", "growth", "enterprise"]
+        slugs = ["beta", "starter", "growth", "premium", "enterprise"]
     for slug in detail_by_slug:
         if slug not in slugs:
             slugs.append(slug)

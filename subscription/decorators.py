@@ -20,8 +20,13 @@ from subscription.service import (
 
 
 def get_current_user():
-    """Get current user from session or request headers."""
-    user_id = session.get("user_id") or request.headers.get("X-User-Id")
+    """Get current user from the server session or a SIGNED Bearer JWT only.
+
+    The forgeable X-User-Id header is no longer trusted (see auth_core) — trusting
+    it let any caller impersonate any user and bypass plan/quota gating.
+    """
+    from auth_core import authenticated_user_id
+    user_id = authenticated_user_id()
     if not user_id:
         return None
     try:

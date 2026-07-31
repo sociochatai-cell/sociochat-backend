@@ -32,14 +32,24 @@ def _get_workspace_from_request():
 
 def _require_workspace_id():
     """Fail-closed resolver. Returns (wid:int, None) on success, or
-    (None, (response, status)) on failure so callers can `return err`."""
+    (None, (response, status)) on failure so callers can `return err`.
+
+    SECURITY: besides requiring the workspace_id, this now VERIFIES the
+    authenticated caller actually owns that workspace via tenant.context —
+    previously any authenticated user could pass another tenant's workspace_id
+    and read/write its contacts. Lazy import avoids circular imports.
+    """
     raw = _get_workspace_from_request()
     if not raw:
         return None, (jsonify({"success": False, "error": "workspace_required"}), 400)
-    try:
-        return int(raw), None
-    except (TypeError, ValueError):
-        return None, (jsonify({"success": False, "error": "invalid_workspace_id"}), 400)
+    from tenant.context import get_current_user, resolve_owned_workspace
+    user = get_current_user()
+    if not user:
+        return None, (jsonify({"success": False, "error": "authentication_required"}), 401)
+    ws, err = resolve_owned_workspace(user, raw)
+    if err:
+        return None, err
+    return ws.id, None
 
 
 # Valid activity_type enum values. Keep in sync with the DB enum so we never
@@ -60,24 +70,14 @@ def normalize_activity_type(t):
 
 
 def _get_request_user_id():
-    uid = session.get("user_id")
-    if uid:
-        try:
-            return int(uid)
-        except Exception:
-            return uid
-    auth = request.headers.get("Authorization", "")
-    if auth and auth.lower().startswith("bearer "):
-        token_part = auth.split(None, 1)[1]
-        if token_part.isdigit():
-            return int(token_part)
-    xuid = request.headers.get("X-User-Id")
-    if xuid:
-        try:
-            return int(xuid)
-        except Exception:
-            return xuid
-    return None
+    """Resolve the user id from the server session or a SIGNED Bearer JWT only.
+
+    The old plaintext ``Bearer <digits>`` and ``X-User-Id`` header paths were
+    forgeable (any caller could impersonate any user id) and have been removed —
+    identity now goes through auth_core, same as the rest of the app.
+    """
+    from auth_core import authenticated_user_id
+    return authenticated_user_id()
 
 
 def _serialize_contact(c, allowed_fields=None):
@@ -289,7 +289,15 @@ def create_contact():
     else:
         if not ws_raw:
             return jsonify({"ok": False, "error": "workspace_id query param required"}), 400
-        ws_val = ws_raw
+        # SECURITY: verify the caller owns the workspace they're writing into.
+        from tenant.context import get_current_user, resolve_owned_workspace
+        _user = get_current_user()
+        if not _user:
+            return jsonify({"ok": False, "error": "authentication_required"}), 401
+        _ws, _err = resolve_owned_workspace(_user, ws_raw)
+        if _err:
+            return _err
+        ws_val = _ws.id
 
     if not request.args.get("user_id") and "user_id" not in _model_columns(Contact):
         user_val = None
@@ -500,6 +508,21 @@ def upsert_contact():
         return jsonify({"ok": False, "error": "Contact model not configured"}), 500
 
     workspace_id = payload.get("workspace_id") or request.args.get("workspace_id")
+
+    # SECURITY: an upsert writes/reads workspace-scoped contacts, so verify the
+    # caller owns the workspace. workspace_id is required to scope safely.
+    if not workspace_id and "workspace_id" in _model_columns(Contact):
+        return jsonify({"ok": False, "error": "workspace_id required"}), 400
+    if workspace_id:
+        from tenant.context import get_current_user, resolve_owned_workspace
+        _user = get_current_user()
+        if not _user:
+            return jsonify({"ok": False, "error": "authentication_required"}), 401
+        _ws, _err = resolve_owned_workspace(_user, workspace_id)
+        if _err:
+            return _err
+        workspace_id = _ws.id
+
     external_source = payload.get("external_source")
     external_id = payload.get("external_id")
     email = payload.get("email")
@@ -808,13 +831,18 @@ def search_contacts():
     GET /contacts/search?q=...&workspace_id=...&limit=20
     """
     q = request.args.get("q", "").strip()
-    workspace_id = request.args.get("workspace_id")
     limit = int(request.args.get("limit", 20))
 
     db = current_app.db
     Contact = _get_contact_model()
     if not Contact:
         return jsonify({"error": "Contact model not configured"}), 500
+
+    # SECURITY: resolve + verify the caller owns the workspace and ALWAYS scope
+    # the search to it (was fail-OPEN: unscoped search across all tenants).
+    workspace_id, err = _require_workspace_id()
+    if err:
+        return err
 
     if not q:
         return jsonify({"data": []})

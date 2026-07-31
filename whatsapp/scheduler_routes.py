@@ -73,6 +73,16 @@ def scheduler_tick():
         logger.warning("usage events poll during scheduler tick: %s", e)
         results["usage_events_poll_error"] = str(e)
 
+    # 3c. Fire due appointment reminders. Replaces the in-process APScheduler 'date'
+    # job so reminders still send when the in-process scheduler is disabled in prod.
+    try:
+        from whatsapp.booking_reminders import send_due_booking_reminders
+
+        results["booking_reminders"] = send_due_booking_reminders(limit=200)
+    except Exception as e:
+        logger.warning("booking reminders during scheduler tick: %s", e)
+        results["booking_reminders_error"] = str(e)
+
     # 4. Advisory: mark expired Embedded Signup onboarding sessions (no disconnects)
     try:
         from whatsapp.onboarding_session_manager import sweep_expired_sessions

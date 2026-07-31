@@ -141,3 +141,41 @@ def send_booking_reminder(booking_id: int):
     except Exception as e:
         db.session.rollback()
         logger.exception("Error sending booking reminder %s: %s", booking_id, e)
+
+
+def send_due_booking_reminders(limit: int = 200) -> dict:
+    """DB-poll driver for booking reminders (the Cloud Scheduler / ``/tick`` path).
+
+    Finds bookings whose ``remind_at`` is due and that haven't been reminded yet,
+    and sends each. This replaces the in-process APScheduler 'date' job so reminders
+    still fire when the in-process scheduler is disabled in production (Cloud Run).
+    ``remind_at`` is stamped on the booking when it is created; this just polls it.
+    Idempotent via ``send_booking_reminder()``'s own ``reminded`` guard.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        due = (
+            WhatsAppFormBooking.query
+            .filter(
+                WhatsAppFormBooking.remind_at.isnot(None),
+                WhatsAppFormBooking.remind_at <= now,
+                WhatsAppFormBooking.reminded == False,  # noqa: E712
+                WhatsAppFormBooking.status != "cancelled",
+            )
+            .order_by(WhatsAppFormBooking.remind_at.asc())
+            .limit(limit)
+            .all()
+        )
+    except Exception as e:
+        logger.exception("send_due_booking_reminders: query failed: %s", e)
+        return {"scanned": 0, "sent": 0, "error": str(e)}
+
+    sent = 0
+    for b in due:
+        try:
+            send_booking_reminder(b.id)
+            if getattr(b, "reminded", False):
+                sent += 1
+        except Exception:
+            logger.exception("send_due_booking_reminders: failed booking %s", getattr(b, "id", "?"))
+    return {"scanned": len(due), "sent": sent}

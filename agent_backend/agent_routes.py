@@ -70,15 +70,24 @@ def agent_chat():
     if not message:
         return jsonify({"status": "error", "message": "Message is required."}), 400
 
-    workspace_id = data.get("workspace_id") or _get_workspace_id()
-    if not workspace_id:
-        return jsonify({"status": "error", "message": "workspace_id is required."}), 400
+    # Require a real (session/JWT) identity — the agent can send messages and run
+    # automations, so it must never run for an anonymous or impersonated caller.
+    user = get_current_user()
+    if not user:
+        return jsonify({"status": "error", "message": "authentication_required"}), 401
+
+    # The workspace the agent acts on MUST belong to the caller. resolve_owned_workspace
+    # verifies ownership (or falls back to the user's own workspace when none supplied).
+    from tenant.context import resolve_owned_workspace
+    ws, err = resolve_owned_workspace(user, data.get("workspace_id") or request.headers.get("X-Workspace-ID"))
+    if err:
+        return err
+    workspace_id = str(ws.id)
 
     session_id = data.get("session_id")
     account_id = _get_account_id(workspace_id)
 
-    user = get_current_user()
-    user_id = str(user.id) if user else request.headers.get("X-User-Id")
+    user_id = str(user.id)
 
     result = action_executor.process_message(
         message=message,

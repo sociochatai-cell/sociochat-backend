@@ -494,7 +494,23 @@ class WebhookProcessor:
         # Get or create conversation
         contact_name = contact.get("profile", {}).get("name") if contact else None
         conversation = self._get_or_create_conversation(account.id, from_phone, contact_name)
-        
+
+        # Phase 3 — round-robin auto-assign a brand-new inbound customer number
+        # to an agent. ONLY this genuine-inbound path triggers it (send-echo,
+        # history-sync and contacts-import must not). Runs BEFORE the commit
+        # below so the assignment lands atomically with the conversation +
+        # message. Fully failure-isolated: it must NEVER break the webhook.
+        if getattr(conversation, "_is_new", False):
+            try:
+                if account.workspace_id is not None:
+                    from agent_auth.inbox_scope import auto_assign_new_number
+                    auto_assign_new_number(int(account.workspace_id), from_phone)
+            except Exception:
+                logger.exception(
+                    "auto_assign hook failed (conversation %s, account %s)",
+                    conversation.id, account.id,
+                )
+
         # Build message content
         content = self._extract_content(message, msg_type)
         if msg_type == "order":
@@ -643,6 +659,22 @@ class WebhookProcessor:
                     )
             except Exception as _ic_err:
                 logger.error(f"CAPI InitiateCheckout from WA order failed: {_ic_err}")
+
+            # Auto-send a PayU payment link if enabled (SocioChat-only; removable).
+            try:
+                from flask import request as _flask_request
+                _host = ""
+                try:
+                    _host = _flask_request.host_url
+                except Exception:
+                    _host = ""
+                from whatsapp.commerce_pay.auto import maybe_auto_request_payment
+                maybe_auto_request_payment(
+                    account=account, conversation=conversation,
+                    message_id=msg_record.id, order_content=content, host_url=_host,
+                )
+            except Exception as _auto_err:
+                logger.error(f"commerce auto-pay hook failed: {_auto_err}")
 
         # --- Bulk-campaign reply attribution -------------------------------------
         # Resolve which bulk campaign (if any) this inbound message is replying to,
@@ -852,6 +884,34 @@ class WebhookProcessor:
             elif int_type == "nfm_reply":
                 reply = interactive.get("nfm_reply", {})
                 button_title = reply.get("body") or "Flow completed"
+                # Appointment booking: a submitted Flow form carries its answers in
+                # `response_json`. If it contains date+time fields, create the booking
+                # row (status=confirmed) and stamp/schedule its reminder. Without this
+                # the whole booking pipeline (Bookings tab + reminders) never fires.
+                try:
+                    from .flow_os_routes import maybe_create_booking_from_submission
+                    response_json = reply.get("response_json")
+                    if isinstance(response_json, str):
+                        import json as _json
+                        try:
+                            response_json = _json.loads(response_json)
+                        except _json.JSONDecodeError:
+                            response_json = {}
+                    if isinstance(response_json, dict) and response_json:
+                        maybe_create_booking_from_submission(
+                            account_id=account.id,
+                            conversation_id=conversation.id,
+                            wa_id=from_phone,
+                            response_json=response_json,
+                            flow_id=reply.get("flow_id"),
+                        )
+                        self.db_session.commit()
+                except Exception as booking_err:
+                    logger.warning("Could not create booking from flow submission: %s", booking_err)
+                    try:
+                        self.db_session.rollback()
+                    except Exception:
+                        pass
                 self._process_automation(
                     account=account,
                     conversation=conversation,
@@ -1275,7 +1335,15 @@ class WebhookProcessor:
                 content["list_id"] = reply.get("id")
                 content["list_title"] = reply.get("title")
                 content["list_description"] = reply.get("description")
-        
+            elif int_type == "nfm_reply":
+                # Flow form submission — persist the answers so the Submissions tab
+                # (which reads content.response_json) can list it. Without this the
+                # submission is stored but shows nothing.
+                nfm = interactive.get("nfm_reply", {})
+                content["response_json"] = nfm.get("response_json")
+                content["flow_id"] = nfm.get("flow_id") or interactive.get("flow_id")
+                content["submission_status"] = "received"
+
         elif msg_type == "button":
             content["button_text"] = message.get("button", {}).get("text", "")
             content["button_payload"] = message.get("button", {}).get("payload", "")
@@ -1412,6 +1480,25 @@ class WebhookProcessor:
                 
                 # Trigger CAPI Lead event for official ad click
                 self._trigger_capi_lead_event(account, conversation, ad_id=attribution.ad_id)
+
+                # Auto-create a CRM lead from this ad conversation IF the ad's campaign
+                # has "create leads" enabled (per-campaign opt-in set in the ad wizard).
+                try:
+                    from ctwa.models import CTWACampaign
+                    _camp = None
+                    if getattr(attribution, "ad_id", None):
+                        _camp = CTWACampaign.query.filter(CTWACampaign.meta_ad_id == attribution.ad_id).first()
+                    if _camp is None and getattr(attribution, "campaign_id", None):
+                        _camp = CTWACampaign.query.filter(CTWACampaign.meta_campaign_id == attribution.campaign_id).first()
+                    # Default TRUE when we can't find our campaign row (external/legacy ad) so leads aren't silently dropped.
+                    if _camp is None or getattr(_camp, "create_leads", True):
+                        from SocioviaCrm.lead_ingest import upsert_lead_from_conversation
+                        upsert_lead_from_conversation(conversation, account)
+                        logger.info(f"CTWA lead upserted for conv {conversation.id} (campaign flag on)")
+                    else:
+                        logger.info(f"CTWA lead skipped for conv {conversation.id}: create_leads disabled")
+                except Exception:
+                    logger.exception("CTWA lead upsert failed (non-fatal)")
         except Exception as e:
             logger.exception(f"Failed to process attribution: {e}")
     

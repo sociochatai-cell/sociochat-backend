@@ -20,6 +20,29 @@ BASE_URL = f"https://graph.facebook.com/{FB_API_VERSION}"
 
 # Google GenAI Configuration - Vertex AI Mode
 def init_client():
+    # Prefer simple API-key mode when a Gemini API key is configured — it needs
+    # no service-account JSON. Falls back to Vertex AI (project + ADC) below.
+    api_key = (
+        os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+        or ""
+    ).strip()
+    if api_key:
+        # 1) Gemini Developer API key (the usual "AIza…" keys)
+        try:
+            client = genai.Client(api_key=api_key)
+            logger.info("[startup] genai.Client initialised in API-key mode")
+            return client
+        except Exception as e:
+            logger.warning(f"[startup] genai API-key mode failed: {e}")
+        # 2) Vertex AI Express key (keys that look like "AQ.…")
+        try:
+            client = genai.Client(api_key=api_key, vertexai=True)
+            logger.info("[startup] genai.Client initialised in Vertex Express mode")
+            return client
+        except Exception as e:
+            logger.warning(f"[startup] genai Vertex-Express mode failed, trying full Vertex: {e}")
+
     project = os.environ.get("GCP_PROJECT") or os.environ.get("PROJECT_ID") or "angular-sorter-473216-k8"
     location = os.environ.get("GOOGLE_CLOUD_LOCATION") or "global"
     adc_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
@@ -1275,6 +1298,23 @@ def generate_copy():
 
     try:
         resp = _generate_content_robust(contents, temperature=GENAI_TEMPERATURE)
+
+        # --- AI usage metering (fail-soft) ---
+        try:
+            from subscription.service import record_ai_usage, resolve_workspace_owner
+            _meter_uid, _meter_wid = resolve_workspace_owner(workspace_id)
+            record_ai_usage(
+                _meter_uid,
+                _meter_wid,
+                feature="crm_content",
+                model=GENAI_MODEL,
+                route_path=request.path,
+                _commit=True,
+            )
+        except Exception:
+            pass
+        # --- end metering ---
+
         raw_text = _extract_text_from_genai_response(resp)
         
         parsed = _extract_json_from_textt(raw_text)
@@ -1379,6 +1419,38 @@ def generate_targeting():
             contents=prompt
         )
         text = response.text
+
+        # --- AI usage metering (fail-soft) ---
+        # NOTE: this handler does not normally receive a workspace_id/user_id, so
+        # unless the client sends one (body, context, or query string) this call
+        # safely no-ops (record_ai_usage no-ops when user_id is falsy).
+        try:
+            from subscription.service import record_ai_usage, resolve_workspace_owner
+            _meter_wsid = (
+                data.get("workspace_id")
+                or data.get("workspaceId")
+                or (context.get("workspace_id") if isinstance(context, dict) else None)
+                or request.args.get("workspace_id")
+            )
+            _meter_uid = (
+                data.get("user_id")
+                or (context.get("user_id") if isinstance(context, dict) else None)
+                or request.args.get("user_id")
+            )
+            _meter_wid = _meter_wsid
+            if not _meter_uid and _meter_wsid:
+                _meter_uid, _meter_wid = resolve_workspace_owner(_meter_wsid)
+            record_ai_usage(
+                _meter_uid,
+                _meter_wid,
+                feature="crm_content",
+                model="gemini-3.1-flash-lite",
+                route_path=request.path,
+                _commit=True,
+            )
+        except Exception:
+            pass
+        # --- end metering ---
         
         if "```json" in text:
              text = text.split("```json")[1].split("```")[0].strip()
