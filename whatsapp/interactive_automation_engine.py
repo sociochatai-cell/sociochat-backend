@@ -4079,6 +4079,67 @@ class InteractiveAutomationEngine:
                 handle_edges=handle_edges,
             )
 
+        # ── #2a: background a SILENT, MUTATING push (e.g. the CRM /leads lead-capture) ──
+        # A silent POST produces no WhatsApp reply and its response drives nothing downstream
+        # (defaultNext is fixed), yet it BLOCKS the reply on a slow external endpoint (~15s)
+        # before the user sees the next step. Fire it on a daemon thread and continue instantly.
+        # All state/DB work stays on THIS thread; only the pure HTTP call (execute_api_node is
+        # context-free — no db/current_app) runs in the background. Failures are LOGGED, not
+        # retried (idempotency is marked up front so a retried inbound webhook can't re-fire).
+        if is_mutating and bool(node_data.get("silent")):
+            _bg_next = self._resolve_api_next_node_id(api_node, "success", source_edges, handle_edges)
+            if _bg_next and node_map.get(_bg_next):
+                _sd_mark = dict(state.state_data or {})
+                _pushed = dict(_sd_mark.get("api_pushed") or {})
+                _pushed[str(node_id)] = True
+                _sd_mark["api_pushed"] = _pushed
+                state.state_data = _sd_mark
+                state.advance_to_node(node_id)
+                state.clear_waiting_for_input()
+                state.last_user_message_at = datetime.now(timezone.utc)
+                flag_modified(state, "state_data")
+                try:
+                    db.session.commit()
+                except Exception:
+                    db.session.rollback()
+                # Best-effort Flow→Lead hook (only fires if leadAction is enabled; needs no HTTP result).
+                try:
+                    self._maybe_mark_lead(state, node_data, captured_value=variables.get("customer_name"))
+                except Exception:
+                    logger.debug("[api_node bg] lead hook skipped", exc_info=True)
+                _nd, _vars, _sid, _nid = dict(node_data), dict(variables), state.id, node_id
+
+                def _bg_api_push() -> None:
+                    try:
+                        _res = api_node_executor.execute_api_node(_nd, _vars)
+                        if getattr(_res, "success", False):
+                            logger.info("[api_node bg] silent push ok node=%s state=%s", _nid, _sid)
+                        else:
+                            # ERROR (was WARNING) + a greppable [LEAD-DROP] marker: a silent lead
+                            # node still shows the user a "we received your details" confirmation
+                            # regardless of the HTTP result, so a rejected lead (e.g. /leads 401 on a
+                            # missing flow_api_token) is otherwise INVISIBLE. Logging at ERROR surfaces
+                            # it in Loki/error dashboards and makes it alertable.
+                            logger.error(
+                                "[api_node bg][LEAD-DROP] silent push FAILED node=%s state=%s status=%s url=%s err=%s — CRM lead NOT delivered",
+                                _nid, _sid, getattr(_res, "status_code", None), _nd.get("url"), getattr(_res, "error", None),
+                            )
+                    except Exception as _e:  # noqa: BLE001
+                        logger.error(
+                            "[api_node bg][LEAD-DROP] silent push EXCEPTION node=%s state=%s url=%s: %s — CRM lead NOT delivered",
+                            _nid, _sid, _nd.get("url"), _e,
+                        )
+
+                threading.Thread(target=_bg_api_push, name=f"wa-api-push-{node_id}", daemon=True).start()
+                return self._continue_from_node(
+                    state=state,
+                    next_node_id=_bg_next,
+                    from_phone=from_phone,
+                    node_map=node_map,
+                    source_edges=source_edges,
+                    handle_edges=handle_edges,
+                )
+
         api_result = api_node_executor.execute_api_node(node_data, variables)
         store_as = node_data.get("storeAs")
         if store_as:
