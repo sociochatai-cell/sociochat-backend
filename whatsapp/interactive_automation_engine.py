@@ -3361,6 +3361,25 @@ class InteractiveAutomationEngine:
                 libs = (search.get("data") or {}).get("libraries") or []
                 if isinstance(libs, list) and len(libs) == 1 and isinstance(libs[0], dict):
                     variables["library_id"] = libs[0].get("id") or variables.get("library_id")
+        # Resolve the PICKED library's NAME from the stored search result so downstream
+        # nodes (the CRM /leads webhook) can send it — req: "Additional field in webhook: Library name".
+        # The button-capture only grabs the library UUID (button_id), never the visible label,
+        # so we look the name up here by matching library_id against the search response.
+        if not variables.get("library_name") and variables.get("library_id"):
+            _lib_id = str(variables.get("library_id"))
+            _search = variables.get("search_result")
+            if isinstance(_search, dict):
+                for _qr in (_search.get("quickReplies") or []):
+                    if isinstance(_qr, dict) and str(_qr.get("id")) == _lib_id and _qr.get("label"):
+                        variables["library_name"] = _qr["label"]
+                        break
+                if not variables.get("library_name"):
+                    for _lib in ((_search.get("data") or {}).get("libraries") or []):
+                        if isinstance(_lib, dict) and str(_lib.get("id") or _lib.get("_id")) == _lib_id:
+                            variables["library_name"] = (
+                                _lib.get("name") or _lib.get("library_name") or _lib.get("label")
+                            )
+                            break
         if state.last_button_clicked:
             variables["last_button_clicked"] = state.last_button_clicked
             variables["button_id"] = state.last_button_clicked
@@ -3399,6 +3418,7 @@ class InteractiveAutomationEngine:
         button_payload: str,
         node_map: dict,
         compiled_flow: Optional[Dict[str, Any]] = None,
+        button_title: Optional[str] = None,
     ) -> None:
         if not button_payload or not state.current_node_id:
             return
@@ -3414,6 +3434,10 @@ class InteractiveAutomationEngine:
         )
         if self._looks_like_library_uuid(button_payload):
             state.set_collected_field("library_id", str(button_payload).strip())
+            # Also capture the human-readable library NAME from the tapped button's
+            # title so it can be forwarded to the CRM webhook as {{library_name}}.
+            if button_title and str(button_title).strip():
+                state.set_collected_field("library_name", str(button_title).strip())
 
         # ── Flow→Lead hook (button capture) ──
         self._maybe_mark_lead(
