@@ -406,13 +406,14 @@ class ConversationStateEngine:
                     logger.info(f"[State Engine] Matched keyword trigger: {automation.name}")
                     return automation
             
-            elif trigger_type == 'any_message':
-                # Store for fallback
+            elif trigger_type in ('any_message', 'any_reply'):
+                # Store for fallback — accept both legacy 'any_message' and
+                # the frontend's newer 'any_reply' slug for the same behaviour.
                 any_message_automation = automation
-        
-        # Return any_message automation as fallback
+
+        # Return any_message / any_reply automation as fallback
         if any_message_automation:
-            logger.info(f"[State Engine] Using any_message trigger: {any_message_automation.name}")
+            logger.info(f"[State Engine] Using {any_message_automation.trigger_type} trigger: {any_message_automation.name}")
             return any_message_automation
         
         return None
