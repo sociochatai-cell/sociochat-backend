@@ -26,6 +26,67 @@ from .encryption import encrypt_token, decrypt_token
 
 logger = logging.getLogger(__name__)
 
+# Maps Sociovia.com plan names → SocioChat daily message limits.
+# SocioChat's own plans are looked up from subscription constants directly.
+_SOCIOVIA_PLAN_TO_DAILY_LIMIT = {
+    "ai_free":      0,      # blocked — should never reach here but guard anyway
+    "ai_starter":   1000,
+    "ai_growth":    5000,
+    "ai_custom":    None,   # unlimited
+    # legacy sociovia plans
+    "starter":      1000,
+    "growth":       5000,
+    "enterprise":   None,   # unlimited
+    "beta":         5000,
+}
+
+def _resolve_daily_limit_for_user(workspace_id: str) -> Optional[int]:
+    """
+    Returns the daily_message_limit to seed for a workspace owner.
+    Reads the owner's plan from the users table and maps it to a limit.
+    Returns None = unlimited.
+    """
+    try:
+        from shared_models import User
+        from subscription.constants import PLAN_LIMITS
+        result = db.session.execute(
+            db.text("SELECT u.plan FROM users u JOIN workspaces2 w ON w.user_id = u.id WHERE w.id = :wid LIMIT 1"),
+            {"wid": workspace_id}
+        ).fetchone()
+        if not result:
+            return 1000  # safe default
+        plan = result[0] or "starter"
+        # Sociovia ai_* plans
+        if plan in _SOCIOVIA_PLAN_TO_DAILY_LIMIT:
+            return _SOCIOVIA_PLAN_TO_DAILY_LIMIT[plan]
+        # SocioChat native plans
+        plan_cfg = PLAN_LIMITS.get(plan, {})
+        return plan_cfg.get("messages_per_day", 1000)
+    except Exception as e:
+        logger.warning("_resolve_daily_limit_for_user failed (default 1000): %s", e)
+        return 1000
+
+
+def _seed_capabilities(account_id: int, workspace_id: str) -> None:
+    """
+    Seed whatsapp_account_capabilities row on new/reconnected account.
+    Uses ON CONFLICT DO NOTHING so existing rows (set by Sociovia monolith) are preserved.
+    """
+    try:
+        daily_limit = _resolve_daily_limit_for_user(workspace_id)
+        db.session.execute(db.text("""
+            INSERT INTO whatsapp_account_capabilities
+                (account_id, subscription_status, ai_enabled, automation_enabled,
+                 broadcast_enabled, daily_message_limit, projection_version, updated_at)
+            VALUES
+                (:aid, 'ACTIVE', true, true, true, :lim, 1, NOW())
+            ON CONFLICT (account_id) DO NOTHING
+        """), {"aid": account_id, "lim": daily_limit})
+        db.session.commit()
+        logger.info("Seeded capabilities for account %s (daily_limit=%s)", account_id, daily_limit)
+    except Exception as e:
+        logger.warning("_seed_capabilities failed for account %s: %s", account_id, e)
+
 META_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v24.0")
 META_GRAPH_API = f"https://graph.facebook.com/{META_API_VERSION}"
 
@@ -682,7 +743,10 @@ def connect_manual(
         db.session.commit()
         
         logger.info(f"Updated existing WhatsApp account: {existing_account.id}")
-        
+
+        # Seed capabilities if row missing (ON CONFLICT DO NOTHING preserves existing)
+        _seed_capabilities(existing_account.id, workspace_id)
+
         # Run post-connection setup (webhook subscription, etc.)
         setup_result = _run_post_connection_setup(existing_account.id, waba_id, access_token)
         
@@ -715,7 +779,10 @@ def connect_manual(
     db.session.commit()
     
     logger.info(f"Created new WhatsApp account: {new_account.id} for workspace {workspace_id}")
-    
+
+    # Seed capabilities row with plan-based daily limit
+    _seed_capabilities(new_account.id, workspace_id)
+
     # Step 6: Auto-setup - Subscribe WABA to webhooks
     setup_result = _run_post_connection_setup(new_account.id, waba_id, access_token)
     
