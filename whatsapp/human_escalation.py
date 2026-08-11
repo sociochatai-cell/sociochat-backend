@@ -658,6 +658,128 @@ def send_booking_notification_email_bg(
         logger.exception(f"[human_escalation] Failed to process Booking background task: {exc}")
 
 
+def send_button_click_notification_email_bg(
+    account_id: int,
+    conversation_id: Optional[int],
+    button_label: str,
+    phone_number: Optional[str],
+    user_name: Optional[str],
+    collected_fields: Optional[Dict[str, Any]] = None,
+    flow_name: Optional[str] = None,
+) -> None:
+    """Send a per-button-click notification email when a flow button flagged
+    with `notifyEmail: true` is clicked by a customer. Recipient is the
+    account's configured `notification_email` (same field used by other
+    workspace notifications). No-op if SMTP or notification_email is unset."""
+    from .models import WhatsAppAccount
+    try:
+        account = WhatsAppAccount.query.get(account_id)
+        if not account:
+            logger.error(f"[button_notify] account {account_id} not found — skipping")
+            return
+
+        recipients = resolve_template_notification_emails(account)
+        if not recipients:
+            logger.info(f"[button_notify] no notification_email for account {account_id} — skipping")
+            return
+
+        smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+        smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        smtp_user = os.getenv("SMTP_USER", "")
+        smtp_pass = os.getenv("SMTP_PASS", "")
+        mail_from = os.getenv("MAIL_FROM", smtp_user or "noreply@sociovia.com")
+
+        if not smtp_user or not smtp_pass:
+            logger.warning("[button_notify] SMTP not configured — skipping")
+            return
+
+        business = (
+            account.custom_name
+            or account.verified_name
+            or account.display_phone_number
+            or f"Account {account.id}"
+        )
+
+        label_clean = (button_label or "action").strip()
+        name_clean = (user_name or "").strip() or "Customer"
+        phone_clean = (phone_number or "").strip() or "unknown number"
+        label_lower = label_clean.lower()
+
+        # Choose a natural sentence based on button label keywords
+        if any(k in label_lower for k in ("call", "callback", "call me")):
+            action_line = f"A call has been requested by {name_clean} ({phone_clean})."
+        elif any(k in label_lower for k in ("meeting", "schedule", "book", "appointment")):
+            action_line = f"A meeting has been scheduled by {name_clean} ({phone_clean})."
+        elif any(k in label_lower for k in ("message", "chat", "talk", "counsellor", "counselor")):
+            action_line = f"{name_clean} ({phone_clean}) wants to talk to your team."
+        elif any(k in label_lower for k in ("visit", "website", "url", "link")):
+            action_line = f"{name_clean} ({phone_clean}) clicked \"{label_clean}\"."
+        elif any(k in label_lower for k in ("interest", "not interested")):
+            action_line = f"{name_clean} ({phone_clean}) responded: \"{label_clean}\"."
+        elif any(k in label_lower for k in ("demo", "trial")):
+            action_line = f"A demo has been requested by {name_clean} ({phone_clean})."
+        else:
+            action_line = f"{name_clean} ({phone_clean}) clicked \"{label_clean}\"."
+
+        subject = f"[SocioChat] {label_clean} — {name_clean} — {business}"
+
+        body_lines = [
+            f"Hello,",
+            "",
+            action_line,
+            "",
+            f"Button clicked: {label_clean}",
+            f"Customer name : {name_clean}",
+            f"Phone         : {phone_clean}",
+        ]
+        if flow_name:
+            body_lines.append(f"Flow          : {flow_name}")
+        body_lines.append(
+            f"Time          : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+
+        # Include collected fields (name, email, city, course, etc.) if present
+        if isinstance(collected_fields, dict) and collected_fields:
+            interesting = {
+                k: v for k, v in collected_fields.items()
+                if v not in (None, "", []) and not str(k).startswith("_")
+            }
+            if interesting:
+                body_lines.append("")
+                body_lines.append("Additional details collected:")
+                for k, v in interesting.items():
+                    body_lines.append(f"  - {k}: {v}")
+
+        body_lines.extend([
+            "",
+            f"WhatsApp account: {business}",
+            f"Workspace ID    : {account.workspace_id}",
+            "",
+            "You can reply to this customer directly from the SocioChat inbox.",
+            "",
+            "— SocioChat",
+        ])
+        body = "\n".join(body_lines)
+
+        msg = MIMEMultipart()
+        msg["From"] = mail_from
+        msg["To"] = ", ".join(recipients)
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(mail_from, recipients, msg.as_string())
+
+        logger.info(
+            "[button_notify] sent to %s (account=%s button=%r name=%s phone=%s)",
+            recipients, account_id, label_clean, name_clean, phone_clean,
+        )
+    except Exception as exc:
+        logger.exception(f"[button_notify] failed: {exc}")
+
+
 BOOKING_TRIGGERS = [
     "book meeting", "book a meeting", "book call", "book a call",
     "schedule call", "schedule a call", "schedule meeting", "schedule a meeting",

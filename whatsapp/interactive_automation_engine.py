@@ -3446,6 +3446,90 @@ class InteractiveAutomationEngine:
             captured_value=button_payload,
         )
 
+        # ── Per-button email notification hook ──
+        # If the specific button the user clicked was flagged `notifyEmail: true`
+        # in the flow builder, send a one-off email to the account's
+        # notification_email. Safe: best-effort, never raises into the flow.
+        try:
+            buttons = node_data.get("buttons") if isinstance(node_data, dict) else None
+            if isinstance(buttons, list):
+                clicked = None
+                for b in buttons:
+                    if not isinstance(b, dict):
+                        continue
+                    if str(b.get("id")) == str(button_payload):
+                        clicked = b
+                        break
+                if clicked and bool(clicked.get("notifyEmail")):
+                    self._dispatch_button_notification_email(
+                        state=state,
+                        node_data=node_data,
+                        button=clicked,
+                        button_title=button_title,
+                    )
+        except Exception:
+            logger.exception("[interactive_engine] button-notify hook failed (ignored)")
+
+    def _dispatch_button_notification_email(
+        self,
+        state: WhatsAppConversationState,
+        node_data: Dict[str, Any],
+        button: Dict[str, Any],
+        button_title: Optional[str],
+    ) -> None:
+        """Schedule the button-click notification email on the bg_processor.
+        No-ops silently if any piece is missing."""
+        try:
+            label = (
+                str(button.get("label") or "").strip()
+                or (str(button_title).strip() if button_title else "")
+                or "Button clicked"
+            )
+            phone = getattr(state, "phone_number", None)
+            user_name = None
+            try:
+                if state.conversation_id is not None:
+                    conv = WhatsAppConversation.query.get(state.conversation_id)
+                    if conv is not None:
+                        user_name = getattr(conv, "user_name", None) or None
+                        phone = phone or getattr(conv, "user_phone", None)
+            except Exception:
+                pass
+
+            collected = {}
+            try:
+                collected = state.get_collected_fields() or {}
+            except Exception:
+                collected = {}
+
+            flow_name = None
+            try:
+                if getattr(self, "_compiled_flow_cache", None):
+                    cached = self._compiled_flow_cache.get(state.automation_id)
+                    if cached:
+                        flow_name = (cached.get("automation") or {}).get("name")
+            except Exception:
+                flow_name = None
+
+            from .human_escalation import send_button_click_notification_email_bg
+            from .background_processor import bg_processor
+            bg_processor.submit(
+                send_button_click_notification_email_bg,
+                account_id=self.account_id,
+                conversation_id=state.conversation_id,
+                button_label=label,
+                phone_number=phone,
+                user_name=user_name,
+                collected_fields=collected,
+                flow_name=flow_name,
+            )
+            logger.info(
+                "[button_notify] scheduled email for account=%s conv=%s button=%r",
+                self.account_id, state.conversation_id, label,
+            )
+        except Exception:
+            logger.exception("[interactive_engine] _dispatch_button_notification_email failed")
+
     def _maybe_mark_lead(
         self,
         state: WhatsAppConversationState,
