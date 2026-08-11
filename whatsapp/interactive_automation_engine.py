@@ -4870,9 +4870,13 @@ class InteractiveAutomationEngine:
         t_send = time.time()
 
         node_data = node.get("data", {})
-        body = node_data.get("body", "")
-        header = node_data.get("header")
-        footer = node_data.get("footer")
+        # Substitute {{field}} placeholders (e.g. {{customer_name}}, {{library_name}})
+        # from collected input so message/confirmation-node bodies render real values —
+        # previously only the question + API-body paths did this, so message nodes leaked
+        # raw "{{customer_name}}" text to the user. (_substitute_flow_variables is None-safe.)
+        body = self._substitute_flow_variables(node_data.get("body", ""), state)
+        header = self._substitute_flow_variables(node_data.get("header"), state)
+        footer = self._substitute_flow_variables(node_data.get("footer"), state)
         buttons = node_data.get("buttons", [])
 
         if node_data.get("internalRouter"):
