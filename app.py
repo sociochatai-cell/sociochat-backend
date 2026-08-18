@@ -297,6 +297,8 @@ _PUBLIC_PREFIXES = (
     "/api/internal/",                  # scheduler + usage events (own secret token)
     "/api/whatsapp/flows/endpoint",    # Meta-signed WhatsApp Flow data endpoint
     "/api/whatsapp/commerce/pay/",     # customer-facing PayU redirect page (opens the link)
+    "/api/whatsapp/hooks/",
+    "/api/auth/wa-entry",
 )
 # Sensitive routes that sit under a public prefix / shared dynamic path — force auth.
 _FORCE_AUTH_EXACT = {
@@ -350,6 +352,11 @@ def _enforce_agent_restrictions_hook():
 
 # Register Auth Blueprint
 app.register_blueprint(auth_bp)
+try:
+    from wa_entry_routes import wa_entry_bp
+    app.register_blueprint(wa_entry_bp, url_prefix="/api/auth")
+except Exception as _e:
+    import logging; logging.getLogger(__name__).warning("wa_entry_bp: %s", _e)
 
 # Register SMS OTP Blueprint
 from sms_routes import sms_bp
