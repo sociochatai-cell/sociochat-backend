@@ -145,9 +145,15 @@ def admin_login():
 
     # 1. Super Admin path — empty code or the internal tenant code.
     if code == "" or code == INTERNAL_TENANT_CODE:
-        admin = Admin.query.filter_by(email=email).first()
-        if admin and check_password_hash(admin.password_hash, password):
-            return _super_admin_response(admin)
+        if email != DEFAULT_ADMIN_EMAIL:
+            # SECURITY: the admin portal (empty code OR internal T0000) is EXCLUSIVELY
+            # the super admin (admin@sociovia.com). Never fall through to the tenant-admin
+            # path for T0000, so no other T0000 user/email can reach the admin portal.
+            return jsonify({"success": False, "error": "invalid_credentials"}), 401
+        else:
+            admin = Admin.query.filter_by(email=email).first()
+            if admin and check_password_hash(admin.password_hash, password):
+                return _super_admin_response(admin)
 
         # Bootstrap login with default credentials
         if _default_admin_password_allowed() and email == DEFAULT_ADMIN_EMAIL and password == DEFAULT_ADMIN_PASSWORD:
@@ -156,11 +162,9 @@ def admin_login():
             if admin:
                 return _super_admin_response(admin)
 
-        # Admin auth failed. With an empty code, behavior is unchanged (401).
-        # With T0000, fall through so the internal tenant's tenant_admin can
-        # still sign in via the internal code.
-        if code == "":
-            return jsonify({"success": False, "error": "invalid_credentials"}), 401
+        # Admin auth failed for the super admin. Always 401 here (both empty code
+        # and T0000) — the admin portal is locked to admin@sociovia.com only.
+        return jsonify({"success": False, "error": "invalid_credentials"}), 401
 
     # 2. Tenant Admin path — a real tenant code (or T0000 fall-through).
     tenant = Tenant.query.filter_by(tenant_code=code).first()
@@ -396,3 +400,97 @@ def login_as_user(admin):
         },
         "workspaces": [{"id": w.id, "name": w.business_name or f"Workspace {w.id}"} for w in workspaces],
     })
+
+
+@admin_bp.route("/api/admin/analytics/users", methods=["GET"])
+@require_admin
+def admin_user_analytics(admin):
+    from datetime import timedelta
+    from sqlalchemy import func
+
+    now = datetime.utcnow()
+    thirty_days_ago = now - timedelta(days=30)
+    soon_cutoff = now + timedelta(days=7)
+
+    users = _internal_user_filter(User.query).all()
+
+    rows = []
+    summary = {
+        "total_users": 0,
+        "paid_users": 0,
+        "free_users": 0,
+        "active_subscriptions": 0,
+        "expiring_soon": 0,
+        "expired": 0,
+        "meta_connected": 0,
+        "auto_renew": 0,
+        "new_last_30d": 0,
+        "inactive_dead": 0,
+        "plan_mix": {},
+    }
+
+    paid_plans = {"starter", "growth", "enterprise"}
+
+    for u in users:
+        summary["total_users"] += 1
+        plan = u.plan or "beta"
+        summary["plan_mix"][plan] = summary["plan_mix"].get(plan, 0) + 1
+
+        is_paid = plan in paid_plans
+        if is_paid:
+            summary["paid_users"] += 1
+        else:
+            summary["free_users"] += 1
+
+        exp = u.subscription_expires_at
+        if is_paid and exp:
+            if exp > now:
+                summary["active_subscriptions"] += 1
+                if exp <= soon_cutoff:
+                    summary["expiring_soon"] += 1
+                    sub_status = "expiring"
+                else:
+                    sub_status = "active"
+            else:
+                summary["expired"] += 1
+                sub_status = "expired"
+        else:
+            sub_status = "free"
+
+        days_to_expiry = None
+        if exp and exp > now:
+            days_to_expiry = (exp - now).days
+
+        is_linked = _sociovia_linked(u.id)
+        if is_linked:
+            summary["meta_connected"] += 1
+
+        is_dead = u.status in ("rejected", "suspended") or (
+            u.status == "pending_verification"
+            and u.created_at
+            and u.created_at < thirty_days_ago
+        )
+        if is_dead:
+            summary["inactive_dead"] += 1
+
+        if u.created_at and u.created_at >= thirty_days_ago:
+            summary["new_last_30d"] += 1
+
+        rows.append({
+            "id": u.id,
+            "name": u.name,
+            "email": u.email,
+            "phone": u.phone,
+            "role": getattr(u, "role", "user"),
+            "status": u.status,
+            "plan": plan,
+            "sub_status": sub_status,
+            "days_to_expiry": days_to_expiry,
+            "subscription_expires_at": exp.isoformat() if exp else None,
+            "auto_renew": False,
+            "meta_connected": is_linked,
+            "is_dead": is_dead,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+        })
+
+    return jsonify({"success": True, "summary": summary, "rows": rows})

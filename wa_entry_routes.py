@@ -196,8 +196,12 @@ def wa_entry_post():
         exchange["sociovia_user_id"], sociochat_uid, exchange["email"], workspace_id, next_path,
     )
 
-    # 303 See Other so the browser switches to GET after the POST
-    resp = make_response(redirect(next_path, code=303))
+    # Build redirect with sso=1 so the SPA runs SSO bootstrap.
+    sep = chr(38) if chr(63) in next_path else chr(63)
+    dest = next_path + sep + 'sso=1'
+    if workspace_id:
+        dest += chr(38) + 'ws=' + workspace_id
+    resp = make_response(redirect(dest, code=303))
     return resp
 
 
