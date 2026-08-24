@@ -41,10 +41,19 @@ def _decode_explicit_whatsapp_key(raw: str) -> Optional[bytes]:
     key_str = (raw or "").strip()
     if not key_str or key_str.lower() in _PLACEHOLDER_KEYS:
         return None
+    # A Fernet key IS the 44-char urlsafe-base64 string (it decodes to 32 bytes).
+    # Fernet() expects that base64 FORM, NOT the decoded raw 32 bytes. So when the
+    # env value is already a valid Fernet key, return it AS-IS — decoding it here
+    # produced raw bytes that Fernet rejected ("must be 32 url-safe base64-encoded
+    # bytes"), which silently broke encrypt_token for every new connect.
+    kb = key_str.encode()
     try:
-        return base64.urlsafe_b64decode(key_str.encode())
+        if len(base64.urlsafe_b64decode(kb)) == 32:
+            return kb
     except Exception:
-        return base64.urlsafe_b64encode(key_str.encode()[:32].ljust(32, b"0"))
+        pass
+    # Arbitrary/non-Fernet text: coerce into a valid Fernet key deterministically.
+    return base64.urlsafe_b64encode(key_str.encode()[:32].ljust(32, b"0"))
 
 
 def get_encryption_key() -> bytes:
@@ -105,6 +114,20 @@ def iter_fernet_decrypt_keys() -> List[bytes]:
                 add(_derive_fernet_key_from_secret(val))
             except Exception:
                 pass
+
+    # 3b) Legacy shared secrets from a SIBLING service (e.g. whatsapp-api) whose
+    # SECRET_KEY differs from this app's. Tokens encrypted there use a Fernet key
+    # KDF-derived from that secret; without this they are undecryptable here.
+    # Comma-separated raw secrets in WHATSAPP_LEGACY_SECRETS.
+    legacy = (os.getenv("WHATSAPP_LEGACY_SECRETS") or "").strip()
+    if legacy:
+        for sec in legacy.split(","):
+            sec = sec.strip()
+            if sec and sec.lower() not in _PLACEHOLDER_KEYS:
+                try:
+                    add(_derive_fernet_key_from_secret(sec))
+                except Exception:
+                    pass
 
     # 4) Flask app secret (some deployments only set secret_key)
     try:

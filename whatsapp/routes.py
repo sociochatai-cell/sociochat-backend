@@ -6973,14 +6973,18 @@ def connect_exchange():
     """
     import requests as http_requests
     from .models import WhatsAppAccount
-    
+
     data = request.get_json(silent=True) or {}
     code = data.get("code")
     workspace_id = data.get("workspace_id")
-    
-    if not code:
+
+    # A fresh Embedded Signup `code`, OR a "resume with choice" call that finishes a
+    # previously AMBIGUOUS connection: the user has now picked a WABA (waba_id supplied)
+    # and we reuse the access token stashed on the onboarding session (validated below).
+    _is_resume_choice = (not code) and bool(data.get("onboarding_session_id")) and bool(data.get("waba_id"))
+    if not code and not _is_resume_choice:
         return jsonify({"success": False, "error": "Authorization code is required"}), 400
-    
+
     if not workspace_id:
         return jsonify({"success": False, "error": "workspace_id is required"}), 400
 
@@ -7015,46 +7019,61 @@ def connect_exchange():
         ), 503
 
     try:
-        # Exchange code for access token (no redirect_uri needed for Embedded Signup)
-        token_resp = http_requests.get(
-            f"https://graph.facebook.com/{api_version}/oauth/access_token",
-            params={
-                "client_id": app_id,
-                "client_secret": app_secret,
-                "code": code,
-            },
-            timeout=15,
-        ).json()
-        
-        logger.info(f"Token exchange response: {token_resp}")
-        
-        if "error" in token_resp:
-            raise ValueError(f"Token exchange failed: {token_resp['error'].get('message', 'Unknown error')}")
-        
-        access_token = token_resp.get("access_token")
-        if not access_token:
-            raise ValueError("No access_token in response")
+        if code:
+            # Exchange code for access token (no redirect_uri needed for Embedded Signup)
+            token_resp = http_requests.get(
+                f"https://graph.facebook.com/{api_version}/oauth/access_token",
+                params={
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "code": code,
+                },
+                timeout=15,
+            ).json()
 
-        # Meta Tech Provider: Embedded Signup code exchange returns the business integration
-        # token. Skip fb_exchange_token unless explicitly enabled (exchange can downgrade partner tokens).
-        if os.getenv("WHATSAPP_EMBEDDED_SIGNUP_LONG_LIVED", "false").lower() == "true":
-            try:
-                long_token_resp = http_requests.get(
-                    f"https://graph.facebook.com/{api_version}/oauth/access_token",
-                    params={
-                        "grant_type": "fb_exchange_token",
-                        "client_id": app_id,
-                        "client_secret": app_secret,
-                        "fb_exchange_token": access_token,
-                    },
-                    timeout=15,
-                ).json()
-                if "access_token" in long_token_resp:
-                    access_token = long_token_resp["access_token"]
-                    logger.info("Got long-lived token")
-            except Exception as e:
-                logger.warning(f"Failed to get long-lived token: {e}")
-        
+            logger.info(f"Token exchange response: {token_resp}")
+
+            if "error" in token_resp:
+                raise ValueError(f"Token exchange failed: {token_resp['error'].get('message', 'Unknown error')}")
+
+            access_token = token_resp.get("access_token")
+            if not access_token:
+                raise ValueError("No access_token in response")
+
+            # Meta Tech Provider: Embedded Signup code exchange returns the business integration
+            # token. Skip fb_exchange_token unless explicitly enabled (exchange can downgrade partner tokens).
+            if os.getenv("WHATSAPP_EMBEDDED_SIGNUP_LONG_LIVED", "false").lower() == "true":
+                try:
+                    long_token_resp = http_requests.get(
+                        f"https://graph.facebook.com/{api_version}/oauth/access_token",
+                        params={
+                            "grant_type": "fb_exchange_token",
+                            "client_id": app_id,
+                            "client_secret": app_secret,
+                            "fb_exchange_token": access_token,
+                        },
+                        timeout=15,
+                    ).json()
+                    if "access_token" in long_token_resp:
+                        access_token = long_token_resp["access_token"]
+                        logger.info("Got long-lived token")
+                except Exception as e:
+                    logger.warning(f"Failed to get long-lived token: {e}")
+        else:
+            # RESUME WITH CHOICE: the first (ambiguous) exchange already spent the
+            # single-use code and stashed the access token on the onboarding session.
+            # Reuse it so the user's WABA selection can complete without re-login.
+            from .encryption import decrypt_token as _decrypt_token
+            _stashed = (ob_session.session_payload or {}).get("exchange_access_token") if ob_session else None
+            access_token = _decrypt_token(_stashed) if _stashed else None
+            if not access_token:
+                return jsonify({
+                    "success": False,
+                    "error": "connect_session_expired",
+                    "message": "Your connection session expired. Please click Connect again and pick your number.",
+                }), 400
+            logger.info("connect/exchange resume: reusing stashed session token for WABA selection")
+
         from .meta_asset_discovery import DiscoveryAmbiguousError, resolve_binding_for_auto_connect
         from .tech_provider_onboarding import (
             apply_hint_overrides,
@@ -7099,6 +7118,17 @@ def connect_exchange():
                     )
                 except Exception as attach_e:
                     logger.warning("onboarding attach_exchange_context: %s", attach_e)
+                # Stash the (encrypted) access token so the user's WABA choice can
+                # finish via a resume call WITHOUT re-running Embedded Signup (the
+                # login code is single-use and already spent above).
+                try:
+                    from .encryption import encrypt_token as _encrypt_token
+                    _pl = dict(ob_session.session_payload or {})
+                    _pl["exchange_access_token"] = _encrypt_token(access_token)
+                    ob_session.session_payload = _pl
+                    get_db().commit()
+                except Exception as _stash_e:
+                    logger.warning("stash exchange token for WABA choice: %s", _stash_e)
             body = {
                 "success": False,
                 "error": str(e),
@@ -8410,8 +8440,11 @@ def upload_chat_media():
         # Get S3/Spaces config
         SPACE_NAME = os.environ.get("SPACE_NAME") or os.environ.get("DO_SPACES_BUCKET")
         SPACE_REGION = os.environ.get("SPACE_REGION") or os.environ.get("DO_SPACES_REGION")
-        ACCESS_KEY = os.environ.get("ACCESS_KEY") or os.environ.get("DO_ACCESS_KEY_ID")
-        SECRET_KEY = os.environ.get("SECRET_KEY") or os.environ.get("DO_SECRET_ACCESS_KEY")
+        # Prefer DO Spaces-specific credential names. NOTE: the generic SECRET_KEY env
+        # holds the FLASK session secret (wrong for Spaces) — reading it here caused
+        # SignatureDoesNotMatch -> "upload_failed". DO_SPACES_SECRET_KEY is the real key.
+        ACCESS_KEY = os.environ.get("DO_SPACES_ACCESS_KEY") or os.environ.get("ACCESS_KEY") or os.environ.get("DO_ACCESS_KEY_ID")
+        SECRET_KEY = os.environ.get("DO_SPACES_SECRET_KEY") or os.environ.get("DO_SECRET_ACCESS_KEY") or os.environ.get("SECRET_KEY")
         
         if not all([SPACE_NAME, SPACE_REGION, ACCESS_KEY, SECRET_KEY]):
             logger.error("S3/Spaces configuration not complete")
