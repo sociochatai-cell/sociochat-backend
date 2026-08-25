@@ -957,13 +957,22 @@ def _agent_tools() -> List[Tool]:
                     "required": ["query"],
                 },
             ),
-            # PHASE 2 — workspace-knowledge tool.
+            # PHASE 2 — workspace-knowledge tools.
             FunctionDeclaration(
                 name="get_business_info",
                 description=(
                     "Get THIS business's own profile — name, industry/type, description, website, "
                     "city and country. Use when the customer asks who you are, what the business does, "
                     "where it is located, or for general company info."
+                ),
+                parameters={"type": "object", "properties": {}},
+            ),
+            FunctionDeclaration(
+                name="list_products",
+                description=(
+                    "List the business's products/services from their connected WhatsApp catalog "
+                    "(name, price, description, availability). Use when the customer asks what you "
+                    "sell, your products or services, prices, or to see the catalog."
                 ),
                 parameters={"type": "object", "properties": {}},
             ),
@@ -1065,6 +1074,34 @@ class WhatsAppAIChatbot:
                     return {"found": False, "note": "No business profile on file for this workspace."}
                 info = {k: v for k, v in dict(row).items() if v}
                 return {"found": True, "business": info}
+            if name == "list_products":
+                import requests as _rq
+                from .models import WhatsAppAccount as _WA
+                from .encryption import decrypt_token as _dt
+                acc = _WA.query.filter_by(workspace_id=str(self.config.workspace_id), is_active=True).first()
+                if not acc or not acc.access_token_encrypted or not acc.waba_id:
+                    return {"found": False, "note": "No connected WhatsApp catalog for this business."}
+                tok = _dt(acc.access_token_encrypted)
+                if not tok:
+                    return {"found": False, "note": "Catalog is temporarily unavailable."}
+                api = os.getenv("WHATSAPP_API_VERSION") or os.getenv("FB_API_VERSION") or "v23.0"
+                base = "https://graph.facebook.com/" + api
+                auth = {"Authorization": "Bearer " + tok}
+                cr = _rq.get(base + "/" + str(acc.waba_id) + "/product_catalogs",
+                             params={"fields": "id,name,product_count"}, headers=auth, timeout=12).json()
+                cats = cr.get("data") or []
+                cat = next((c for c in cats if (c.get("product_count") or 0) > 0), cats[0] if cats else None)
+                if not cat:
+                    return {"found": False, "note": "No product catalog is connected yet."}
+                pr = _rq.get(base + "/" + str(cat["id"]) + "/products",
+                             params={"fields": "name,price,description,availability", "limit": 20},
+                             headers=auth, timeout=12).json()
+                prods = []
+                for p in (pr.get("data") or [])[:20]:
+                    prods.append({k: p.get(k) for k in ("name", "price", "description", "availability") if p.get(k)})
+                if not prods:
+                    return {"found": False, "note": "The catalog has no products listed yet."}
+                return {"found": True, "catalog": cat.get("name"), "count": len(prods), "products": prods}
             return {"error": f"unknown_tool:{name}"}
         except Exception as e:  # noqa: BLE001
             logger.warning("[ai_chatbot][agent] tool %s failed: %s", name, e)
