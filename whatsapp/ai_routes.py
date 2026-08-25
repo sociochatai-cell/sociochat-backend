@@ -389,6 +389,35 @@ def disable_ai(account_id: int, account: WhatsAppAccount, workspace_id: str):
         return jsonify({"error": "Failed to disable AI"}), 500
 
 
+@ai_bp.route('/<int:account_id>/ai/agent-mode', methods=['GET', 'POST'])
+@require_account_access
+def agent_mode(account_id: int, account: WhatsAppAccount, workspace_id: str):
+    """Advanced AI-agent brain toggle — SEPARATE from the bot on/off (ai/enable).
+    When ON, the chatbot uses the function-calling agent (tools) instead of pure RAG.
+    GET  -> {"ai_agent_mode": bool}
+    POST {"enabled": true|false} -> set it.
+    """
+    try:
+        if request.method == 'GET':
+            return jsonify({
+                "success": True,
+                "ai_agent_mode": bool(getattr(account, "ai_agent_mode", False)),
+            }), 200
+        data = request.get_json(silent=True) or {}
+        enabled = bool(data.get("enabled"))
+        account.ai_agent_mode = enabled
+        db.session.commit()
+        return jsonify({
+            "success": True,
+            "ai_agent_mode": enabled,
+            "message": "Advanced AI agent enabled" if enabled else "Advanced AI agent disabled",
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.exception(f"Error setting agent mode: {e}")
+        return jsonify({"error": "Failed to update agent mode"}), 500
+
+
 # ============================================================
 # Intent Detection Endpoints
 # ============================================================

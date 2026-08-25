@@ -434,6 +434,10 @@ class WhatsAppAccount(db.Model):
 
     # Bot / AI settings slice (legacy columns + whatsapp_bot_settings; shadow-written from microservice)
     ai_enabled = db.Column(db.Boolean, nullable=True)
+    # NEW advanced AI-agent brain toggle (Gemini function-calling). SEPARATE from
+    # ai_enabled (which turns the bot on/off). Default off → the bot uses the legacy
+    # pure-RAG path; ON → agent brain with tools. Auto-added by WHATSAPP_ORM_COLUMN_SYNC.
+    ai_agent_mode = db.Column(db.Boolean, nullable=True, default=False)
     ai_model = db.Column(db.String(50), nullable=True)
     temperature = db.Column(db.Float, nullable=True)
     max_tokens = db.Column(db.Integer, nullable=True)

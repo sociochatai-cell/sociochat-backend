@@ -27,7 +27,7 @@ from pathlib import Path
 
 # New GenAI SDK
 from google import genai
-from google.genai.types import HttpOptions, GenerateContentConfig
+from google.genai.types import HttpOptions, GenerateContentConfig, Tool, FunctionDeclaration, Part, Content
 
 logger = logging.getLogger(__name__)
 
@@ -896,6 +896,71 @@ RESPONSE:"""
 # AI Chatbot Class
 # ============================================================
 
+# =====================================================================
+# PHASE 1 — Agent brain (function-calling). SEPARATE from the chatbot
+# on/off toggle: this only chooses WHICH brain runs when the bot is ON.
+# Gated by WHATSAPP_AI_AGENT_MODE (default OFF) → legacy pure-RAG path is
+# used unless explicitly enabled. Per-workspace override lands in a later phase.
+# =====================================================================
+def _ai_agent_mode_enabled(workspace_id: Optional[Any] = None) -> bool:
+    """NEW advanced-agent brain gate — SEPARATE from the chatbot on/off toggle.
+    ON when the global env flag is set OR the workspace's WhatsApp account has
+    ai_agent_mode=True (the per-workspace UI toggle). FAIL-SAFE: any DB error →
+    env-only result, so behavior never breaks."""
+    raw = (os.getenv("WHATSAPP_AI_AGENT_MODE", "false") or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if workspace_id:
+        try:
+            from .models import WhatsAppAccount
+            acc = (
+                WhatsAppAccount.query
+                .filter_by(workspace_id=str(workspace_id))
+                .filter(WhatsAppAccount.ai_agent_mode.is_(True))
+                .first()
+            )
+            if acc is not None:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+AGENT_SYSTEM_ADDENDUM = """
+
+You are an AI assistant for this business on WhatsApp. You may call tools to help the customer.
+- Call `search_knowledge_base` AT MOST ONCE per customer question to look up FAQs, policies, products and services.
+- If it returns results, base your answer on them; NEVER invent prices, policies, or product details.
+- If it returns NO results, do NOT call it again — answer helpfully from the conversation, or say a team member will assist shortly.
+- Always finish your turn with a plain-text reply to the customer (no markdown), match the customer's language, keep it concise for WhatsApp."""
+
+
+def _agent_tools() -> List[Tool]:
+    """Tool declarations exposed to the model. PHASE 1: only the RAG search.
+    Later phases append workspace-data, catalog, template and transaction tools."""
+    return [
+        Tool(function_declarations=[
+            FunctionDeclaration(
+                name="search_knowledge_base",
+                description=(
+                    "Search the business knowledge base (FAQs, policies, products, services) "
+                    "for information to answer the customer's question."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "What to look up — usually the customer's question or a keyword.",
+                        }
+                    },
+                    "required": ["query"],
+                },
+            ),
+        ]),
+    ]
+
+
 class WhatsAppAIChatbot:
     """AI-powered chatbot for WhatsApp conversations."""
     
@@ -952,6 +1017,115 @@ class WhatsAppAIChatbot:
             turns.append({"role": "user", "parts": [{"text": current_message}]})
         return turns
 
+    def _execute_agent_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Run one agent tool and return a JSON-serializable result. PHASE 1: only
+        search_knowledge_base (wraps the existing RAG). FAIL-SAFE: never raises."""
+        try:
+            if name == "search_knowledge_base":
+                q = (args.get("query") or "").strip()
+                chunks, _hc = get_rag_context(
+                    query=q,
+                    workspace_id=self.config.workspace_id,
+                    top_k=self.config.rag_top_k,
+                    threshold=self.config.rag_confidence_threshold,
+                )
+                chunks = chunks or []
+                texts: List[str] = []
+                for c in chunks[:5]:
+                    t = c.get("text") or c.get("content") or c.get("chunk") or ""
+                    if t:
+                        texts.append(t)
+                mx = max((float(c.get("score", 0) or 0) for c in chunks), default=0.0)
+                out: Dict[str, Any] = {"results": texts, "count": len(texts), "max_score": mx}
+                if not texts:
+                    out["note"] = ("No knowledge-base entries matched. Do NOT search again — "
+                                   "answer the customer directly or offer to connect a team member.")
+                return out
+            return {"error": f"unknown_tool:{name}"}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[ai_chatbot][agent] tool %s failed: %s", name, e)
+            return {"error": str(e), "results": [], "count": 0}
+
+    def _generate_agentic(self, message: str, context: Optional[List[Dict[str, str]]] = None) -> ChatResponse:
+        """PHASE 1 agent brain (behind WHATSAPP_AI_AGENT_MODE, default OFF).
+        A Gemini function-calling loop that currently exposes ONE tool
+        (search_knowledge_base = the existing RAG). Additive — generate_response()
+        wraps this in try/except and falls back to the legacy path on any error."""
+        import time
+        start_time = time.time()
+        system_prompt = (self.config.system_prompt or DEFAULT_SYSTEM_PROMPT) + AGENT_SYSTEM_ADDENDUM
+        if getattr(self.config, "flow_context", None):
+            system_prompt += "\n\nCONVERSATION FLOW CONTEXT:\n" + str(self.config.flow_context)
+        contents = self._build_contents(context, message)  # list[dict]
+        tools = _agent_tools()
+        out_tokens = max(256, min(int(self.config.max_tokens or DEFAULT_MAX_OUTPUT_TOKENS), 8192))
+        used_rag = False
+        rag_chunks = 0
+        max_score = 0.0
+        MAX_STEPS = 4
+        for step in range(MAX_STEPS):
+            # On the final step, drop tools so the model MUST return a text reply
+            # (guarantees a real answer instead of "loop exhausted").
+            force_final = step == (MAX_STEPS - 1)
+            response = self.client.models.generate_content(
+                model=self.config.model,
+                contents=contents,
+                config=GenerateContentConfig(
+                    max_output_tokens=out_tokens,
+                    temperature=self.config.temperature,
+                    system_instruction=system_prompt,
+                    tools=(None if force_final else tools),
+                ),
+            )
+            cand = (getattr(response, "candidates", None) or [None])[0]
+            parts = list(getattr(getattr(cand, "content", None), "parts", None) or [])
+            calls = [p.function_call for p in parts if getattr(p, "function_call", None)]
+
+            if not calls:
+                text = self._clean_response((response.text or "").strip()) if getattr(response, "text", None) else ""
+                elapsed = int((time.time() - start_time) * 1000)
+                if not text:
+                    return ChatResponse(
+                        message=self.config.fallback_message, success=False,
+                        escalate_to_human=True, escalation_reason="agent_empty_response",
+                        model_used=self.config.model, response_time_ms=elapsed,
+                        used_rag=used_rag, rag_chunks=rag_chunks, rag_max_score=max_score,
+                    )
+                logger.info("[ai_chatbot][agent] done step=%s used_rag=%s chunks=%s ms=%s",
+                            step, used_rag, rag_chunks, elapsed)
+                return ChatResponse(
+                    message=text, success=True, model_used=self.config.model,
+                    response_time_ms=elapsed, used_rag=used_rag,
+                    rag_chunks=rag_chunks, rag_max_score=max_score,
+                )
+
+            # Model asked to call one or more tools. Append the model's ACTUAL response
+            # content (this preserves the Gemini 3.x thought_signature on the function_call
+            # parts — required, else the next turn 400s), run the tools, then feed the
+            # function responses back as a proper Content of Part.from_function_response.
+            if getattr(cand, "content", None) is not None:
+                contents.append(cand.content)
+            resp_parts: List[Any] = []
+            for fc in calls:
+                nm = fc.name
+                fargs = dict(fc.args or {})
+                result = self._execute_agent_tool(nm, fargs)
+                if nm == "search_knowledge_base":
+                    used_rag = True
+                    rag_chunks = max(rag_chunks, int(result.get("count", 0) or 0))
+                    max_score = max(max_score, float(result.get("max_score", 0.0) or 0.0))
+                resp_parts.append(Part.from_function_response(name=nm, response=result))
+            contents.append(Content(role="user", parts=resp_parts))
+
+        logger.warning("[ai_chatbot][agent] loop exhausted after %s steps", MAX_STEPS)
+        return ChatResponse(
+            message=self.config.fallback_message, success=False,
+            escalate_to_human=True, escalation_reason="agent_loop_exhausted",
+            model_used=self.config.model,
+            response_time_ms=int((time.time() - start_time) * 1000),
+            used_rag=used_rag, rag_chunks=rag_chunks, rag_max_score=max_score,
+        )
+
     def generate_response(self, message: str, context: Optional[List[Dict[str, str]]] = None) -> ChatResponse:
         """
         Generate AI response with RAG integration. FAIL-SAFE.
@@ -972,7 +1146,16 @@ class WhatsAppAIChatbot:
                 escalate_to_human=True,
                 escalation_reason="ai_not_configured",
             )
-        
+
+        # PHASE 1 gate: advanced agent brain (separate OFF-by-default toggle,
+        # WHATSAPP_AI_AGENT_MODE). When ON, run the function-calling loop; on ANY
+        # error fall through to the legacy pure-RAG path below (never regress).
+        if _ai_agent_mode_enabled(self.config.workspace_id) and self.config.workspace_id:
+            try:
+                return self._generate_agentic(message, context)
+            except Exception as _agent_e:  # noqa: BLE001
+                logger.exception("[ai_chatbot] agent mode error; falling back to legacy RAG: %s", _agent_e)
+
         try:
             if _ai_debug_enabled():
                 logger.info(
