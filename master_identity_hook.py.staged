@@ -1,0 +1,117 @@
+"""
+Phase A signup hook: mirror a VERIFIED SocioChat T0000 user into Sociovia (master).
+
+  *** STAGED — NOT wired into the running app yet. Deploy only after the full
+      set of pieces is built and tested together. ***
+
+Fires when a SocioChat user verifies their email (account becomes active):
+  - T0000 (tenant_id == 1) ONLY. Whitelabel never reaches Sociovia.
+  - If a Sociovia user with that email already exists -> LINK (keep their password).
+  - Else -> CREATE a Sociovia identity, COPYING the password_hash so the SAME
+    password works on both sides (both apps use werkzeug scrypt).
+  - Record the link in sync_user_map so the mapping exists from day one.
+
+SAFETY:
+  - Additive only (creates new master rows; never updates/deletes existing).
+  - Failure-isolated: wrapped so it can NEVER break signup/verification. If Sociovia
+    is unreachable, the SocioChat user still verifies and logs in normally.
+"""
+from __future__ import annotations
+
+import os
+import logging
+from functools import lru_cache
+
+from sqlalchemy import create_engine, text
+from models import db
+
+log = logging.getLogger("master_identity_hook")
+
+
+@lru_cache(maxsize=1)
+def _master_engine():
+    uri = os.getenv("SOCIOVIA_DB_URL", "").strip()
+    if not uri:
+        log.warning("SOCIOVIA_DB_URL not set; signup hook is a no-op")
+        return None
+    return create_engine(uri, pool_pre_ping=True, pool_size=2, max_overflow=3, pool_recycle=280)
+
+
+def mirror_user_to_master(user) -> None:
+    """Mirror a just-verified SocioChat user into Sociovia. Never raises."""
+    try:
+        # T0000 (main) only — whitelabel stays isolated in SocioChat.
+        if getattr(user, "tenant_id", None) != 1:
+            return
+
+        eng = _master_engine()
+        if eng is None:
+            return
+
+        email = (user.email or "").strip().lower()
+        if not email:
+            return
+
+        # Already linked? (idempotent)
+        row = db.session.execute(
+            text("SELECT sociovia_user_id FROM sync_user_map "
+                 "WHERE lower(email)=lower(:e) AND sociovia_user_id IS NOT NULL"),
+            {"e": email},
+        ).first()
+        if row and row[0]:
+            return
+
+        with eng.begin() as conn:
+            # Link an existing master account by email, else create a new one.
+            sv_id = conn.execute(
+                text("SELECT id FROM users WHERE lower(email)=lower(:e) ORDER BY id LIMIT 1"),
+                {"e": email},
+            ).scalar()
+            if not sv_id:
+                sv_id = conn.execute(
+                    text("INSERT INTO users "
+                         "(name, email, phone, business_name, industry, password_hash, "
+                         " status, email_verified, tenant_id, created_at, updated_at) "
+                         "VALUES (:n, :e, :p, :b, :i, :ph, 'active', true, 1, now(), now()) "
+                         "RETURNING id"),
+                    {"n": getattr(user, "name", None),
+                     "e": email,
+                     "p": getattr(user, "phone", None),
+                     "b": getattr(user, "business_name", None),
+                     "i": getattr(user, "industry", None),
+                     "ph": user.password_hash},        # copy hash -> same password both sides
+                ).scalar()
+
+        # Record the mapping (isolated table; idempotent).
+        db.session.execute(
+            text("INSERT INTO sync_user_map "
+                 "(email, sociovia_user_id, sociochat_user_id, sync_enabled, synced_at) "
+                 "VALUES (:e, :sv, :sc, true, now()) "
+                 "ON CONFLICT (email) DO UPDATE SET "
+                 "  sociovia_user_id=EXCLUDED.sociovia_user_id, "
+                 "  sociochat_user_id=EXCLUDED.sociochat_user_id, updated_at=now()"),
+            {"e": email, "sv": sv_id, "sc": user.id},
+        )
+        db.session.commit()
+        log.info("signup-hook: mirrored sociochat user %s -> sociovia user %s (%s)",
+                 user.id, sv_id, email)
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        log.exception("mirror_user_to_master failed for sociochat user %s",
+                      getattr(user, "id", None))
+
+
+# ---------------------------------------------------------------------------
+# DEPLOY STEP (apply later, after full testing) — in auth_routes.py verify_email(),
+# right AFTER `db.session.commit()` that sets email_verified=True/status="active":
+#
+#     # Phase A: mirror verified T0000 user into Sociovia master. Failure-isolated.
+#     try:
+#         from master_identity_hook import mirror_user_to_master
+#         mirror_user_to_master(user)
+#     except Exception:
+#         pass
+# ---------------------------------------------------------------------------

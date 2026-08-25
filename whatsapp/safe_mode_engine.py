@@ -70,7 +70,12 @@ def is_risk_allowed(account: WhatsAppAccount, risk_class: RiskClass) -> bool:
         return risk_class != RiskClass.VERY_HIGH
         
     if mode == OperationalMode.ADVISORY_SAFE_MODE:
-        # If in safe mode, suppress High and Very High risk automation
+        # Advisory-first: when the account is in advisory-only posture (the
+        # default), Safe Mode WARNS but does not block high-risk bulk sends.
+        # Enforcement (suppressing High/Very-High) only applies when an operator
+        # has explicitly cleared advisory-only via a time-boxed override.
+        if bool(getattr(account, "safe_mode_advisory_only", True)):
+            return True
         return risk_class in (RiskClass.LOW, RiskClass.MEDIUM)
         
     if mode == OperationalMode.DEGRADED:
