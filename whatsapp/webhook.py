@@ -662,10 +662,18 @@ class WebhookProcessor:
 
             # Auto-send a PayU payment link if enabled (SocioChat-only; removable).
             try:
+                # NOTE: inbound webhooks reach this worker via the internal redirect
+                # (host = sociochat-backend:8080), so request.host_url would produce a
+                # NON-public pay link that customers can't open. Pass host_url="" so
+                # _public_base() falls back to COMMERCE_PUBLIC_BASE_URL / APP_BASE_URL —
+                # the same public base the AI-agent request_payment path uses. Only use
+                # the request host when it is genuinely public (http/https, not internal).
                 from flask import request as _flask_request
                 _host = ""
                 try:
-                    _host = _flask_request.host_url
+                    _rh = (_flask_request.host_url or "").strip()
+                    if _rh and "sociochat-backend" not in _rh and ":8080" not in _rh:
+                        _host = _rh
                 except Exception:
                     _host = ""
                 from whatsapp.commerce_pay.auto import maybe_auto_request_payment
