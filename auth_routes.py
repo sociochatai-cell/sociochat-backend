@@ -118,6 +118,24 @@ def signup():
         }), 400
 
     verification_code = generate_code()
+    pwd_hash = generate_password_hash(password)
+
+    # Master/slave (flag REVERSE_PROVISION, DEFAULT OFF): for the internal tenant
+    # (T0000) the user id is allotted by the Sociovia MASTER. Provision the master
+    # user FIRST (same email + same password hash) and adopt its id, so a
+    # SocioChat-first user is same-id AND exists on Sociovia from birth. Whitelabel
+    # tenants (tenant_id != 1) keep their own local id. Best-effort: any failure
+    # falls back to a normal local id so signup NEVER breaks.
+    adopt_master_id = None
+    if tenant_id == 1:
+        try:
+            from reverse_sync import provision_sociovia_user, _reverse_provision_enabled
+            if _reverse_provision_enabled():
+                mid = provision_sociovia_user(email, name, pwd_hash)
+                if mid and User.query.get(mid) is None:
+                    adopt_master_id = mid
+        except Exception:
+            logger.exception("master provision failed (non-fatal); using local id")
 
     user = User(
         tenant_id=tenant_id,
@@ -126,24 +144,68 @@ def signup():
         phone=phone,
         business_name=business_name,
         industry=industry,
-        password_hash=generate_password_hash(password),
+        password_hash=pwd_hash,
         verification_code_hash=generate_password_hash(verification_code),
         verification_expires_at=datetime.utcnow() + timedelta(minutes=15),
         email_verified=False,
         status="pending_verification",
     )
+    if adopt_master_id is not None:
+        user.id = adopt_master_id
     db.session.add(user)
     db.session.commit()
 
+    # Link the two identities so sync + reverse both recognise this user.
+    if adopt_master_id is not None:
+        try:
+            from sqlalchemy import text as _text
+            db.session.execute(_text(
+                "INSERT INTO sync_user_map (email, sociovia_user_id, sociochat_user_id, sync_enabled, synced_at) "
+                "VALUES (:e, :sv, :sc, true, NOW()) ON CONFLICT (email) DO UPDATE "
+                "SET sociovia_user_id=EXCLUDED.sociovia_user_id, sociochat_user_id=EXCLUDED.sociochat_user_id, "
+                "sync_enabled=true, updated_at=NOW()"),
+                {"e": email, "sv": adopt_master_id, "sc": user.id})
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception("sync_user_map link failed (non-fatal) for %s", email)
+
     log_action("system", "user_signup", user.id, {"email": email})
 
-    # Auto-create initial workspace placeholder
+    # Auto-create initial workspace placeholder. For a master-provisioned (T0000)
+    # signup, the workspace ALSO adopts a Sociovia master workspace id so user AND
+    # workspace share the same id on both sides. Best-effort; falls back to local id.
+    ws_master_id = None
+    if adopt_master_id is not None:
+        try:
+            from reverse_sync import provision_sociovia_workspace
+            wm = provision_sociovia_workspace(adopt_master_id, business_name)
+            if wm and Workspace.query.get(wm) is None:
+                ws_master_id = wm
+        except Exception:
+            logger.exception("workspace master provision failed (non-fatal)")
+
     workspace = Workspace(
         user_id=user.id,
         business_name=business_name,
     )
+    if ws_master_id is not None:
+        workspace.id = ws_master_id
     db.session.add(workspace)
     db.session.commit()
+
+    if ws_master_id is not None:
+        try:
+            from sqlalchemy import text as _text2
+            db.session.execute(_text2(
+                "INSERT INTO sync_workspace_map (owner_email, sociovia_workspace_id, sociochat_workspace_id, "
+                "workspace_name, origin, synced_at) VALUES (:e, :sv, :sc, :nm, 'sociochat', NOW()) "
+                "ON CONFLICT (sociovia_workspace_id) DO NOTHING"),
+                {"e": email, "sv": ws_master_id, "sc": workspace.id, "nm": business_name})
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception("sync_workspace_map link failed (non-fatal) for %s", email)
 
     email_sent = False
     sms_sent = False

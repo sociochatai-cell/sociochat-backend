@@ -240,9 +240,13 @@ def _enforce_workspace_ownership():
     if ws is None:
         return  # let the route return its own 404
     if ws.user_id != user.id:
-        logger.warning("blocked_cross_workspace user=%s ws=%s owner=%s path=%s",
-                       user.id, wid_int, ws.user_id, path)
-        return jsonify({"success": False, "error": "forbidden_workspace"}), 403
+        # Admin users have cross-workspace access (master-slave shared workspaces)
+        if getattr(user, 'role', None) == 'admin':
+            pass
+        else:
+            logger.warning("blocked_cross_workspace user=%s ws=%s owner=%s path=%s",
+                           user.id, wid_int, ws.user_id, path)
+            return jsonify({"success": False, "error": "forbidden_workspace"}), 403
 
 
 # ---------- Fail-closed authentication gate ----------
@@ -357,6 +361,13 @@ try:
     app.register_blueprint(wa_entry_bp, url_prefix="/api/auth")
 except Exception as _e:
     import logging; logging.getLogger(__name__).warning("wa_entry_bp: %s", _e)
+
+# Register Sync Blueprint (Return-to-Sociovia button + workspace sync)
+try:
+    from sync_routes import sync_bp
+    app.register_blueprint(sync_bp)
+except Exception as _e:
+    import logging; logging.getLogger(__name__).warning("sync_bp: %s", _e)
 
 # Register SMS OTP Blueprint
 from sms_routes import sms_bp
@@ -907,13 +918,48 @@ def create_workspace():
 
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or data.get("business_name") or "").strip()
+
+    # Same-id master/slave (T0000): replicate a SocioChat-created workspace to
+    # Sociovia with the SAME id. Provision the Sociovia master workspace FIRST
+    # (under the user's linked master id) and adopt its id locally. Gated by
+    # REVERSE_PROVISION; whitelabel tenants keep their local id. Best-effort — a
+    # sync failure can never break workspace creation.
+    ws_master_id = None
+    try:
+        if getattr(user, "tenant_id", None) == 1:
+            from sqlalchemy import text as _wtext
+            _row = db.session.execute(_wtext(
+                "SELECT sociovia_user_id FROM sync_user_map "
+                "WHERE lower(email)=lower(:e) AND sync_enabled=true AND sociovia_user_id IS NOT NULL"),
+                {"e": user.email}).first()
+            _sv_uid = _row[0] if _row else None
+            if _sv_uid:
+                from reverse_sync import provision_sociovia_workspace
+                _wm = provision_sociovia_workspace(_sv_uid, name)
+                if _wm and Workspace.query.get(_wm) is None:
+                    ws_master_id = _wm
+    except Exception:
+        pass
+
     workspace = Workspace(user_id=user.id, business_name=name or None)
+    if ws_master_id is not None:
+        workspace.id = ws_master_id
     db.session.add(workspace)
     db.session.commit()
 
-    # Phase-2 cross-app sync: mirror this new workspace into Sociovia for linked
-    # users. No-op unless SOCIOVIA_WORKSPACE_SYNC_ENABLED=1 and the user is linked.
-    # Failure-isolated so a sync problem can never break workspace creation.
+    if ws_master_id is not None:
+        try:
+            from sqlalchemy import text as _wtext2
+            db.session.execute(_wtext2(
+                "INSERT INTO sync_workspace_map (owner_email, sociovia_workspace_id, sociochat_workspace_id, "
+                "workspace_name, origin, synced_at) VALUES (:e, :sv, :sc, :nm, 'sociochat', NOW()) "
+                "ON CONFLICT (sociovia_workspace_id) DO NOTHING"),
+                {"e": user.email, "sv": ws_master_id, "sc": workspace.id, "nm": name})
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+    # Legacy no-op reverse hook (kept harmless for older linked users).
     try:
         from sociovia_sync import mirror_workspace_to_sociovia
         mirror_workspace_to_sociovia(user.id, workspace.id, workspace.business_name)
