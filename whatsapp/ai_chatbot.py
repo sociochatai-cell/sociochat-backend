@@ -944,7 +944,7 @@ You are an AI assistant for this business on WhatsApp. You may call tools to hel
 - If it returns results, base your answer on them; NEVER invent prices, policies, or product details.
 - If it returns NO results, do NOT call it again — answer helpfully from the conversation, or say a team member will assist shortly.
 - When the customer wants to SEE, browse or buy products / see the catalog, call `send_products` to send visual product cards (do NOT just list them as text). When offering clear choices or a next step, call `send_buttons` (max 3). These visual messages are sent ALONGSIDE your text reply — so still write a short friendly text reply too.
-- When the customer has AGREED to buy and the amount is known, confirm the amount, then call `request_payment` to send them a secure payment link. Never guess an amount — use the real product price or one the customer confirmed.
+- When the customer has AGREED to buy and the amount is known, confirm the amount, then call `request_payment` to send them a secure payment link. Pass the EXACT amount the customer stated or the exact product/cart price — copy the number precisely, never round it, add to it, or change it. If the customer says "1 rupee", the amount is exactly 1.
 - When the customer asks for a human/agent, is upset, or has a request you cannot handle, call `escalate_to_human` and tell them a team member will follow up shortly.
 - Prefer normal text/interactive replies during a live chat. Only use approved TEMPLATES for structured or re-engagement content (a confirmation, reminder, or offer): call `list_templates` first to see what exists and how many variables each needs, then `send_template` with the values in order. Never invent a template name.
 - Always finish your turn with a plain-text reply to the customer (no markdown), match the customer's language, keep it concise for WhatsApp."""
@@ -1078,7 +1078,7 @@ def _agent_tools(disabled: Optional[set] = None) -> List[Tool]:
                     "properties": {
                         "amount": {
                             "type": "number",
-                            "description": "Total amount to charge, in INR (e.g. 4999).",
+                            "description": "Exact total to charge in INR — copy the number the customer stated or the exact product/cart price. Never round or change it (customer says '1 rupee' → 1).",
                         },
                         "product_info": {
                             "type": "string",
