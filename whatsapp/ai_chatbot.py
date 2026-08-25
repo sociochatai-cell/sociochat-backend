@@ -1114,15 +1114,16 @@ def _agent_tools() -> List[Tool]:
             FunctionDeclaration(
                 name="book_appointment",
                 description=(
-                    "Record an appointment / meeting / call the customer wants to book. Use only when "
-                    "the customer has given a specific date and time. Confirm the date and time back to "
-                    "them in your reply. The customer's phone is captured automatically."
+                    "Record an appointment / meeting / call the customer wants to book. Use whenever the "
+                    "customer indicates a day and time, in ANY wording or order (e.g. 'tomorrow at 4pm', "
+                    "'next Monday 11', '3pm on the 10th', 'Sept 10 afternoon'). Resolve it against today's "
+                    "date (given in your instructions). Confirm the final date and time back to them."
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
-                        "date": {"type": "string", "description": "Appointment date in YYYY-MM-DD format."},
-                        "time": {"type": "string", "description": "Appointment time in 24h HH:MM format."},
+                        "date": {"type": "string", "description": "Appointment date, preferably YYYY-MM-DD (other formats are accepted and normalized)."},
+                        "time": {"type": "string", "description": "Appointment time, preferably 24h HH:MM (e.g. '3pm' is also accepted)."},
                         "service": {"type": "string", "description": "What the appointment is for (e.g. 'demo call')."},
                         "customer_name": {"type": "string", "description": "Customer's name if known."},
                     },
@@ -1325,13 +1326,41 @@ class WhatsAppAIChatbot:
     def _tool_book_appointment(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """PHASE 4: record an appointment in whatsapp_form_bookings. Requires a
         resolvable account for this workspace and a date + time from the customer."""
-        date = (args.get("date") or "").strip()
-        time_ = (args.get("time") or "").strip()
-        if not date or not time_:
-            return {"ok": False, "note": "A date (YYYY-MM-DD) and time (HH:MM) are required."}
+        raw_date = (args.get("date") or "").strip()
+        raw_time = (args.get("time") or "").strip()
+        if not raw_date or not raw_time:
+            return {"ok": False, "note": "A date and time are required to book."}
         phone = self.config.customer_phone
         if not phone:
             return {"ok": False, "note": "No customer phone in context; cannot book."}
+        # Normalize loose/relative date+time into YYYY-MM-DD + HH:MM. The model is
+        # told today's date, but customers (and the model) may still pass odd formats
+        # ("10 Sept", "3 pm", "09/10/2026") — parse them defensively with dateutil.
+        date, time_ = raw_date, raw_time
+        # Zero the minute/second in the default so a time like "3 pm" fills minutes
+        # as :00 (not the current minute), while a missing date still defaults to today.
+        try:
+            from dateutil import parser as _dp
+            base = datetime.now().replace(minute=0, second=0, microsecond=0)
+            dt_combined = _dp.parse(f"{raw_date} {raw_time}", default=base, dayfirst=False, fuzzy=True)
+            date = dt_combined.strftime("%Y-%m-%d")
+            time_ = dt_combined.strftime("%H:%M")
+        except Exception:
+            # Fall back to parsing them separately; keep raw values if that also fails.
+            try:
+                from dateutil import parser as _dp
+                base = datetime.now().replace(minute=0, second=0, microsecond=0)
+                d = _dp.parse(raw_date, default=base, fuzzy=True)
+                date = d.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+            try:
+                from dateutil import parser as _dp
+                base = datetime.now().replace(minute=0, second=0, microsecond=0)
+                t = _dp.parse(raw_time, default=base, fuzzy=True)
+                time_ = t.strftime("%H:%M")
+            except Exception:
+                pass
         try:
             from app import db
             from .models import WhatsAppAccount
@@ -1527,6 +1556,18 @@ class WhatsAppAIChatbot:
         self._agent_escalate = False  # PHASE 4: set by escalate_to_human tool
         self._agent_escalate_reason = ""
         system_prompt = (self.config.system_prompt or DEFAULT_SYSTEM_PROMPT) + AGENT_SYSTEM_ADDENDUM
+        # PHASE 4 fix: give the model today's date so it can resolve relative/loose
+        # dates ("tomorrow", "next Friday", "the 10th") for book_appointment.
+        try:
+            _now = datetime.now()
+            system_prompt += (
+                f"\n\nToday's date is {_now:%A, %d %B %Y} ({_now:%Y-%m-%d}). "
+                "When the customer gives a date/time in ANY format or relative terms "
+                "(e.g. 'tomorrow 4pm', 'next Monday', '10 Sept at 3'), work out the exact "
+                "calendar date and pass book_appointment date as YYYY-MM-DD and time as 24h HH:MM."
+            )
+        except Exception:
+            pass
         if getattr(self.config, "flow_context", None):
             system_prompt += "\n\nCONVERSATION FLOW CONTEXT:\n" + str(self.config.flow_context)
         contents = self._build_contents(context, message)  # list[dict]
