@@ -1090,6 +1090,45 @@ def _agent_tools() -> List[Tool]:
                     },
                 },
             ),
+            FunctionDeclaration(
+                name="capture_lead",
+                description=(
+                    "Save this customer as a lead in the business CRM so the team can follow up. "
+                    "Use once you learn who they are or what they want — e.g. they share their name, "
+                    "email, company, or express clear interest in a product/service. The customer's "
+                    "phone number is captured automatically."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Customer's name if known."},
+                        "email": {"type": "string", "description": "Customer's email if shared."},
+                        "company": {"type": "string", "description": "Customer's company if mentioned."},
+                        "interest": {
+                            "type": "string",
+                            "description": "Short note on what they want / are interested in (e.g. 'Meta ads automation').",
+                        },
+                    },
+                },
+            ),
+            FunctionDeclaration(
+                name="book_appointment",
+                description=(
+                    "Record an appointment / meeting / call the customer wants to book. Use only when "
+                    "the customer has given a specific date and time. Confirm the date and time back to "
+                    "them in your reply. The customer's phone is captured automatically."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "date": {"type": "string", "description": "Appointment date in YYYY-MM-DD format."},
+                        "time": {"type": "string", "description": "Appointment time in 24h HH:MM format."},
+                        "service": {"type": "string", "description": "What the appointment is for (e.g. 'demo call')."},
+                        "customer_name": {"type": "string", "description": "Customer's name if known."},
+                    },
+                    "required": ["date", "time"],
+                },
+            ),
         ]),
     ]
 
@@ -1224,10 +1263,106 @@ class WhatsAppAIChatbot:
                 return self._tool_request_payment(args)
             if name == "escalate_to_human":
                 return self._tool_escalate_to_human(args)
+            if name == "capture_lead":
+                return self._tool_capture_lead(args)
+            if name == "book_appointment":
+                return self._tool_book_appointment(args)
             return {"error": f"unknown_tool:{name}"}
         except Exception as e:  # noqa: BLE001
             logger.warning("[ai_chatbot][agent] tool %s failed: %s", name, e)
             return {"error": str(e), "results": [], "count": 0}
+
+    def _tool_capture_lead(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """PHASE 4: create/update a CRM lead for this customer. Wraps the shared
+        `leads` table via crm_lead_models.CrmLead. Dedups by workspace+phone."""
+        phone = self.config.customer_phone
+        if not self.config.workspace_id:
+            return {"ok": False, "note": "No workspace context."}
+        try:
+            from app import db
+            from .crm_lead_models import CrmLead
+            ws = int(self.config.workspace_id)
+            name = (args.get("name") or "").strip() or "WhatsApp Lead"
+            email = (args.get("email") or "").strip() or None
+            company = (args.get("company") or "").strip() or None
+            interest = (args.get("interest") or "").strip()
+            source = ("whatsapp_ai_agent" + (f": {interest}" if interest else ""))[:128]
+            conv_id = self.config.conversation_id
+            existing = None
+            if phone:
+                existing = CrmLead.query.filter_by(workspace_id=ws, phone=phone).first()
+            from datetime import datetime as _dt
+            if existing:
+                if args.get("name"):
+                    existing.name = name
+                if email:
+                    existing.email = email
+                if company:
+                    existing.company = company
+                if interest:
+                    existing.source = source
+                existing.last_interaction_at = _dt.utcnow()
+                db.session.commit()
+                return {"ok": True, "updated": True, "note": "Existing lead updated in the CRM."}
+            lead = CrmLead(
+                workspace_id=ws, name=name, email=email, phone=phone,
+                company=company, status="new", source=source,
+                lead_type="whatsapp", conversation_id=conv_id,
+                last_interaction_at=_dt.utcnow(),
+            )
+            db.session.add(lead)
+            db.session.commit()
+            return {"ok": True, "created": True, "note": "Lead saved to the CRM for follow-up."}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[ai_chatbot][agent] capture_lead failed: %s", e)
+            try:
+                from app import db as _db2
+                _db2.session.rollback()
+            except Exception:
+                pass
+            return {"ok": False, "note": "Could not save the lead right now."}
+
+    def _tool_book_appointment(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """PHASE 4: record an appointment in whatsapp_form_bookings. Requires a
+        resolvable account for this workspace and a date + time from the customer."""
+        date = (args.get("date") or "").strip()
+        time_ = (args.get("time") or "").strip()
+        if not date or not time_:
+            return {"ok": False, "note": "A date (YYYY-MM-DD) and time (HH:MM) are required."}
+        phone = self.config.customer_phone
+        if not phone:
+            return {"ok": False, "note": "No customer phone in context; cannot book."}
+        try:
+            from app import db
+            from .models import WhatsAppAccount
+            from .flow_os_models import WhatsAppFormBooking
+            acc = WhatsAppAccount.query.filter_by(
+                workspace_id=str(self.config.workspace_id), is_active=True
+            ).first()
+            if not acc:
+                return {"ok": False, "note": "No active WhatsApp account for this business."}
+            booking = WhatsAppFormBooking(
+                account_id=acc.id,
+                conversation_id=self.config.conversation_id,
+                wa_id=phone,
+                customer_name=(args.get("customer_name") or None),
+                booking_date=date[:10],
+                booking_time=time_[:8],
+                service_type=(args.get("service") or None),
+                status="confirmed",
+            )
+            db.session.add(booking)
+            db.session.commit()
+            return {"ok": True, "booking_id": booking.id, "date": date, "time": time_,
+                    "note": "Appointment recorded. Confirm the date and time back to the customer."}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[ai_chatbot][agent] book_appointment failed: %s", e)
+            try:
+                from app import db as _db2
+                _db2.session.rollback()
+            except Exception:
+                pass
+            return {"ok": False, "note": "Could not record the appointment right now."}
 
     def _tool_request_payment(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """PHASE 4: create a PayU payment link for the given amount and send it into
