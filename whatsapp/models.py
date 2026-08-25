@@ -438,6 +438,13 @@ class WhatsAppAccount(db.Model):
     # ai_enabled (which turns the bot on/off). Default off → the bot uses the legacy
     # pure-RAG path; ON → agent brain with tools. Auto-added by WHATSAPP_ORM_COLUMN_SYNC.
     ai_agent_mode = db.Column(db.Boolean, nullable=True, default=False)
+    # PHASE 6 guardrails (all auto-added by WHATSAPP_ORM_COLUMN_SYNC):
+    #  - ai_agent_disabled_tools: comma-separated tool names the agent may NOT use
+    #    for this workspace (e.g. "request_payment,send_template"). Empty/None = all on.
+    #  - ai_agent_max_payment: hard ceiling (INR) for a single request_payment link;
+    #    None = fall back to the global env cap.
+    ai_agent_disabled_tools = db.Column(db.Text, nullable=True)
+    ai_agent_max_payment = db.Column(db.Integer, nullable=True)
     ai_model = db.Column(db.String(50), nullable=True)
     temperature = db.Column(db.Float, nullable=True)
     max_tokens = db.Column(db.Integer, nullable=True)

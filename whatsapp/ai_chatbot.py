@@ -950,11 +950,34 @@ You are an AI assistant for this business on WhatsApp. You may call tools to hel
 - Always finish your turn with a plain-text reply to the customer (no markdown), match the customer's language, keep it concise for WhatsApp."""
 
 
-def _agent_tools() -> List[Tool]:
-    """Tool declarations exposed to the model. PHASE 1: only the RAG search.
-    Later phases append workspace-data, catalog, template and transaction tools."""
-    return [
-        Tool(function_declarations=[
+def _agent_guardrails(workspace_id: Optional[Any]) -> Dict[str, Any]:
+    """PHASE 6: per-workspace guardrails from the WhatsApp account row.
+    Returns {'disabled': set[str], 'max_payment': int|None}. FAIL-SAFE: on any
+    error returns empty guardrails (nothing disabled), never raising."""
+    disabled: set = set()
+    max_payment: Optional[int] = None
+    try:
+        if workspace_id:
+            from .models import WhatsAppAccount
+            acc = (WhatsAppAccount.query
+                   .filter_by(workspace_id=str(workspace_id), is_active=True)
+                   .first())
+            if acc is not None:
+                raw = getattr(acc, "ai_agent_disabled_tools", None) or ""
+                disabled = {t.strip() for t in str(raw).split(",") if t.strip()}
+                mp = getattr(acc, "ai_agent_max_payment", None)
+                if mp is not None:
+                    max_payment = int(mp)
+    except Exception:
+        pass
+    return {"disabled": disabled, "max_payment": max_payment}
+
+
+def _agent_tools(disabled: Optional[set] = None) -> List[Tool]:
+    """Tool declarations exposed to the model. PHASE 6: filters out any tool named
+    in `disabled` (per-workspace guardrail) so the model never sees turned-off tools."""
+    disabled = disabled or set()
+    decls = [
             FunctionDeclaration(
                 name="search_knowledge_base",
                 description=(
@@ -1164,8 +1187,9 @@ def _agent_tools() -> List[Tool]:
                     "required": ["template_name"],
                 },
             ),
-        ]),
-    ]
+        ]
+    kept = [d for d in decls if getattr(d, "name", None) not in disabled]
+    return [Tool(function_declarations=kept)] if kept else []
 
 
 class WhatsAppAIChatbot:
@@ -1224,9 +1248,35 @@ class WhatsAppAIChatbot:
             turns.append({"role": "user", "parts": [{"text": current_message}]})
         return turns
 
+    def _ensure_guardrails(self) -> Dict[str, Any]:
+        """Load PHASE 6 guardrails on demand (so direct tool calls are also protected,
+        not just calls routed through _generate_agentic)."""
+        g = getattr(self, "_guardrails", None)
+        if not g:
+            g = _agent_guardrails(self.config.workspace_id)
+            self._guardrails = g
+        return g
+
     def _execute_agent_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Run one agent tool and return a JSON-serializable result. PHASE 1: only
-        search_knowledge_base (wraps the existing RAG). FAIL-SAFE: never raises."""
+        """Run one agent tool and return a JSON-serializable result. FAIL-SAFE: never
+        raises. PHASE 6: enforces per-workspace tool disables + a per-turn call cap,
+        and emits an analytics log line for every tool call."""
+        # PHASE 6 guardrails (defense in depth — disabled tools are also hidden from
+        # the model, but block here too in case one slips through).
+        guard = self._ensure_guardrails()
+        if name in (guard.get("disabled") or set()):
+            logger.info("[ai_chatbot][agent][tool] ws=%s conv=%s tool=%s BLOCKED=disabled",
+                        self.config.workspace_id, self.config.conversation_id, name)
+            return {"error": "tool_disabled",
+                    "note": f"The {name} action is turned off for this business."}
+        self._agent_toolcalls = getattr(self, "_agent_toolcalls", 0) + 1
+        if self._agent_toolcalls > getattr(self, "_agent_max_toolcalls", 8):
+            logger.warning("[ai_chatbot][agent][tool] ws=%s conv=%s tool=%s BLOCKED=rate_cap n=%s",
+                           self.config.workspace_id, self.config.conversation_id, name, self._agent_toolcalls)
+            return {"error": "rate_limited",
+                    "note": "Too many actions in one turn — please continue in text."}
+        logger.info("[ai_chatbot][agent][tool] ws=%s conv=%s tool=%s call#%s",
+                    self.config.workspace_id, self.config.conversation_id, name, self._agent_toolcalls)
         try:
             if name == "search_knowledge_base":
                 q = (args.get("query") or "").strip()
@@ -1546,6 +1596,18 @@ class WhatsAppAIChatbot:
             amount = 0.0
         if amount <= 0:
             return {"ok": False, "note": "A positive amount is required to request payment."}
+        # PHASE 6: hard ceiling on a single payment link — per-workspace override, else
+        # global env WHATSAPP_AI_MAX_PAYMENT (default 200000 INR). Blocks runaway charges.
+        try:
+            env_cap = int(os.getenv("WHATSAPP_AI_MAX_PAYMENT", "200000") or 200000)
+        except Exception:
+            env_cap = 200000
+        cap = self._ensure_guardrails().get("max_payment") or env_cap
+        if amount > cap:
+            logger.warning("[ai_chatbot][agent] request_payment BLOCKED amount=%s > cap=%s ws=%s",
+                           amount, cap, self.config.workspace_id)
+            return {"ok": False, "note": f"Amount ₹{amount:.0f} exceeds the allowed limit (₹{cap}). "
+                    "A team member will help with larger payments."}
         phone = self.config.customer_phone
         conv_id = self.config.conversation_id
         if not phone:
@@ -1698,6 +1760,14 @@ class WhatsAppAIChatbot:
         self._agent_interactive: List[Dict[str, Any]] = []  # PHASE 3 queue
         self._agent_escalate = False  # PHASE 4: set by escalate_to_human tool
         self._agent_escalate_reason = ""
+        # PHASE 6 guardrails: per-workspace disabled tools + payment ceiling, plus a
+        # per-turn tool-call cap so a misbehaving model can't spam actions.
+        self._guardrails = _agent_guardrails(self.config.workspace_id)
+        self._agent_toolcalls = 0
+        try:
+            self._agent_max_toolcalls = int(os.getenv("WHATSAPP_AI_MAX_TOOLCALLS", "8") or 8)
+        except Exception:
+            self._agent_max_toolcalls = 8
         system_prompt = (self.config.system_prompt or DEFAULT_SYSTEM_PROMPT) + AGENT_SYSTEM_ADDENDUM
         # PHASE 4 fix: give the model today's date so it can resolve relative/loose
         # dates ("tomorrow", "next Friday", "the 10th") for book_appointment.
@@ -1714,7 +1784,7 @@ class WhatsAppAIChatbot:
         if getattr(self.config, "flow_context", None):
             system_prompt += "\n\nCONVERSATION FLOW CONTEXT:\n" + str(self.config.flow_context)
         contents = self._build_contents(context, message)  # list[dict]
-        tools = _agent_tools()
+        tools = _agent_tools(self._guardrails.get("disabled"))
         out_tokens = max(256, min(int(self.config.max_tokens or DEFAULT_MAX_OUTPUT_TOKENS), 8192))
         used_rag = False
         rag_chunks = 0
@@ -1731,7 +1801,7 @@ class WhatsAppAIChatbot:
                     max_output_tokens=out_tokens,
                     temperature=self.config.temperature,
                     system_instruction=system_prompt,
-                    tools=(None if force_final else tools),
+                    tools=(None if (force_final or not tools) else tools),
                 ),
             )
             cand = (getattr(response, "candidates", None) or [None])[0]
