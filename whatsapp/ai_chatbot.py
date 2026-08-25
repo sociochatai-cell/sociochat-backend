@@ -946,6 +946,7 @@ You are an AI assistant for this business on WhatsApp. You may call tools to hel
 - When the customer wants to SEE, browse or buy products / see the catalog, call `send_products` to send visual product cards (do NOT just list them as text). When offering clear choices or a next step, call `send_buttons` (max 3). These visual messages are sent ALONGSIDE your text reply — so still write a short friendly text reply too.
 - When the customer has AGREED to buy and the amount is known, confirm the amount, then call `request_payment` to send them a secure payment link. Never guess an amount — use the real product price or one the customer confirmed.
 - When the customer asks for a human/agent, is upset, or has a request you cannot handle, call `escalate_to_human` and tell them a team member will follow up shortly.
+- Prefer normal text/interactive replies during a live chat. Only use approved TEMPLATES for structured or re-engagement content (a confirmation, reminder, or offer): call `list_templates` first to see what exists and how many variables each needs, then `send_template` with the values in order. Never invent a template name.
 - Always finish your turn with a plain-text reply to the customer (no markdown), match the customer's language, keep it concise for WhatsApp."""
 
 
@@ -1130,6 +1131,39 @@ def _agent_tools() -> List[Tool]:
                     "required": ["date", "time"],
                 },
             ),
+            # PHASE 5 — approved WhatsApp templates (structured / re-engagement content).
+            FunctionDeclaration(
+                name="list_templates",
+                description=(
+                    "List the business's APPROVED WhatsApp message templates (name, category, the "
+                    "body text and how many {{n}} variables each needs). Call this BEFORE send_template "
+                    "so you know which templates exist and what variables to fill. Templates are pre-approved "
+                    "formats used for structured messages like confirmations, reminders and offers."
+                ),
+                parameters={"type": "object", "properties": {}},
+            ),
+            FunctionDeclaration(
+                name="send_template",
+                description=(
+                    "Send one of the business's APPROVED templates to the customer, filling its {{1}}, {{2}}… "
+                    "body variables in order. Use for structured/approved content (order or booking confirmation, "
+                    "reminder, offer) — especially to re-engage a customer. Only use a template name returned by "
+                    "list_templates, and provide exactly the number of body values it needs."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "template_name": {"type": "string", "description": "Exact template name from list_templates."},
+                        "body_params": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Values for the body {{1}},{{2}}… variables, in order. Empty if the template has none.",
+                        },
+                        "language": {"type": "string", "description": "Template language code (e.g. 'en_US'); omit to use the template's default."},
+                    },
+                    "required": ["template_name"],
+                },
+            ),
         ]),
     ]
 
@@ -1268,10 +1302,119 @@ class WhatsAppAIChatbot:
                 return self._tool_capture_lead(args)
             if name == "book_appointment":
                 return self._tool_book_appointment(args)
+            if name == "list_templates":
+                return self._tool_list_templates(args)
+            if name == "send_template":
+                return self._tool_send_template(args)
             return {"error": f"unknown_tool:{name}"}
         except Exception as e:  # noqa: BLE001
             logger.warning("[ai_chatbot][agent] tool %s failed: %s", name, e)
             return {"error": str(e), "results": [], "count": 0}
+
+    def _service_for_workspace(self):
+        """Build a WhatsAppService bound to this workspace's active account (decrypted
+        token). Returns (service, account) or (None, note)."""
+        try:
+            from .models import WhatsAppAccount
+            from .encryption import decrypt_token as _dt
+            from .services import WhatsAppService
+            acc = WhatsAppAccount.query.filter_by(
+                workspace_id=str(self.config.workspace_id), is_active=True
+            ).first()
+            if not acc or not acc.access_token_encrypted:
+                return None, "No active WhatsApp account for this business."
+            tok = _dt(acc.access_token_encrypted)
+            if not tok:
+                return None, "WhatsApp account token is unavailable."
+            service = WhatsAppService(
+                access_token=tok,
+                phone_number_id=acc.phone_number_id,
+                waba_id=acc.waba_id,
+                workspace_id=acc.workspace_id,
+            )
+            return service, acc
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[ai_chatbot][agent] service build failed: %s", e)
+            return None, "Messaging is temporarily unavailable."
+
+    def _tool_list_templates(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """PHASE 5: list the workspace's APPROVED templates so the model can pick one."""
+        try:
+            from .models import WhatsAppAccount, WhatsAppTemplate
+            from sqlalchemy import or_ as _or
+            acc = WhatsAppAccount.query.filter_by(
+                workspace_id=str(self.config.workspace_id), is_active=True
+            ).first()
+            if not acc:
+                return {"found": False, "note": "No active WhatsApp account for this business."}
+            q = WhatsAppTemplate.query.filter_by(account_id=acc.id).filter(
+                WhatsAppTemplate.is_archived.isnot(True)
+            ).filter(
+                _or(WhatsAppTemplate.meta_status == "APPROVED", WhatsAppTemplate.status == "APPROVED")
+            )
+            out = []
+            for t in q.limit(30).all():
+                out.append({
+                    "name": t.name,
+                    "language": t.language,
+                    "category": t.category,
+                    "body": (t.body_text or "")[:300],
+                    "variable_count": t.variable_count or 0,
+                })
+            if not out:
+                return {"found": False, "note": "No approved templates are available for this business."}
+            return {"found": True, "count": len(out), "templates": out}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[ai_chatbot][agent] list_templates failed: %s", e)
+            return {"found": False, "note": "Could not load templates."}
+
+    def _tool_send_template(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """PHASE 5: send an approved template to the customer, filling body variables."""
+        template_name = (args.get("template_name") or "").strip()
+        if not template_name:
+            return {"ok": False, "note": "template_name is required."}
+        phone = self.config.customer_phone
+        if not phone:
+            return {"ok": False, "note": "No customer phone in context; cannot send a template."}
+        try:
+            from .models import WhatsAppAccount, WhatsAppTemplate
+            acc = WhatsAppAccount.query.filter_by(
+                workspace_id=str(self.config.workspace_id), is_active=True
+            ).first()
+            if not acc:
+                return {"ok": False, "note": "No active WhatsApp account for this business."}
+            # Resolve the template + its language, and validate it is approved.
+            trec = WhatsAppTemplate.query.filter_by(account_id=acc.id, name=template_name)
+            language = (args.get("language") or "").strip()
+            if language:
+                trec = trec.filter_by(language=language)
+            trec = trec.first()
+            if not trec:
+                return {"ok": False, "note": f"No template named '{template_name}' found."}
+            if not (trec.meta_status == "APPROVED" or trec.status == "APPROVED"):
+                return {"ok": False, "note": f"Template '{template_name}' is not approved and cannot be sent."}
+            lang = language or trec.language or "en_US"
+            body_params = [str(v) for v in (args.get("body_params") or [])]
+            components = None
+            if body_params:
+                components = [{"type": "body", "parameters": [{"type": "text", "text": v} for v in body_params]}]
+            service, note = self._service_for_workspace()
+            if not service:
+                return {"ok": False, "note": note}
+            res = service.send_template(
+                to=phone,
+                template_name=template_name,
+                language_code=lang,
+                components=components,
+                conversation_id=self.config.conversation_id,
+            )
+            ok = bool(res and res.get("success"))
+            return {"ok": ok, "template": template_name,
+                    "note": ("Template sent to the customer." if ok
+                             else f"Template send failed: {(res or {}).get('error')}")}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[ai_chatbot][agent] send_template failed: %s", e)
+            return {"ok": False, "note": "Could not send the template right now."}
 
     def _tool_capture_lead(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """PHASE 4: create/update a CRM lead for this customer. Wraps the shared
