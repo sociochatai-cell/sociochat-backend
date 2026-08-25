@@ -957,6 +957,16 @@ def _agent_tools() -> List[Tool]:
                     "required": ["query"],
                 },
             ),
+            # PHASE 2 — workspace-knowledge tool.
+            FunctionDeclaration(
+                name="get_business_info",
+                description=(
+                    "Get THIS business's own profile — name, industry/type, description, website, "
+                    "city and country. Use when the customer asks who you are, what the business does, "
+                    "where it is located, or for general company info."
+                ),
+                parameters={"type": "object", "properties": {}},
+            ),
         ]),
     ]
 
@@ -1041,6 +1051,20 @@ class WhatsAppAIChatbot:
                     out["note"] = ("No knowledge-base entries matched. Do NOT search again — "
                                    "answer the customer directly or offer to connect a team member.")
                 return out
+            if name == "get_business_info":
+                from app import db as _db
+                from sqlalchemy import text as _text
+                row = _db.session.execute(
+                    _text(
+                        "select business_name, business_type, industry, description, website, "
+                        "city, country, usp from workspaces2 where id::text = :wid limit 1"
+                    ),
+                    {"wid": str(self.config.workspace_id)},
+                ).mappings().first()
+                if not row:
+                    return {"found": False, "note": "No business profile on file for this workspace."}
+                info = {k: v for k, v in dict(row).items() if v}
+                return {"found": True, "business": info}
             return {"error": f"unknown_tool:{name}"}
         except Exception as e:  # noqa: BLE001
             logger.warning("[ai_chatbot][agent] tool %s failed: %s", name, e)
