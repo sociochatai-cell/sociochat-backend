@@ -376,6 +376,11 @@ class AIConfig:
     # Optional one-line description of a paused interactive flow, so the model can answer
     # the off-script question in context and not derail the flow.
     flow_context: Optional[str] = None
+    # PHASE 4: live conversation context, populated by the caller (automation_engine)
+    # so agent-mode transactional tools (request_payment, escalate_to_human,
+    # capture_lead, book_appointment) can act on the real chat. None in the legacy path.
+    conversation_id: Optional[int] = None
+    customer_phone: Optional[str] = None
 
 
 def get_bot_config(account: Any) -> Dict[str, Any]:
@@ -939,6 +944,8 @@ You are an AI assistant for this business on WhatsApp. You may call tools to hel
 - If it returns results, base your answer on them; NEVER invent prices, policies, or product details.
 - If it returns NO results, do NOT call it again — answer helpfully from the conversation, or say a team member will assist shortly.
 - When the customer wants to SEE, browse or buy products / see the catalog, call `send_products` to send visual product cards (do NOT just list them as text). When offering clear choices or a next step, call `send_buttons` (max 3). These visual messages are sent ALONGSIDE your text reply — so still write a short friendly text reply too.
+- When the customer has AGREED to buy and the amount is known, confirm the amount, then call `request_payment` to send them a secure payment link. Never guess an amount — use the real product price or one the customer confirmed.
+- When the customer asks for a human/agent, is upset, or has a request you cannot handle, call `escalate_to_human` and tell them a team member will follow up shortly.
 - Always finish your turn with a plain-text reply to the customer (no markdown), match the customer's language, keep it concise for WhatsApp."""
 
 
@@ -1031,6 +1038,56 @@ def _agent_tools() -> List[Tool]:
                         },
                     },
                     "required": ["body_text", "buttons"],
+                },
+            ),
+            # PHASE 4 — transactions & handoff.
+            FunctionDeclaration(
+                name="request_payment",
+                description=(
+                    "Create a secure PayU payment link for an amount and send it to the customer "
+                    "in this chat. Use ONLY when the customer has agreed to buy / pay and an amount "
+                    "is known (e.g. after they pick a product or confirm a price). Always confirm the "
+                    "amount with the customer first. After sending, tell them the payment link is on its way."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "amount": {
+                            "type": "number",
+                            "description": "Total amount to charge, in INR (e.g. 4999).",
+                        },
+                        "product_info": {
+                            "type": "string",
+                            "description": "Short description of what is being paid for (e.g. 'Sociovia Meta automation').",
+                        },
+                        "customer_name": {
+                            "type": "string",
+                            "description": "Optional customer name if known from the conversation.",
+                        },
+                        "customer_email": {
+                            "type": "string",
+                            "description": "Optional customer email if known from the conversation.",
+                        },
+                    },
+                    "required": ["amount", "product_info"],
+                },
+            ),
+            FunctionDeclaration(
+                name="escalate_to_human",
+                description=(
+                    "Hand this conversation over to a human team member and flag it for attention in "
+                    "the business inbox. Use when the customer explicitly asks for a human/agent, is "
+                    "upset, or has a request you cannot handle. After calling, tell the customer a team "
+                    "member will get back to them shortly."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "Brief reason for the handoff (e.g. 'customer requested human', 'complaint').",
+                        },
+                    },
                 },
             ),
         ]),
@@ -1163,10 +1220,71 @@ class WhatsAppAIChatbot:
                 return self._tool_send_products(args)
             if name == "send_buttons":
                 return self._tool_send_buttons(args)
+            if name == "request_payment":
+                return self._tool_request_payment(args)
+            if name == "escalate_to_human":
+                return self._tool_escalate_to_human(args)
             return {"error": f"unknown_tool:{name}"}
         except Exception as e:  # noqa: BLE001
             logger.warning("[ai_chatbot][agent] tool %s failed: %s", name, e)
             return {"error": str(e), "results": [], "count": 0}
+
+    def _tool_request_payment(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """PHASE 4: create a PayU payment link for the given amount and send it into
+        the chat. Wraps commerce_pay.orders.create_order_and_send. Requires the
+        workspace to have a WorkspacePaymentConfig (PayU) and a live conversation."""
+        try:
+            amount = float(args.get("amount") or 0)
+        except Exception:
+            amount = 0.0
+        if amount <= 0:
+            return {"ok": False, "note": "A positive amount is required to request payment."}
+        phone = self.config.customer_phone
+        conv_id = self.config.conversation_id
+        if not phone:
+            return {"ok": False, "note": "No customer phone in context; cannot send a payment link."}
+        try:
+            from .commerce_pay.models import WorkspacePaymentConfig
+            from .commerce_pay import orders as _orders
+            cfg_row = WorkspacePaymentConfig.query.filter_by(
+                workspace_id=int(self.config.workspace_id)
+            ).first()
+            if not cfg_row:
+                return {"ok": False, "note": "Online payments are not set up for this business yet."}
+            order, link, sent = _orders.create_order_and_send(
+                workspace_id=int(self.config.workspace_id),
+                cfg_row=cfg_row,
+                phone=phone,
+                amount=amount,
+                productinfo=(args.get("product_info") or "Order"),
+                host_url="",  # falls back to COMMERCE_PUBLIC_BASE_URL / APP_BASE_URL
+                conversation_id=conv_id,
+                customer_name=(args.get("customer_name") or None),
+                customer_email=(args.get("customer_email") or None),
+                origin="ai_agent",
+            )
+            return {"ok": True, "sent": bool(sent), "amount": round(amount, 2),
+                    "link": link,
+                    "note": "Payment link created and sent to the customer in this chat."}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[ai_chatbot][agent] request_payment failed: %s", e)
+            return {"ok": False, "note": "Could not create the payment link right now."}
+
+    def _tool_escalate_to_human(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """PHASE 4: flag this conversation for a human in the inbox and mark the
+        ChatResponse so the automation layer escalates. Wraps
+        human_escalation.mark_conversation_human_required."""
+        reason = (args.get("reason") or "customer requested human").strip()[:200]
+        self._agent_escalate = True
+        self._agent_escalate_reason = reason
+        conv_id = self.config.conversation_id
+        if conv_id:
+            try:
+                from .human_escalation import mark_conversation_human_required
+                mark_conversation_human_required(int(conv_id), reason)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[ai_chatbot][agent] escalate mark failed: %s", e)
+        return {"ok": True, "note": "Conversation flagged for a human team member."}
 
     def _catalog_for_send(self):
         """Resolve (waba_id-linked) catalog_id + token for the connected account.
@@ -1271,6 +1389,8 @@ class WhatsAppAIChatbot:
         import time
         start_time = time.time()
         self._agent_interactive: List[Dict[str, Any]] = []  # PHASE 3 queue
+        self._agent_escalate = False  # PHASE 4: set by escalate_to_human tool
+        self._agent_escalate_reason = ""
         system_prompt = (self.config.system_prompt or DEFAULT_SYSTEM_PROMPT) + AGENT_SYSTEM_ADDENDUM
         if getattr(self.config, "flow_context", None):
             system_prompt += "\n\nCONVERSATION FLOW CONTEXT:\n" + str(self.config.flow_context)
@@ -1316,6 +1436,8 @@ class WhatsAppAIChatbot:
                     response_time_ms=elapsed, used_rag=used_rag,
                     rag_chunks=rag_chunks, rag_max_score=max_score,
                     interactive_messages=list(self._agent_interactive),
+                    escalate_to_human=bool(self._agent_escalate),
+                    escalation_reason=self._agent_escalate_reason,
                 )
 
             # Model asked to call one or more tools. Append the model's ACTUAL response

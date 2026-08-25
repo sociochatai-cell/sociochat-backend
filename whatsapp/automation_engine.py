@@ -761,6 +761,14 @@ def send_automation_response(
                     logger.warning("AgentOS handoff error (continuing with AI): %s", agentos_exc)
 
                 chatbot = create_ai_chatbot(ai_config_dict)
+                # PHASE 4: hand the agent the live conversation + customer phone so
+                # transactional tools (payment link, human handoff, etc.) can act.
+                # Only used by agent mode (default OFF); harmless for the legacy path.
+                try:
+                    chatbot.config.conversation_id = conversation_id
+                    chatbot.config.customer_phone = to_phone
+                except Exception:
+                    pass
                 context = _get_conversation_context(
                     conversation_id, ai_config_dict["context_messages"]
                 )
