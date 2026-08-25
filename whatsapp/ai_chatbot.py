@@ -333,7 +333,12 @@ class ChatResponse:
     rag_max_score: float = 0.0
     escalate_to_human: bool = False
     escalation_reason: str = ""
-    
+    # PHASE 3: interactive Meta Cloud API payloads (buttons / product_list / product)
+    # the agent decided to send AFTER the text reply. Each item is a raw Meta
+    # `interactive` object to hand to service.send_interactive_passthrough(). Empty
+    # for the legacy path and whenever the agent sends no visual content.
+    interactive_messages: List[Dict[str, Any]] = field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "message": self.message,
@@ -348,6 +353,7 @@ class ChatResponse:
             "rag_max_score": self.rag_max_score,
             "escalate_to_human": self.escalate_to_human,
             "escalation_reason": self.escalation_reason,
+            "interactive_messages": self.interactive_messages,
         }
 
 
@@ -932,6 +938,7 @@ You are an AI assistant for this business on WhatsApp. You may call tools to hel
 - Call `search_knowledge_base` AT MOST ONCE per customer question to look up FAQs, policies, products and services.
 - If it returns results, base your answer on them; NEVER invent prices, policies, or product details.
 - If it returns NO results, do NOT call it again — answer helpfully from the conversation, or say a team member will assist shortly.
+- When the customer wants to SEE, browse or buy products / see the catalog, call `send_products` to send visual product cards (do NOT just list them as text). When offering clear choices or a next step, call `send_buttons` (max 3). These visual messages are sent ALONGSIDE your text reply — so still write a short friendly text reply too.
 - Always finish your turn with a plain-text reply to the customer (no markdown), match the customer's language, keep it concise for WhatsApp."""
 
 
@@ -975,6 +982,56 @@ def _agent_tools() -> List[Tool]:
                     "sell, your products or services, prices, or to see the catalog."
                 ),
                 parameters={"type": "object", "properties": {}},
+            ),
+            # PHASE 3 — visual/interactive sends (fully dynamic, no template approval,
+            # valid inside the 24h customer-service window).
+            FunctionDeclaration(
+                name="send_products",
+                description=(
+                    "Send the customer an interactive PRODUCT CARD message from the connected "
+                    "WhatsApp catalog (tappable cards with image, name and price). Use this — "
+                    "instead of just listing text — whenever the customer wants to see, browse "
+                    "or buy products, or asks to see the catalog. Optionally pass product_names "
+                    "to feature specific items; omit to show the whole catalog. Always also give "
+                    "a short friendly text reply; the cards are sent alongside it."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "product_names": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional. Names of specific products to feature. Omit for all.",
+                        },
+                        "body_text": {
+                            "type": "string",
+                            "description": "Short message shown above the product cards (e.g. 'Here are our products 🛍️').",
+                        },
+                    },
+                },
+            ),
+            FunctionDeclaration(
+                name="send_buttons",
+                description=(
+                    "Send the customer up to 3 tappable REPLY BUTTONS so they can pick an option "
+                    "with one tap (e.g. 'Talk to a human', 'See prices', 'Book a call'). Use when "
+                    "offering clear choices or a next step. Always also give a short text reply."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "body_text": {
+                            "type": "string",
+                            "description": "The question/prompt shown above the buttons.",
+                        },
+                        "buttons": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "1 to 3 short button labels (max ~20 chars each).",
+                        },
+                    },
+                    "required": ["body_text", "buttons"],
+                },
             ),
         ]),
     ]
@@ -1102,10 +1159,109 @@ class WhatsAppAIChatbot:
                 if not prods:
                     return {"found": False, "note": "The catalog has no products listed yet."}
                 return {"found": True, "catalog": cat.get("name"), "count": len(prods), "products": prods}
+            if name == "send_products":
+                return self._tool_send_products(args)
+            if name == "send_buttons":
+                return self._tool_send_buttons(args)
             return {"error": f"unknown_tool:{name}"}
         except Exception as e:  # noqa: BLE001
             logger.warning("[ai_chatbot][agent] tool %s failed: %s", name, e)
             return {"error": str(e), "results": [], "count": 0}
+
+    def _catalog_for_send(self):
+        """Resolve (waba_id-linked) catalog_id + token for the connected account.
+        Returns (catalog_id:str, token:str, products:list[dict with retailer_id,name]) or (None, note)."""
+        import requests as _rq
+        from .models import WhatsAppAccount as _WA
+        from .encryption import decrypt_token as _dt
+        acc = _WA.query.filter_by(workspace_id=str(self.config.workspace_id), is_active=True).first()
+        if not acc or not acc.access_token_encrypted or not acc.waba_id:
+            return None, "No connected WhatsApp catalog for this business."
+        tok = _dt(acc.access_token_encrypted)
+        if not tok:
+            return None, "Catalog is temporarily unavailable."
+        api = os.getenv("WHATSAPP_API_VERSION") or os.getenv("FB_API_VERSION") or "v23.0"
+        base = "https://graph.facebook.com/" + api
+        auth = {"Authorization": "Bearer " + tok}
+        cr = _rq.get(base + "/" + str(acc.waba_id) + "/product_catalogs",
+                     params={"fields": "id,name,product_count"}, headers=auth, timeout=12).json()
+        cats = cr.get("data") or []
+        cat = next((c for c in cats if (c.get("product_count") or 0) > 0), cats[0] if cats else None)
+        if not cat:
+            return None, "No product catalog is connected yet."
+        pr = _rq.get(base + "/" + str(cat["id"]) + "/products",
+                     params={"fields": "retailer_id,name,price,availability", "limit": 30},
+                     headers=auth, timeout=12).json()
+        prods = [p for p in (pr.get("data") or []) if p.get("retailer_id")]
+        return {"catalog_id": str(cat["id"]), "catalog_name": cat.get("name"), "products": prods}, None
+
+    def _tool_send_products(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """PHASE 3: queue an interactive product_list (or single product) message.
+        Resolves the connected catalog, matches optional product_names to retailer_ids,
+        and pushes a Meta `interactive` object onto self._agent_interactive."""
+        info, note = self._catalog_for_send()
+        if not info:
+            return {"queued": False, "note": note or "Catalog unavailable."}
+        prods = info["products"]
+        if not prods:
+            return {"queued": False, "note": "The catalog has no products to send."}
+        wanted = [str(n).strip().lower() for n in (args.get("product_names") or []) if str(n).strip()]
+        if wanted:
+            sel = [p for p in prods if (p.get("name") or "").strip().lower() in wanted]
+            # fall back to substring match, else all
+            if not sel:
+                sel = [p for p in prods if any(w in (p.get("name") or "").lower() for w in wanted)]
+            if not sel:
+                sel = prods
+        else:
+            sel = prods
+        sel = sel[:30]
+        body_text = (args.get("body_text") or "Here are our products 🛍️").strip()[:1024]
+        catalog_id = info["catalog_id"]
+        if len(sel) == 1:
+            interactive = {
+                "type": "product",
+                "body": {"text": body_text},
+                "action": {
+                    "catalog_id": catalog_id,
+                    "product_retailer_id": sel[0]["retailer_id"],
+                },
+            }
+        else:
+            interactive = {
+                "type": "product_list",
+                "header": {"type": "text", "text": (info.get("catalog_name") or "Our Products")[:60]},
+                "body": {"text": body_text},
+                "action": {
+                    "catalog_id": catalog_id,
+                    "sections": [{
+                        "title": (info.get("catalog_name") or "Products")[:24],
+                        "product_items": [{"product_retailer_id": p["retailer_id"]} for p in sel],
+                    }],
+                },
+            }
+        self._agent_interactive.append(interactive)
+        return {"queued": True, "kind": interactive["type"],
+                "sent_count": len(sel),
+                "note": "Product cards will be sent to the customer alongside your text reply."}
+
+    def _tool_send_buttons(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """PHASE 3: queue an interactive reply-buttons message (max 3)."""
+        body_text = (args.get("body_text") or "").strip()
+        labels = [str(b).strip() for b in (args.get("buttons") or []) if str(b).strip()]
+        if not body_text or not labels:
+            return {"queued": False, "note": "body_text and at least one button are required."}
+        buttons = []
+        for i, lbl in enumerate(labels[:3]):
+            buttons.append({"type": "reply", "reply": {"id": f"btn_{i+1}", "title": lbl[:20]}})
+        interactive = {
+            "type": "button",
+            "body": {"text": body_text[:1024]},
+            "action": {"buttons": buttons},
+        }
+        self._agent_interactive.append(interactive)
+        return {"queued": True, "kind": "button", "count": len(buttons),
+                "note": "Buttons will be sent to the customer alongside your text reply."}
 
     def _generate_agentic(self, message: str, context: Optional[List[Dict[str, str]]] = None) -> ChatResponse:
         """PHASE 1 agent brain (behind WHATSAPP_AI_AGENT_MODE, default OFF).
@@ -1114,6 +1270,7 @@ class WhatsAppAIChatbot:
         wraps this in try/except and falls back to the legacy path on any error."""
         import time
         start_time = time.time()
+        self._agent_interactive: List[Dict[str, Any]] = []  # PHASE 3 queue
         system_prompt = (self.config.system_prompt or DEFAULT_SYSTEM_PROMPT) + AGENT_SYSTEM_ADDENDUM
         if getattr(self.config, "flow_context", None):
             system_prompt += "\n\nCONVERSATION FLOW CONTEXT:\n" + str(self.config.flow_context)
@@ -1158,6 +1315,7 @@ class WhatsAppAIChatbot:
                     message=text, success=True, model_used=self.config.model,
                     response_time_ms=elapsed, used_rag=used_rag,
                     rag_chunks=rag_chunks, rag_max_score=max_score,
+                    interactive_messages=list(self._agent_interactive),
                 )
 
             # Model asked to call one or more tools. Append the model's ACTUAL response

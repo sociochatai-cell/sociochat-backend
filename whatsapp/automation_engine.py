@@ -802,6 +802,35 @@ def send_automation_response(
                             "preview": (ai_response.message or "")[:140],
                         },
                     )
+                    # PHASE 3 (agent mode): after the text reply, send any interactive
+                    # visual messages (product cards / reply buttons) the agent queued.
+                    # Behind the ai_agent_mode toggle → legacy bots always have an empty
+                    # list, so this is a no-op for them.
+                    _interactives = getattr(ai_response, "interactive_messages", None) or []
+                    for _inter in _interactives:
+                        try:
+                            _ir = service.send_interactive_passthrough(to_phone, _inter)
+                            trace_event(
+                                stage="ai.reply.interactive",
+                                status="ok" if bool(_ir and _ir.get("success")) else "error",
+                                wamid=inbound_wamid,
+                                conversation_id=conversation_id,
+                                account_id=account_id,
+                                details={
+                                    "interactive_type": _inter.get("type"),
+                                    "error": (_ir or {}).get("error") if isinstance(_ir, dict) else None,
+                                },
+                            )
+                            logger.info(
+                                "[automation_engine][ai] interactive sent type=%s ok=%s",
+                                _inter.get("type"),
+                                bool(_ir and _ir.get("success")),
+                            )
+                        except Exception as _inter_exc:  # noqa: BLE001
+                            logger.warning(
+                                "[automation_engine][ai] interactive send failed type=%s err=%s",
+                                _inter.get("type"), _inter_exc,
+                            )
                     logger.info(
                         "[Automation Source: AI CHATBOT + RAG] AI response sent: "
                         "tokens=%s, time=%sms",
