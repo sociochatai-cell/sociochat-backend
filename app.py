@@ -276,6 +276,7 @@ _PUBLIC_EXACT = {
     ("POST", "/api/agent-auth/login"),
     # Public catalog / branding (loaded before login)
     ("GET", "/api/subscription/plans"),
+    ("POST", "/api/subscription/contact-sales"),
     ("GET", "/api/tenant/by-domain"), ("GET", "/api/tenant/domain-allowed"),
     # Payment provider callbacks (verified by signed hash inside the handler)
     ("POST", "/api/payments/payu/return"), ("GET", "/api/payments/payu/return"),

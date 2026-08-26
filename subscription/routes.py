@@ -209,6 +209,53 @@ def list_plans():
     return jsonify({"success": True, "plans": _build_plans_payload(rows)})
 
 
+@subscription_bp.route("/contact-sales", methods=["POST"])
+def contact_sales():
+    """Public: Enterprise 'Contact Sales' form -> email the team. No auth (pricing page)."""
+    import os
+    import re
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip()
+    phone = (data.get("phone") or "").strip()
+    plan = (data.get("plan") or "Enterprise").strip()[:80]
+    company = (data.get("company") or "").strip()[:120]
+    message = (data.get("message") or "").strip()[:2000]
+    if not name or not email or not phone:
+        return jsonify({"success": False, "error": "name, email and phone are required"}), 400
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        return jsonify({"success": False, "error": "invalid email"}), 400
+
+    dest_raw = (
+        os.getenv("SALES_NOTIFY_EMAIL")
+        or os.getenv("WAITLIST_NOTIFY_EMAIL")
+        or os.getenv("DEFAULT_ADMIN_EMAIL")
+        or "sociovia.ai@gmail.com"
+    )
+    to = [e.strip() for e in dest_raw.split(",") if e.strip()]
+    subject = "[SocioChat] " + plan + " sales enquiry - " + name
+    lines = [
+        "New Contact Sales enquiry from the pricing page.",
+        "",
+        "Plan: " + plan,
+        "Name: " + name,
+        "Email: " + email,
+        "Phone: " + phone,
+    ]
+    if company:
+        lines.append("Company: " + company)
+    if message:
+        lines.append("Message: " + message)
+    body = "\n".join(lines) + "\n"
+    try:
+        from mailer import send_mail
+        send_mail(to, subject, body)
+    except Exception as e:
+        current_app.logger.exception("contact-sales email failed: %s", e)
+        return jsonify({"success": False, "error": "could not send enquiry"}), 500
+    return jsonify({"success": True, "message": "Thanks! Our team will reach out shortly."})
+
+
 @subscription_bp.route("/my-plans", methods=["GET"])
 @require_auth
 def list_my_plans(user):
