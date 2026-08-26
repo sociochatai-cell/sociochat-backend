@@ -1480,7 +1480,15 @@ class WhatsAppAIChatbot:
             from .crm_lead_models import CrmLead
             ws = int(self.config.workspace_id)
             name = (args.get("name") or "").strip() or "WhatsApp Lead"
-            email = (args.get("email") or "").strip() or None
+            # Emails never contain spaces; models sometimes transcribe them with
+            # stray spaces / capitals (e.g. "Sharan 1114 411@Gmail.com"). Normalize.
+            email = (args.get("email") or "").strip()
+            if email:
+                email = email.replace(" ", "").lower()
+                if "@" not in email or "." not in email.split("@")[-1]:
+                    email = None  # not a usable email — drop rather than store garbage
+            else:
+                email = None
             company = (args.get("company") or "").strip() or None
             interest = (args.get("interest") or "").strip()
             source = ("whatsapp_ai_agent" + (f": {interest}" if interest else ""))[:128]
