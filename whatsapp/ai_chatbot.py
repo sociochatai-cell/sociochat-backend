@@ -946,6 +946,7 @@ You are an AI assistant for this business on WhatsApp. You may call tools to hel
 - When the customer wants to SEE, browse or buy products / see the catalog, call `send_products` to send visual product cards (do NOT just list them as text). When offering clear choices or a next step, call `send_buttons` (max 3). These visual messages are sent ALONGSIDE your text reply — so still write a short friendly text reply too.
 - When the customer has AGREED to buy and the amount is known, confirm the amount, then call `request_payment` to send them a secure payment link. Pass the EXACT amount the customer stated or the exact product/cart price — copy the number precisely, never round it, add to it, or change it. If the customer says "1 rupee", the amount is exactly 1.
 - When the customer asks for a human/agent, is upset, or has a request you cannot handle, call `escalate_to_human` and tell them a team member will follow up shortly.
+- When the customer tells you their name, email, or company, call `capture_lead` and pass those EXACT values (from their message), plus their interest. Address the customer by the name they just gave — not any older saved name.
 - Prefer normal text/interactive replies during a live chat. Only use approved TEMPLATES for structured or re-engagement content (a confirmation, reminder, or offer): call `list_templates` first to see what exists and how many variables each needs, then `send_template` with the values in order. Never invent a template name.
 - Always finish your turn with a plain-text reply to the customer (no markdown), match the customer's language, keep it concise for WhatsApp."""
 
@@ -1118,9 +1119,11 @@ def _agent_tools(disabled: Optional[set] = None) -> List[Tool]:
                 name="capture_lead",
                 description=(
                     "Save this customer as a lead in the business CRM so the team can follow up. "
-                    "Use once you learn who they are or what they want — e.g. they share their name, "
-                    "email, company, or express clear interest in a product/service. The customer's "
-                    "phone number is captured automatically."
+                    "Use once you learn who they are or what they want. IMPORTANT: whenever the customer "
+                    "states their name, email, or company in the chat, you MUST pass those exact values "
+                    "in this call — copy them from the customer's own message, even if a different saved "
+                    "name already exists. Do not leave name/email/company blank when the customer just "
+                    "gave them. The customer's phone number is captured automatically."
                 ),
                 parameters={
                     "type": "object",
