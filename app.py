@@ -863,7 +863,7 @@ def api_workspaces():
 
 @app.route("/api/workspaces/<int:workspace_id>", methods=["PUT"])
 def update_workspace(workspace_id):
-    """Update workspace details."""
+    """Update workspace details (name + full business profile used by the AI)."""
     user = get_current_user()
     if not user:
         return jsonify({"success": False, "error": "Not authenticated"}), 401
@@ -875,22 +875,47 @@ def update_workspace(workspace_id):
     if workspace.user_id != user.id:
         return jsonify({"success": False, "error": "Unauthorized"}), 403
 
-    data = request.json
+    data = request.get_json(silent=True) or {}
     if not data:
         return jsonify({"success": False, "error": "No data provided"}), 400
 
+    # Name (accept either key).
     if "name" in data or "business_name" in data:
-        new_name = data.get("name") or data.get("business_name")
-        workspace.business_name = new_name
-        db.session.commit()
+        _nm = (data.get("name") or data.get("business_name") or "").strip()
+        if _nm:
+            workspace.business_name = _nm
+
+    # Business-profile fields (all optional; only the ones provided are updated).
+    # These feed the AI's get_business_info tool. Columns already exist on the model.
+    _PROFILE_FIELDS = [
+        "business_type", "industry", "description", "website", "usp",
+        "audience_description", "b2b_b2c", "registered_address", "address_line",
+        "city", "district", "pin_code", "country", "social_links", "remarks",
+    ]
+    for _f in _PROFILE_FIELDS:
+        if _f in data:
+            _v = data.get(_f)
+            setattr(workspace, _f, _v.strip() if isinstance(_v, str) else _v)
+
+    db.session.commit()
 
     return jsonify({
         "success": True,
         "workspace": {
             "id": workspace.id,
             "name": workspace.business_name,
-            "business_name": workspace.business_name
-        }
+            "business_name": workspace.business_name,
+            "business_type": workspace.business_type,
+            "industry": workspace.industry,
+            "description": workspace.description,
+            "website": workspace.website,
+            "usp": workspace.usp,
+            "audience_description": workspace.audience_description,
+            "b2b_b2c": workspace.b2b_b2c,
+            "city": workspace.city,
+            "country": workspace.country,
+            "social_links": workspace.social_links,
+        },
     })
 
 
@@ -975,6 +1000,74 @@ def create_workspace():
             "business_name": workspace.business_name,
         }
     }), 201
+
+
+@app.route("/api/workspaces/analyze-url", methods=["POST"])
+def analyze_workspace_url():
+    """Fetch a business website and use Gemini to extract profile fields for prefill.
+    Read-only helper: never writes to the DB, just returns suggested fields."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Not authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"success": False, "error": "url is required"}), 400
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+
+    import re as _re
+    # 1. Fetch the page and reduce it to readable text.
+    try:
+        import requests as _rq
+        r = _rq.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0 (SocioChat business profiler)"})
+        html = r.text or ""
+    except Exception as e:
+        return jsonify({"success": False, "error": "Could not reach the website. Check the URL or fill details manually."}), 200
+
+    text = _re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", html)
+    text = _re.sub(r"(?s)<[^>]+>", " ", text)
+    text = _re.sub(r"\s+", " ", text).strip()[:6000]
+    if not text:
+        return jsonify({"success": False, "error": "The site returned no readable content. Please fill details manually."}), 200
+
+    # 2. Ask Gemini to extract a structured business profile.
+    try:
+        import os as _os
+        import json as _json
+        from google import genai
+        api_key = _os.getenv("GEMINI_API_KEY") or _os.getenv("GOOGLE_API_KEY")
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            "From the website content below, extract the BUSINESS PROFILE as STRICT JSON with exactly these keys: "
+            "business_name, business_type, industry, description, usp, audience_description, "
+            "b2b_b2c, city, country, social_links. "
+            "Rules: use \"\" for anything not clearly found; do NOT invent facts. "
+            "description = 1-2 sentences on what the business does. "
+            "usp = its main selling points (short). "
+            "b2b_b2c = one of \"B2B\", \"B2C\", \"B2B2C\" or \"\". "
+            "social_links = comma-separated social/profile URLs if present, else \"\".\n\n"
+            "WEBSITE (" + url + "):\n" + text
+        )
+        resp = client.models.generate_content(
+            model=_os.getenv("SC_ANALYZE_MODEL", "gemini-2.5-flash"),
+            contents=prompt,
+            config={"response_mime_type": "application/json"},
+        )
+        raw = (resp.text or "").strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            raw = raw[4:].strip() if raw.lower().startswith("json") else raw
+        profile = _json.loads(raw)
+        if not isinstance(profile, dict):
+            raise ValueError("non-dict result")
+    except Exception as e:
+        app.logger.exception("analyze-url gemini failed: %s", e)
+        return jsonify({"success": False, "error": "Could not analyze the site automatically. Please fill details manually."}), 200
+
+    profile["website"] = url
+    return jsonify({"success": True, "profile": profile})
 
 
 @app.route("/api/workspaces/<int:workspace_id>", methods=["DELETE"])
