@@ -386,6 +386,9 @@ from whatsapp import (
 from whatsapp.usage_events_routes import usage_events_internal_bp
 app.register_blueprint(whatsapp_bp, url_prefix="/api/whatsapp")
 app.register_blueprint(automation_bp, url_prefix="/api/whatsapp")
+# Mobile push notifications (additive, mobile-only; web never calls these).
+from push.routes import push_bp
+app.register_blueprint(push_bp, url_prefix="/api/push")
 app.register_blueprint(ai_bp)
 app.register_blueprint(faq_bp)
 app.register_blueprint(knowledge_bp)

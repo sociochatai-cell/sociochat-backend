@@ -48,3 +48,8 @@ instance/
 env.yaml.bak*
 *.bak-preswap-*
 *.bak
+
+# Build/backup artifacts — never commit (large / nested duplicate)
+sociochat-be.tgz
+*.tgz
+/sociochat-backend/
