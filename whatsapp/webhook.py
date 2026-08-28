@@ -780,6 +780,37 @@ class WebhookProcessor:
             logger.error(f"Failed to broadcast message received event: {e}")
 
         # ============================================================
+        # Mobile PUSH notification (additive, best-effort).
+        # The message is already saved+committed above, so this can NEVER affect
+        # message processing. Fully isolated in try/except like the CRM block.
+        # Sends only to devices registered for this workspace (mobile users);
+        # the web registers none, so this is a no-op for web.
+        # ============================================================
+        try:
+            from push.expo_push import send_push_to_workspace
+            _preview = None
+            try:
+                _md = msg_record.to_dict()
+                _content = _md.get("content")
+                if isinstance(_content, dict):
+                    _preview = _content.get("text") or _content.get("body") or _content.get("caption")
+                elif isinstance(_content, str):
+                    _preview = _content
+                _preview = _preview or _md.get("body")
+            except Exception:
+                _preview = None
+            _title = conversation.user_name or conversation.user_phone or "New message"
+            _body = _preview or "New WhatsApp message"
+            send_push_to_workspace(
+                account.workspace_id,
+                title=_title,
+                body=_body,
+                data={"conversation_id": conversation.id, "type": "whatsapp_message"},
+            )
+        except Exception as e:
+            logger.warning(f"Push notify skipped (non-fatal): {e}")
+
+        # ============================================================
         # CRM: Auto-capture conversation into the CRM as a Lead.
         # Lazy import to avoid circular imports (SocioviaCrm <-> whatsapp).
         # New conversations create a Lead; existing ones refresh
