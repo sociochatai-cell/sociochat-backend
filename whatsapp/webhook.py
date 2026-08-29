@@ -795,7 +795,7 @@ class WebhookProcessor:
         # the web registers none, so this is a no-op for web.
         # ============================================================
         try:
-            from push.expo_push import send_push_to_workspace
+            from push.expo_push import send_push_for_message
             _preview = None
             try:
                 _md = msg_record.to_dict()
@@ -807,14 +807,11 @@ class WebhookProcessor:
                 _preview = _preview or _md.get("body")
             except Exception:
                 _preview = None
-            _title = conversation.user_name or conversation.user_phone or "New message"
+            _sender = conversation.user_name or conversation.user_phone or "New message"
             _body = _preview or "New WhatsApp message"
-            send_push_to_workspace(
-                account.workspace_id,
-                title=_title,
-                body=_body,
-                data={"conversation_id": conversation.id, "type": "whatsapp_message"},
-            )
+            # Notifies the workspace OWNER on all their devices; auto-skips
+            # coexistence accounts + honors the Settings toggle. Never raises.
+            send_push_for_message(account, _sender, _body, conversation_id=conversation.id)
         except Exception as e:
             logger.warning(f"Push notify skipped (non-fatal): {e}")
 

@@ -36,3 +36,32 @@ class PushDevice(db.Model):
             "platform": self.platform,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class PushPref(db.Model):
+    """Per-user, per-workspace push on/off preference (the Settings toggle).
+
+    If no row exists for a (user, workspace), the DEFAULT applies:
+      - coexistence account  -> OFF (avoid duplicate notifications)
+      - otherwise            -> ON
+    An explicit row overrides that default either way.
+    """
+
+    __tablename__ = "push_prefs"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, index=True, nullable=False)
+    workspace_id = db.Column(db.Integer, index=True, nullable=False)
+    enabled = db.Column(db.Boolean, nullable=False, default=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint("user_id", "workspace_id", name="uq_push_pref_user_ws"),
+    )
+
+    def to_dict(self):
+        return {
+            "user_id": self.user_id,
+            "workspace_id": self.workspace_id,
+            "enabled": self.enabled,
+        }
