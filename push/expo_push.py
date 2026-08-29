@@ -69,7 +69,13 @@ def send_push_for_message(account, sender_name: str, body: str, conversation_id=
         if account is None or account.workspace_id is None:
             return 0
 
-        ws = Workspace.query.get(account.workspace_id)
+        # WhatsAppAccount.workspace_id is a STRING column; Workspace.id is int.
+        try:
+            ws_id_int = int(account.workspace_id)
+        except (TypeError, ValueError):
+            return 0
+
+        ws = Workspace.query.get(ws_id_int)
         if ws is None or ws.user_id is None:
             return 0
 
@@ -77,7 +83,7 @@ def send_push_for_message(account, sender_name: str, body: str, conversation_id=
         is_coex = bool(getattr(account, "is_coexistence", False))
 
         # Respect coexistence default + the user's Settings toggle
-        if not _notifications_enabled(owner_id, account.workspace_id, is_coex):
+        if not _notifications_enabled(owner_id, ws_id_int, is_coex):
             return 0
 
         # Notify ALL of the owner's devices (any workspace they registered under)

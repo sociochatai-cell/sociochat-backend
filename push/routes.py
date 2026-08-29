@@ -92,10 +92,12 @@ def get_prefs():
 
         out = []
         for ws in workspaces:
-            # A workspace is "coexistence" if any of its WA accounts is coexistence
+            # A workspace is "coexistence" if any of its WA accounts is coexistence.
+            # NOTE: WhatsAppAccount.workspace_id is a STRING column, so compare
+            # against str(ws.id) (ws.id is an int) — mixing types errors in Postgres.
             coex = (
                 db.session.query(WhatsAppAccount.id)
-                .filter_by(workspace_id=ws.id, is_coexistence=True)
+                .filter_by(workspace_id=str(ws.id), is_coexistence=True)
                 .first()
                 is not None
             )
