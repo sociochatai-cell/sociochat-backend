@@ -216,6 +216,21 @@ def merge_flow_endpoint_completion_into_latest_message(
         except Exception as email_err:
             logger.exception(f"Failed to submit background task to send flow submission email: {email_err}")
 
+        # Trigger WhatsApp self-notification if enabled on the flow
+        try:
+            from .flow_submission_notify import send_flow_submission_whatsapp_notify_bg
+            from .background_processor import bg_processor as _bg
+            flow_id_str = (content.get("flow_id") or "")
+            _bg.submit(
+                send_flow_submission_whatsapp_notify_bg,
+                account_id=account.id,
+                message_id=msg.id,
+                submission=submission,
+                flow_id_str=str(flow_id_str),
+            )
+        except Exception as wa_notify_err:
+            logger.debug("[flow_inbox_sync] WA self-notify schedule skipped: %s", wa_notify_err)
+
         conv_aid = None
         try:
             conv_aid = msg.conversation.account_id if msg.conversation else None

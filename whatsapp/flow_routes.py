@@ -862,6 +862,28 @@ def deprecate_flow(flow_id: int):
 
 
 # ============================================================
+# PATCH /api/whatsapp/flows/{id}/notify-toggle - Toggle owner notification
+# ============================================================
+
+@flow_bp.route("/<int:flow_id>/notify-toggle", methods=["PATCH"])
+@require_flow_access
+def toggle_notify_owner(flow_id: int):
+    flow = g.flow
+    data = request.get_json(silent=True) or {}
+    enabled = data.get("enabled")
+    if enabled is None:
+        flow.notify_owner_whatsapp = not flow.notify_owner_whatsapp
+    else:
+        flow.notify_owner_whatsapp = bool(enabled)
+    db.session.commit()
+    return jsonify({
+        "success": True,
+        "flow_id": flow.id,
+        "notify_owner_whatsapp": flow.notify_owner_whatsapp,
+    })
+
+
+# ============================================================
 # GET /api/whatsapp/flows/templates - Get Sample Templates
 # ============================================================
 

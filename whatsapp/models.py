@@ -1626,11 +1626,14 @@ class WhatsAppFlow(db.Model):
     meta_flow_id = db.Column(db.String(64), nullable=True, index=True)  # ID from Meta after publish
     status = db.Column(db.String(16), default="DRAFT", nullable=False)  # DRAFT, PUBLISHED, DEPRECATED
     
+    # Notification settings
+    notify_owner_whatsapp = db.Column(db.Boolean, default=False, nullable=False)
+
     # Timestamps
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     published_at = db.Column(db.DateTime, nullable=True)
-    
+
     # Relationships
     account = db.relationship("WhatsAppAccount", backref=db.backref("flows", lazy="dynamic", passive_deletes=True))
     parent_flow = db.relationship("WhatsAppFlow", remote_side=[id], backref="child_versions")
@@ -1656,6 +1659,7 @@ class WhatsAppFlow(db.Model):
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "published_at": self.published_at.isoformat() if self.published_at else None,
             "screen_count": len(self.flow_json.get("screens", [])) if self.flow_json else 0,
+            "notify_owner_whatsapp": self.notify_owner_whatsapp,
             "is_editable": self.status == "DRAFT",
             "is_selectable": self.status == "PUBLISHED",
         }
