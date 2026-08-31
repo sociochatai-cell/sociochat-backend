@@ -73,7 +73,13 @@ class TemplateRewriter:
             api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if api_key:
             self.client = genai.Client(api_key=api_key)
-            self.model = "gemini-1.5-flash"
+            # "gemini-1.5-flash" is deprecated (404 on v1beta). Use the same
+            # current model the rest of the app uses (env or gemini-3.5-flash).
+            self.model = (
+                os.environ.get("TEXT_MODEL")
+                or os.environ.get("GEMINI_MODEL")
+                or "gemini-3.5-flash"
+            )
         else:
             self.client = None
             self.model = None
