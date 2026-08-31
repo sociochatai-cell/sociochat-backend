@@ -287,7 +287,12 @@ def create_template_endpoint():
                 buttons = comp.get("buttons", [])
         
         # Pre-validate
-        days_old = (datetime.now(timezone.utc) - account.created_at).days if account.created_at else 0
+        # account.created_at may be tz-naive (stored without tzinfo); treat it as
+        # UTC so we don't subtract a naive from an aware datetime (crashes).
+        _created = account.created_at
+        if _created is not None and _created.tzinfo is None:
+            _created = _created.replace(tzinfo=timezone.utc)
+        days_old = (datetime.now(timezone.utc) - _created).days if _created else 0
         is_new_waba = days_old < 30
         
         validator = TemplateValidator(is_new_waba=is_new_waba)
