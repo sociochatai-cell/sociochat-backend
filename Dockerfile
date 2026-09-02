@@ -9,6 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Playwright + Chromium for JS/SPA website crawling (AI knowledge-base training)
+RUN pip install --no-cache-dir playwright && playwright install --with-deps chromium
+
 COPY . .
 
 EXPOSE 8080
