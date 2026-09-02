@@ -40,6 +40,10 @@ def _resolve_owned_template(template_id):
     workspace. Returns (template, error_response). Fails CLOSED."""
     template = WhatsAppTemplate.query.get(template_id)
     if not template:
+        # Fallback: the frontend may send the Meta template id instead of the
+        # local primary key. Resolve by meta_template_id too so delete/edit work.
+        template = WhatsAppTemplate.query.filter_by(meta_template_id=str(template_id)).first()
+    if not template:
         return None, (jsonify({"success": False, "error": "Template not found"}), 404)
     account, err = resolve_owned_account(template.account_id)
     if err:
@@ -495,13 +499,14 @@ def duplicate_template_endpoint(template_id):
 def delete_template_endpoint(template_id):
     """Permanently delete a template."""
     try:
-        _, err = _resolve_owned_template(template_id)
+        tpl, err = _resolve_owned_template(template_id)
         if err:
             return err
 
-        logger.info("[template_delete] Deleting template %s", template_id)
+        resolved_id = tpl.id if tpl else template_id
+        logger.info("[template_delete] Deleting template %s (resolved %s)", template_id, resolved_id)
         service = WhatsAppService()
-        result, success = service.delete_template(template_id)
+        result, success = service.delete_template(resolved_id)
 
         if not success:
             logger.warning("[template_delete] Failed: %s", result)
