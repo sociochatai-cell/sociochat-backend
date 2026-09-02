@@ -2228,3 +2228,12 @@ if __name__ == "__main__":
     print(f"   Message: {resp.message}")
     
     print("\nDone!")
+
+
+# --- Compatibility shims for rag_engine test-RAG path (restored) ---
+DEFAULT_HANDOFF_MESSAGE = DEFAULT_FALLBACK_MESSAGE
+
+
+def build_business_system_prompt(*args, **kwargs):
+    """Return the default system prompt. Kept for rag_engine.generate_answer_with_gemini."""
+    return DEFAULT_SYSTEM_PROMPT
