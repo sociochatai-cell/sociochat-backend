@@ -972,6 +972,28 @@ class WebhookProcessor:
                 except Exception as e:
                     logger.exception(f"Failed to advance CRM lead status to qualified (flow): {e}")
 
+                # WhatsApp owner notification for form submissions
+                try:
+                    from .flow_submission_notify import send_flow_submission_whatsapp_notify_bg
+                    from .background_processor import bg_processor as _bg
+                    _nfm_rj = reply.get("response_json")
+                    if isinstance(_nfm_rj, str):
+                        import json as _nfm_json
+                        try:
+                            _nfm_rj = _nfm_json.loads(_nfm_rj)
+                        except Exception:
+                            _nfm_rj = {}
+                    if isinstance(_nfm_rj, dict) and _nfm_rj:
+                        _bg.submit(
+                            send_flow_submission_whatsapp_notify_bg,
+                            account_id=account.id,
+                            message_id=msg_record.id,
+                            submission=_nfm_rj,
+                            flow_id_str=str(reply.get("flow_id") or ""),
+                        )
+                except Exception as wa_notify_err:
+                    logger.debug("[webhook] WA form-notify schedule skipped: %s", wa_notify_err)
+
             if button_payload:
                 self._process_automation(
                     account=account,

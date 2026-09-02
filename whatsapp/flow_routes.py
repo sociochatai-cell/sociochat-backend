@@ -865,22 +865,213 @@ def deprecate_flow(flow_id: int):
 # PATCH /api/whatsapp/flows/{id}/notify-toggle - Toggle owner notification
 # ============================================================
 
+FORM_NOTIFY_TEMPLATE_NAME = "form_submission_alert"
+
 @flow_bp.route("/<int:flow_id>/notify-toggle", methods=["PATCH"])
 @require_flow_access
 def toggle_notify_owner(flow_id: int):
     flow = g.flow
     data = request.get_json(silent=True) or {}
     enabled = data.get("enabled")
-    if enabled is None:
-        flow.notify_owner_whatsapp = not flow.notify_owner_whatsapp
-    else:
-        flow.notify_owner_whatsapp = bool(enabled)
+    want_on = enabled if enabled is not None else not flow.notify_owner_whatsapp
+
+    if want_on:
+        account = WhatsAppAccount.query.get(flow.account_id)
+        if not account:
+            return jsonify({"success": False, "error": "Account not found"}), 404
+
+        phone = (account.notification_phone_number or "").strip()
+        if not phone:
+            return jsonify({
+                "success": False,
+                "error": "setup_required",
+                "message": "Set a notification phone number first in Notification Settings",
+            }), 400
+
+        biz_phone = "".join(c for c in (account.display_phone_number or "") if c.isdigit())
+        clean_phone = "".join(c for c in phone if c.isdigit())
+        if clean_phone == biz_phone:
+            return jsonify({
+                "success": False,
+                "error": "same_as_business",
+                "message": "Notification number cannot be the same as your business number",
+            }), 400
+
+        from .models import WhatsAppTemplate
+        tpl = WhatsAppTemplate.query.filter_by(
+            account_id=account.id,
+            name=FORM_NOTIFY_TEMPLATE_NAME,
+            status="APPROVED",
+        ).first()
+        if not tpl:
+            tpl_fallback = WhatsAppTemplate.query.filter_by(
+                account_id=account.id,
+                name="human_required",
+                status="APPROVED",
+            ).first()
+            if not tpl_fallback:
+                return jsonify({
+                    "success": False,
+                    "error": "template_missing",
+                    "message": "No approved notification template found. Create the template from Notification Settings first.",
+                }), 400
+
+    flow.notify_owner_whatsapp = bool(want_on)
     db.session.commit()
     return jsonify({
         "success": True,
         "flow_id": flow.id,
         "notify_owner_whatsapp": flow.notify_owner_whatsapp,
     })
+
+
+# ============================================================
+# GET /api/whatsapp/flows/notification-settings - Get notification config
+# ============================================================
+
+@flow_bp.route("/notification-settings", methods=["GET"])
+def get_notification_settings():
+    workspace_id = (
+        request.headers.get("X-Workspace-ID")
+        or request.args.get("workspace_id")
+    )
+    if not workspace_id:
+        return jsonify({"success": False, "error": "workspace_id required"}), 400
+
+    account = WhatsAppAccount.query.filter_by(workspace_id=workspace_id).first()
+    if not account:
+        return jsonify({"success": False, "error": "No WhatsApp account found"}), 404
+
+    from .models import WhatsAppTemplate
+    tpl = WhatsAppTemplate.query.filter_by(
+        account_id=account.id,
+        name=FORM_NOTIFY_TEMPLATE_NAME,
+    ).first()
+    tpl_fallback = WhatsAppTemplate.query.filter_by(
+        account_id=account.id,
+        name="human_required",
+        status="APPROVED",
+    ).first()
+
+    template_status = "not_created"
+    template_name_in_use = None
+    if tpl and tpl.status == "APPROVED":
+        template_status = "approved"
+        template_name_in_use = FORM_NOTIFY_TEMPLATE_NAME
+    elif tpl and tpl.status in ("PENDING", "IN_APPEAL"):
+        template_status = "pending"
+    elif tpl and tpl.status == "REJECTED":
+        template_status = "rejected"
+    elif tpl_fallback:
+        template_status = "fallback_approved"
+        template_name_in_use = "human_required"
+
+    biz_phone = (account.display_phone_number or "").strip()
+
+    return jsonify({
+        "success": True,
+        "notification_phone_number": account.notification_phone_number or "",
+        "business_phone_number": biz_phone,
+        "template_status": template_status,
+        "template_name_in_use": template_name_in_use,
+        "template_to_create": {
+            "name": FORM_NOTIFY_TEMPLATE_NAME,
+            "category": "UTILITY",
+            "language": "en_US",
+            "body": (
+                "\U0001f4cb *New Form Submission*\n\n"
+                "Form: {{1}}\nFrom: {{2}}\n"
+                "Submission Details: {{3}}\n"
+                "Submitted at: {{4}}\n\n"
+                "Please respond to the customer promptly."
+            ),
+        },
+    })
+
+
+# ============================================================
+# PATCH /api/whatsapp/flows/notification-settings - Save notification phone
+# ============================================================
+
+@flow_bp.route("/notification-settings", methods=["PATCH"])
+def save_notification_settings():
+    workspace_id = (
+        request.headers.get("X-Workspace-ID")
+        or request.args.get("workspace_id")
+    )
+    if not workspace_id:
+        return jsonify({"success": False, "error": "workspace_id required"}), 400
+
+    account = WhatsAppAccount.query.filter_by(workspace_id=workspace_id).first()
+    if not account:
+        return jsonify({"success": False, "error": "No WhatsApp account found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    phone = (data.get("notification_phone_number") or "").strip()
+
+    if not phone:
+        return jsonify({"success": False, "error": "Phone number is required"}), 400
+
+    clean_phone = "".join(c for c in phone if c.isdigit())
+    biz_phone = "".join(c for c in (account.display_phone_number or "") if c.isdigit())
+    if clean_phone == biz_phone:
+        return jsonify({
+            "success": False,
+            "error": "Cannot use your business number. Enter a different personal WhatsApp number.",
+        }), 400
+
+    account.notification_phone_number = phone
+    db.session.commit()
+
+    return jsonify({
+        "success": True,
+        "notification_phone_number": account.notification_phone_number,
+    })
+
+
+# ============================================================
+# POST /api/whatsapp/flows/check-template-status - Refresh template status from Meta
+# ============================================================
+
+@flow_bp.route("/check-template-status", methods=["POST"])
+def check_template_status():
+    workspace_id = (
+        request.headers.get("X-Workspace-ID")
+        or request.args.get("workspace_id")
+    )
+    if not workspace_id:
+        return jsonify({"success": False, "error": "workspace_id required"}), 400
+
+    account = WhatsAppAccount.query.filter_by(workspace_id=workspace_id).first()
+    if not account:
+        return jsonify({"success": False, "error": "No WhatsApp account found"}), 404
+
+    from .models import WhatsAppTemplate
+    tpl = WhatsAppTemplate.query.filter_by(
+        account_id=account.id,
+        name=FORM_NOTIFY_TEMPLATE_NAME,
+    ).first()
+
+    status = "not_created"
+    if tpl:
+        if tpl.status == "APPROVED":
+            status = "approved"
+        elif tpl.status in ("PENDING", "IN_APPEAL"):
+            status = "pending"
+        elif tpl.status == "REJECTED":
+            status = "rejected"
+        else:
+            status = tpl.status.lower() if tpl.status else "unknown"
+    else:
+        fallback = WhatsAppTemplate.query.filter_by(
+            account_id=account.id,
+            name="human_required",
+            status="APPROVED",
+        ).first()
+        if fallback:
+            status = "fallback_approved"
+
+    return jsonify({"success": True, "template_status": status})
 
 
 # ============================================================

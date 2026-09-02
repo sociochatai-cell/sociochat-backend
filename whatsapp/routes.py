@@ -2975,7 +2975,12 @@ def validate_token_endpoint():
         "valid": bool,
         "user_id": str | None,
         "name": str | None,
-        "error": str | None
+        "error": str | None,
+        # expiry/permanence (best-effort, via Meta debug_token):
+        "is_permanent": bool | None,   # True => never expires (expires_at == 0)
+        "expires_at": int | None,      # unix ts; 0 => never
+        "token_type": str | None,      # "SYSTEM_USER" | "USER" | ...
+        "scopes": list
     }
     """
     from .connection_path import validate_token_with_meta

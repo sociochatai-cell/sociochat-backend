@@ -147,12 +147,19 @@ def validate_token_with_meta(access_token: str) -> Dict[str, Any]:
         
         if response.status_code == 200:
             data = response.json()
-            return {
+            result = {
                 "valid": True,
                 "user_id": data.get("id"),
                 "name": data.get("name"),
                 "error": None
             }
+            # Enrich with expiry/permanence so the UI can show whether this is a
+            # permanent (never-expiring) System User token or a 60-day/personal one.
+            try:
+                result.update(_token_expiry_info(access_token))
+            except Exception as _e:  # noqa: BLE001 - never fail validation on this
+                logger.warning("token expiry enrichment failed: %s", _e)
+            return result
         elif response.status_code == 401:
             return {"valid": False, "error": "Token expired or revoked"}
         else:
@@ -181,6 +188,45 @@ def _meta_app_credentials() -> tuple[Optional[str], Optional[str]]:
         or os.getenv("FB_APP_SECRET")
     )
     return app_id, app_secret
+
+
+def _token_expiry_info(access_token: str) -> Dict[str, Any]:
+    """Look up a token's expiry + type via Meta debug_token.
+
+    Returns {is_permanent, expires_at, token_type, scopes}. By Meta's convention a
+    permanent System User token reports ``expires_at == 0`` (never expires). Used so
+    the UI can tell the user whether the token they pasted is truly never-expiring
+    vs. a 60-day / personal token that will lapse. Best-effort: on any failure the
+    fields are None (unknown) and the caller still treats the token as valid.
+    """
+    info: Dict[str, Any] = {
+        "is_permanent": None,
+        "expires_at": None,
+        "token_type": None,
+        "scopes": [],
+    }
+    app_id, app_secret = _meta_app_credentials()
+    if not (app_id and app_secret):
+        return info
+    try:
+        resp = requests.get(
+            f"{META_GRAPH_API}/debug_token",
+            params={"input_token": access_token, "access_token": f"{app_id}|{app_secret}"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return info
+        data = resp.json().get("data", {}) or {}
+        expires_at = data.get("expires_at")
+        info["expires_at"] = expires_at
+        info["token_type"] = data.get("type")
+        info["scopes"] = data.get("scopes", [])
+        # Meta convention: expires_at == 0 (or missing) → the token never expires.
+        info["is_permanent"] = (expires_at in (0, None))
+        return info
+    except Exception as e:  # noqa: BLE001 - best-effort enrichment only
+        logger.warning("_token_expiry_info debug_token failed: %s", e)
+        return info
 
 
 def verify_messaging_send_access(

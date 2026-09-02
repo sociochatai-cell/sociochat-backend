@@ -499,17 +499,24 @@ def delete_template_endpoint(template_id):
         if err:
             return err
 
+        logger.info("[template_delete] Deleting template %s", template_id)
         service = WhatsAppService()
         result, success = service.delete_template(template_id)
-        
+
         if not success:
+            logger.warning("[template_delete] Failed: %s", result)
+            if "success" not in result:
+                result["success"] = False
             return jsonify(result), 400
-            
+
+        if "success" not in result:
+            result["success"] = True
+        logger.info("[template_delete] Deleted template %s", template_id)
         return jsonify(result), 200
-        
+
     except Exception as e:
         logger.exception("Template delete error")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 # ==============================================================
 # POST /templates/<id>/resubmit - Update Meta Template
