@@ -798,8 +798,8 @@ def _send_ai_fallback(
     # If so, don't set needs_attention - let the agent handle it.
     recent_outbound = WhatsAppMessage.query.filter(
         WhatsAppMessage.conversation_id == conversation_id,
-        WhatsAppMessage.direction == "echo",
-        WhatsAppMessage.created_at >= datetime.now(timezone.utc) - timedelta(seconds=30)
+        WhatsAppMessage.direction.in_(["echo", "outgoing", "out", "sent"]),
+        WhatsAppMessage.created_at >= datetime.now(timezone.utc) - timedelta(seconds=90)
     ).first()
     
     if not recent_outbound:
@@ -832,6 +832,13 @@ def _send_ai_fallback(
             account_id=account_id,
             details={"reason": "ai_queue_fallback"},
         )
+        # The AI/agent already replied to the customer. Do NOT also send the
+        # "I'm sorry … a team member will assist" text — that is what produced
+        # the odd double message. Just flag the inbox for a human and stop.
+        set_conversation_needs_attention(
+            conversation_id, needs_attention=True, reason="ai_queue_fallback",
+        )
+        return True, None, None
 
     set_conversation_needs_attention(
         conversation_id,
