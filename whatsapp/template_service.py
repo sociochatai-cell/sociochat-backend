@@ -23,6 +23,16 @@ import requests
 
 from .models import WhatsAppAccount, WhatsAppTemplate
 
+def _coerce_quality_score(qs):
+    """Meta may return quality_score as a dict {'score': 'GREEN'|'YELLOW'|'RED'|'UNKNOWN', 'date': ...},
+    a plain string, or None. The whatsapp_templates.quality_score column is String(32),
+    so persist just the string score (psycopg2 cannot adapt a raw dict)."""
+    if isinstance(qs, dict):
+        return qs.get('score')
+    if isinstance(qs, str):
+        return qs
+    return None
+
 logger = logging.getLogger(__name__)
 
 WHATSAPP_API_BASE = "https://graph.facebook.com"
@@ -117,7 +127,7 @@ class WhatsAppTemplateService:
                     existing.category = category
                     existing.components = tpl.get("components", [])
                     existing.rejection_reason = tpl.get("rejected_reason")
-                    existing.quality_score = tpl.get("quality_score")
+                    existing.quality_score = _coerce_quality_score(tpl.get("quality_score"))
 
                     for comp in tpl.get("components", []):
                         comp_type = comp.get("type", "").upper()
@@ -269,7 +279,7 @@ class WhatsAppTemplateService:
             template.status = meta_template.get("status")
             template.category = meta_template.get("category")
             template.rejection_reason = meta_template.get("rejected_reason")
-            template.quality_score = meta_template.get("quality_score")
+            template.quality_score = _coerce_quality_score(meta_template.get("quality_score"))
             template.components = meta_template.get("components", [])
             template.last_synced_at = datetime.now(timezone.utc)
 
