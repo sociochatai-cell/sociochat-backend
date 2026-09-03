@@ -790,15 +790,26 @@ def send_automation_response(
                     },
                 )
 
-                # Hard rule: if AI generation succeeded and produced a non-empty reply,
-                # send that reply to the user. Escalation/fallback is only for real failures.
-                if ai_response.success and ai_response.message:
-                    logger.info(
-                        "[automation_engine][ai] sending_ai_reply conv=%s preview=%r",
-                        conversation_id,
-                        ai_response.message[:160],
-                    )
-                    result = service.send_text(to_phone, ai_response.message)
+                # Hard rule: if AI generation succeeded and produced ANY reply — text OR
+                # queued interactive messages (buttons / product cards) — send it. The
+                # "a team member will assist you soon" handoff fires ONLY when there is
+                # genuinely no answer at all (no text AND no interactive messages).
+                _interactives = getattr(ai_response, "interactive_messages", None) or []
+                if ai_response.success and (ai_response.message or _interactives):
+                    if ai_response.message:
+                        logger.info(
+                            "[automation_engine][ai] sending_ai_reply conv=%s preview=%r",
+                            conversation_id,
+                            ai_response.message[:160],
+                        )
+                        result = service.send_text(to_phone, ai_response.message)
+                    else:
+                        logger.info(
+                            "[automation_engine][ai] interactive-only reply conv=%s interactives=%s",
+                            conversation_id,
+                            len(_interactives),
+                        )
+                        result = {"success": True, "conversation_id": conversation_id}
                     trace_event(
                         stage="ai.reply.send",
                         status="ok" if bool(result and result.get("success")) else "error",
