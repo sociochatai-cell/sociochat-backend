@@ -222,6 +222,10 @@ def update_ai_config(account_id: int, account: WhatsAppAccount, workspace_id: st
                 response_config["context_messages"] = data["context_messages"]
             
             ai_rule.response_config = response_config
+            # JSON column is not a MutableDict — flag the in-place edit so the
+            # UPDATE is actually persisted (otherwise the save reverts on refresh).
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(ai_rule, "response_config")
             
             logger.info(f"Updated AI chatbot config for account {account.id}")
         
