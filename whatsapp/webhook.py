@@ -1920,6 +1920,7 @@ class WebhookProcessor:
 
             replay_mode = self._duplicate_replay_mode_for_account(account.id)
             peer_wait = self._duplicate_peer_wait_sec()
+            peer_outcome = "none"  # default when peer-wait disabled (prevents UnboundLocalError below)
             if peer_wait > 0:
                 peer_outcome = self._wait_for_peer_automation_outcome(
                     existing, max_wait_sec=peer_wait
