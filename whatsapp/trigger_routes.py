@@ -6,6 +6,7 @@ from flask import Blueprint, request, jsonify, url_for
 from shared_models import db
 from .models import WhatsAppAccount
 from .trigger_models import WhatsAppTrigger
+from .trigger_logs_model import TriggerLog
 from .services import WhatsAppService
 from .token_helper import get_account_with_token
 # decorators
@@ -286,20 +287,55 @@ def invoke_trigger(trigger_id: int):
             copy_code_value=copy_code_value
         )
         
+        import json as _json
+        _client_ip = request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0].strip()
+
         if result.get("success"):
-            # Update stats
             trigger.trigger_count += 1
             trigger.last_triggered_at = datetime.now(timezone.utc)
+            try:
+                log = TriggerLog(
+                    trigger_id=trigger.id,
+                    workspace_id=str(trigger.workspace_id),
+                    account_id=trigger.account_id,
+                    recipient_phone=to,
+                    variables_json=_json.dumps(variables) if variables else None,
+                    source_ip=_client_ip,
+                    source_type="api",
+                    success=True,
+                    message_id=str(result.get("message_id", "")),
+                    delivery_status="sent",
+                )
+                db.session.add(log)
+            except Exception as log_err:
+                logger.warning("Failed to write trigger log: %s", log_err)
             db.session.commit()
-            
+
             logger.info(f"[Automation Source: API TRIGGER] Trigger '{trigger.name}' (ID: {trigger.id}) fired to {to}")
-            
+
             return jsonify({
                 "success": True,
                 "message": "Trigger fired successfully",
                 "message_id": result.get("message_id")
             })
         else:
+            try:
+                log = TriggerLog(
+                    trigger_id=trigger.id,
+                    workspace_id=str(trigger.workspace_id),
+                    account_id=trigger.account_id,
+                    recipient_phone=to,
+                    variables_json=_json.dumps(variables) if variables else None,
+                    source_ip=_client_ip,
+                    source_type="api",
+                    success=False,
+                    error_message=str(result.get("error", "Unknown error")),
+                    delivery_status="failed",
+                )
+                db.session.add(log)
+                db.session.commit()
+            except Exception as log_err:
+                logger.warning("Failed to write trigger log: %s", log_err)
             return jsonify({
                 "success": False,
                 "error": "Failed to send message to WhatsApp",
