@@ -1090,3 +1090,33 @@ def import_sociovia(dataset_id):
         db.session.rollback()
         logger.exception("Sociovia import error")
         return _error(f"Sociovia import error: {str(e)}")
+
+
+# ============================================================
+# CSV Export / Download
+# ============================================================
+
+
+@dataset_bp.route("/datasets/<int:dataset_id>/export-csv", methods=["GET"])
+def export_csv(dataset_id):
+    """Download all rows of a dataset as a CSV file."""
+    ds, _owner_err = _resolve_owned_dataset(dataset_id)
+    if _owner_err:
+        return _owner_err
+
+    columns = ds.columns or []
+    rows = DatasetRow.query.filter_by(dataset_id=dataset_id).order_by(DatasetRow.id.asc()).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(columns)
+    for row in rows:
+        data = row.data or {}
+        writer.writerow([data.get(col, "") for col in columns])
+
+    from flask import Response
+    safe_name = "".join(c if c.isalnum() or c in (" ", "-", "_") else "_" for c in (ds.name or "dataset"))
+    resp = Response(output.getvalue(), mimetype="text/csv")
+    resp.headers["Content-Disposition"] = f"attachment; filename=\"{safe_name}.csv\""
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
