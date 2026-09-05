@@ -3061,3 +3061,51 @@ def dataset_import_pipedrive(dataset_id: int):
         db.session.rollback()
         logger.exception("Pipedrive import failed: %s", e)
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@drip_bp.route("/datasets/<int:dataset_id>/export-csv", methods=["GET"])
+def dataset_export_csv(dataset_id: int):
+    """Download all rows of a dataset as a CSV file.
+
+    Ownership is enforced by the blueprint-wide _enforce_drip_ownership guard.
+    """
+    import io as _io
+    import csv as _csv
+    from flask import Response
+
+    dataset = WhatsAppDataset.query.get(dataset_id)
+    if not dataset:
+        return jsonify({"success": False, "error": "Dataset not found"}), 404
+
+    columns = list(dataset.columns or [])
+    rows = (
+        WhatsAppDatasetRow.query.filter_by(dataset_id=dataset_id)
+        .order_by(WhatsAppDatasetRow.id.asc())
+        .all()
+    )
+
+    # If no explicit columns, derive from the union of row keys.
+    if not columns:
+        seen = []
+        for r in rows:
+            for k in (r.data or {}).keys():
+                if k not in seen:
+                    seen.append(k)
+        columns = seen
+
+    output = _io.StringIO()
+    writer = _csv.writer(output)
+    writer.writerow(columns)
+    for row in rows:
+        data = row.data or {}
+        writer.writerow([data.get(col, "") for col in columns])
+
+    safe_name = "".join(
+        c if c.isalnum() or c in (" ", "-", "_") else "_"
+        for c in (dataset.name or "dataset")
+    ).strip() or "dataset"
+
+    resp = Response(output.getvalue(), mimetype="text/csv")
+    resp.headers["Content-Disposition"] = f"attachment; filename=\"{safe_name}.csv\""
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
