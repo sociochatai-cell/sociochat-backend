@@ -178,6 +178,19 @@ class WhatsAppTemplateService:
 
             for local_tpl in all_local_templates:
                 if (local_tpl.name, local_tpl.language) not in meta_template_ids:
+                    # PROTECT local-only drafts: a template created in the app or
+                    # web but not yet submitted to Meta has no meta_template_id
+                    # (and local_status DRAFT). It is legitimately absent from
+                    # Meta's list, so the old code hard-deleted it on every sync
+                    # — wiping user work. Only prune rows that were ACTUALLY on
+                    # Meta once (meta_template_id set) and have since disappeared.
+                    never_on_meta = (
+                        getattr(local_tpl, "meta_template_id", None) is None
+                        or getattr(local_tpl, "local_status", None) == "DRAFT"
+                    )
+                    if never_on_meta:
+                        logger.info(f"Keeping local draft {local_tpl.name} ({local_tpl.language}) - never submitted to Meta")
+                        continue
                     logger.info(f"Deleting local template {local_tpl.name} ({local_tpl.language}) - absent from Meta")
                     self.db_session.delete(local_tpl)
                     deleted_count += 1
