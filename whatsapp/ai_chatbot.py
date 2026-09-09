@@ -1225,6 +1225,10 @@ class WhatsAppAIChatbot:
     def is_available(self) -> bool:
         return self._initialized and self.client is not None
 
+    def get_tool_log(self) -> List[Dict[str, Any]]:
+        """Return the list of tool calls made during the last agentic run."""
+        return getattr(self, "_agent_tool_log", [])
+
     @staticmethod
     def _build_contents(context: Optional[List[Dict[str, str]]], current_message: str):
         """Build a Gemini `contents` list from prior conversation turns + the current message.
@@ -1775,6 +1779,7 @@ class WhatsAppAIChatbot:
         # per-turn tool-call cap so a misbehaving model can't spam actions.
         self._guardrails = _agent_guardrails(self.config.workspace_id)
         self._agent_toolcalls = 0
+        self._agent_tool_log: List[Dict[str, Any]] = []
         try:
             self._agent_max_toolcalls = int(os.getenv("WHATSAPP_AI_MAX_TOOLCALLS", "8") or 8)
         except Exception:
@@ -1851,6 +1856,7 @@ class WhatsAppAIChatbot:
                 nm = fc.name
                 fargs = dict(fc.args or {})
                 result = self._execute_agent_tool(nm, fargs)
+                self._agent_tool_log.append({"name": nm, "args": fargs, "result": result, "timestamp": datetime.utcnow().isoformat()})
                 if nm == "search_knowledge_base":
                     used_rag = True
                     rag_chunks = max(rag_chunks, int(result.get("count", 0) or 0))

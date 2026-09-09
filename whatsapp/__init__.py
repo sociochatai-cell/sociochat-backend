@@ -68,6 +68,7 @@ from .bulk_routes import bulk_bp
 from .coexistence_routes import coexistence_bp
 from .catalog_routes import catalog_bp
 from .tracking_routes import tracking_bp, tracking_redirect_bp
+from .conversation_insights_routes import insights_bp
 
 # Flow + dataset + scheduler blueprints (flow_os_routes/dataset_routes are target-only modules
 # kept from the multi-tenant app; flow_routes/flow_testing/flow_endpoint/scheduler_routes are shared).
@@ -94,6 +95,7 @@ __all__ = [
     "catalog_bp",
     "tracking_bp",
     "tracking_redirect_bp",
+    "insights_bp",
     "verification_bp",
     "flow_bp",
     "flow_testing_bp",

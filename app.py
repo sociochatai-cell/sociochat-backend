@@ -382,6 +382,7 @@ from whatsapp import (
     flow_bp, flow_testing_bp, flow_endpoint_bp, flow_os_bp, bookings_bp,
     dataset_bp, coexistence_bp,
     catalog_bp, tracking_bp, tracking_redirect_bp, scheduler_bp,
+    insights_bp,
 )
 from whatsapp.usage_events_routes import usage_events_internal_bp
 app.register_blueprint(whatsapp_bp, url_prefix="/api/whatsapp")
@@ -408,6 +409,7 @@ app.register_blueprint(coexistence_bp)
 app.register_blueprint(catalog_bp, url_prefix="/api/whatsapp")
 app.register_blueprint(tracking_bp)
 app.register_blueprint(tracking_redirect_bp)
+app.register_blueprint(insights_bp)
 app.register_blueprint(scheduler_bp, url_prefix="/api/internal/scheduler")
 
 # Commerce payments (PayU) — per-business in-chat payment (SocioChat-only, removable)
@@ -524,6 +526,7 @@ with app.app_context():
     import payments.mandate_models  # noqa: F401  (register payu_mandates + charges tables)
     from whatsapp import dataset_models  # noqa: F401
     from whatsapp import flow_os_models  # noqa: F401
+    from whatsapp import conversation_insights_models  # noqa: F401
     from agent_backend import session_models  # noqa: F401  (register agent_sessions table)
     import agent_auth.models  # noqa: F401  (register workspace_agents + agent_workspaces tables)
     import whatsapp.commerce_pay.models  # noqa: F401  (register workspace_payment_configs)

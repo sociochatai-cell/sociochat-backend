@@ -810,6 +810,20 @@ def send_automation_response(
                             len(_interactives),
                         )
                         result = {"success": True, "conversation_id": conversation_id}
+
+                    # Fire-and-forget: record AI conversation insights
+                    try:
+                        from .conversation_insights_service import record_insights
+                        record_insights(
+                            workspace_id=workspace_id,
+                            conversation_id=conversation_id,
+                            customer_phone=to_phone,
+                            tool_log=chatbot.get_tool_log(),
+                            ai_reply_text=ai_response.message,
+                        )
+                    except Exception as _ins_err:
+                        logger.warning("[automation_engine] insights recording failed: %s", _ins_err)
+
                     trace_event(
                         stage="ai.reply.send",
                         status="ok" if bool(result and result.get("success")) else "error",
