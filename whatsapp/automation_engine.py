@@ -815,7 +815,7 @@ def send_automation_response(
                     try:
                         from .conversation_insights_service import record_insights
                         record_insights(
-                            workspace_id=self.workspace_id,
+                            workspace_id=account.workspace_id,
                             conversation_id=conversation_id,
                             customer_phone=to_phone,
                             tool_log=chatbot.get_tool_log(),
