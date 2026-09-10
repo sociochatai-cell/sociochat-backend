@@ -448,6 +448,16 @@ class InteractiveAutomationEngine:
                 expected = trigger_config.get("message", "").lower()
                 if expected:
                     exact_map[expected] = match_entry
+            elif trigger_type == "command":
+                cmd = (trigger_config.get("command") or trigger_config.get("message") or "").strip().lower()
+                if cmd:
+                    exact_map[cmd] = match_entry
+                    if not cmd.startswith("/"):
+                        exact_map["/" + cmd] = match_entry
+                for alias in (trigger_config.get("aliases") or []):
+                    a = str(alias).strip().lower()
+                    if a:
+                        exact_map[a] = match_entry
 
         keyword_contains.sort(key=lambda item: len(item[0]), reverse=True)
 

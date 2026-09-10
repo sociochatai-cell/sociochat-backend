@@ -1333,14 +1333,14 @@ class WhatsAppAIChatbot:
                 base = "https://graph.facebook.com/" + api
                 auth = {"Authorization": "Bearer " + tok}
                 cr = _rq.get(base + "/" + str(acc.waba_id) + "/product_catalogs",
-                             params={"fields": "id,name,product_count"}, headers=auth, timeout=12).json()
+                             params={"fields": "id,name,product_count"}, headers=auth, timeout=6).json()
                 cats = cr.get("data") or []
                 cat = next((c for c in cats if (c.get("product_count") or 0) > 0), cats[0] if cats else None)
                 if not cat:
                     return {"found": False, "note": "No product catalog is connected yet."}
                 pr = _rq.get(base + "/" + str(cat["id"]) + "/products",
                              params={"fields": "name,price,description,availability", "limit": 20},
-                             headers=auth, timeout=12).json()
+                             headers=auth, timeout=6).json()
                 prods = []
                 for p in (pr.get("data") or [])[:20]:
                     prods.append({k: p.get(k) for k in ("name", "price", "description", "availability") if p.get(k)})
@@ -1686,14 +1686,14 @@ class WhatsAppAIChatbot:
         base = "https://graph.facebook.com/" + api
         auth = {"Authorization": "Bearer " + tok}
         cr = _rq.get(base + "/" + str(acc.waba_id) + "/product_catalogs",
-                     params={"fields": "id,name,product_count"}, headers=auth, timeout=12).json()
+                     params={"fields": "id,name,product_count"}, headers=auth, timeout=6).json()
         cats = cr.get("data") or []
         cat = next((c for c in cats if (c.get("product_count") or 0) > 0), cats[0] if cats else None)
         if not cat:
             return None, "No product catalog is connected yet."
         pr = _rq.get(base + "/" + str(cat["id"]) + "/products",
                      params={"fields": "retailer_id,name,price,availability", "limit": 30},
-                     headers=auth, timeout=12).json()
+                     headers=auth, timeout=6).json()
         prods = [p for p in (pr.get("data") or []) if p.get("retailer_id")]
         return {"catalog_id": str(cat["id"]), "catalog_name": cat.get("name"), "products": prods}, None
 

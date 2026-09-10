@@ -257,8 +257,22 @@ class WhatsAppTemplate(db.Model):
     # Relationship
     account = db.relationship("WhatsAppAccount", backref=db.backref("templates", lazy="dynamic", passive_deletes=True))
     
+    def _extract_header_info(self):
+        """Extract header format and image URL from components JSON."""
+        fmt, url = None, None
+        if self.components:
+            for c in (self.components if isinstance(self.components, list) else []):
+                if (c.get("type") or "").upper() == "HEADER":
+                    fmt = (c.get("format") or "").upper() or None
+                    handles = (c.get("example") or {}).get("header_handle") or []
+                    if handles and isinstance(handles, list):
+                        url = handles[0] if isinstance(handles[0], str) else None
+                    break
+        return fmt, url
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for API response."""
+        header_format, header_image_url = self._extract_header_info()
         return {
             "id": self.id,
             "account_id": self.account_id,
@@ -272,6 +286,8 @@ class WhatsAppTemplate(db.Model):
             "components": self.components,
             "body_text": self.body_text,
             "header_text": self.header_text,
+            "header_format": header_format,
+            "header_image_url": header_image_url,
             "footer_text": self.footer_text,
             "variable_count": self.variable_count,
             # Approval acceleration fields

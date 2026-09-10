@@ -80,6 +80,12 @@ def _extract_trigger_toggles_to_config(automation, nodes):
         automation.trigger_type = node_trigger_type
     if node_keywords:
         merged["keywords"] = node_keywords
+    node_command = trigger_data.get("command")
+    if node_command:
+        merged["command"] = node_command
+    node_aliases = trigger_data.get("aliases")
+    if node_aliases:
+        merged["aliases"] = node_aliases
     automation.trigger_config = merged
     logger.debug(
         "Extracted trigger toggles for automation %s: firstMessageOnly=%s, oneTimeOnly=%s",

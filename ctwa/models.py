@@ -131,7 +131,7 @@ class CTWAWorkspaceSettings(db.Model):
 
 
 def ensure_ctwa_schema(engine):
-    """Add newly-introduced columns to an existing ctwa_campaigns table."""
+    """Add newly-introduced columns/tables for CTWA feature."""
     from sqlalchemy import text
     try:
         with engine.begin() as conn:
@@ -139,6 +139,20 @@ def ensure_ctwa_schema(engine):
             conn.execute(text("ALTER TABLE ctwa_campaigns ADD COLUMN IF NOT EXISTS cta_type VARCHAR(32) NOT NULL DEFAULT 'WHATSAPP_MESSAGE'"))
             conn.execute(text("ALTER TABLE ctwa_campaigns ADD COLUMN IF NOT EXISTS budget_type VARCHAR(16) NOT NULL DEFAULT 'daily'"))
             conn.execute(text("ALTER TABLE ctwa_campaigns ADD COLUMN IF NOT EXISTS lifetime_budget INTEGER"))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS ctwa_workspace_settings (
+                    id SERIAL PRIMARY KEY,
+                    workspace_id VARCHAR(255) NOT NULL UNIQUE,
+                    ad_account_id VARCHAR(64),
+                    ad_account_name VARCHAR(255),
+                    page_id VARCHAR(64),
+                    page_name VARCHAR(255),
+                    whatsapp_phone_number_id VARCHAR(64),
+                    whatsapp_display_number VARCHAR(32),
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """))
     except Exception:
         import logging
         logging.getLogger("sociovia.ctwa").warning("ensure_ctwa_schema skipped", exc_info=True)

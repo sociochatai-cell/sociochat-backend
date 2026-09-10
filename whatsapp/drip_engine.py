@@ -74,7 +74,7 @@ def _tracking_base_url() -> str:
         if candidate.lower().startswith(("http://", "https://")):
             return candidate.rstrip("/")
 
-    return "https://sociovia.com"
+    return os.getenv("APP_BASE_URL", "https://app.sociochat.ai")
 
 
 def _build_tracking_redirect_url(tracking_id: str) -> str:

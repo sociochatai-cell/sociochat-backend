@@ -103,6 +103,7 @@ def build_payment_request(cfg, *, txnid, amount_inr, productinfo, firstname,
         "phone": (phone or "")[:15],
         "surl": surl,
         "furl": furl,
+        "curl": surl,
         "hash": h,
     }
     return {"action": cfg.base_url, "params": params}
@@ -168,7 +169,7 @@ def build_si_registration_request(cfg, *, txnid, amount_inr, productinfo, firstn
     params = {
         "key": cfg.key, "txnid": txnid, "amount": amount, "productinfo": productinfo,
         "firstname": firstname, "email": email or "", "phone": (phone or "")[:15],
-        "surl": surl, "furl": furl, "hash": h,
+        "surl": surl, "furl": furl, "curl": surl, "hash": h,
         "udf1": "", "udf2": "", "udf3": "", "udf4": "1", "udf5": "",
         "si": "1", "si_details": si_json,
     }

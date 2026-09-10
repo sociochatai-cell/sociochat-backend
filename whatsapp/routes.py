@@ -4573,11 +4573,6 @@ def rewrite_template_for_category():
         from google import genai
         from google.genai import types
         
-        # Use Vertex AI with project-based auth (not API key)
-        # Fallback chain: GCP_PROJECT -> PROJECT_ID -> hardcoded default
-        gcp_project = os.environ.get("GCP_PROJECT") or os.environ.get("PROJECT_ID") or "angular-sorter-473216-k8"
-        gcp_location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
-        
         # ===========================================
         # STEP 5: Build placeholder-safe prompts
         # ===========================================
@@ -4658,18 +4653,14 @@ Return ONLY the cleaned template text. No explanations.
         # STEP 6: Call Gemini API
         # ===========================================
         try:
-            from google.genai.types import HttpOptions
-            
+            from whatsapp.ai_chatbot import get_genai_client
+
             text_model = os.environ.get("TEXT_MODEL") or os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash"
-            
-            # Initialize Vertex AI client (NOT free-tier API key)
-            client = genai.Client(
-                http_options=HttpOptions(api_version="v1"),
-                project=gcp_project,
-                location=gcp_location,
-                vertexai=True,
-            )
-            
+
+            client = get_genai_client()
+            if not client:
+                raise RuntimeError("GenAI client not available")
+
             response = client.models.generate_content(
                 model=text_model,
                 contents=prompt
@@ -7804,7 +7795,7 @@ def connect_callback():
     error_description = request.args.get("error_description", "")
     
     # Get frontend URL for postMessage
-    frontend_url = os.getenv("FRONTEND_BASE_URL", "https://sociovia.com")
+    frontend_url = os.getenv("FRONTEND_BASE_URL", "https://app.sociochat.ai")
 
     if error:
         logger.warning(f"WhatsApp OAuth error: {error} - {error_description}")

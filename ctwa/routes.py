@@ -930,6 +930,9 @@ def publish_campaign(cid):
     if error:
         return error  # (jsonify, status) tuple from the CRM helper
 
+    if not row.daily_budget and not row.lifetime_budget:
+        return jsonify({"success": False, "error": "budget_required", "message": "Please set a budget before publishing the ad."}), 400
+
     ad_account_id = row.ad_account_id or ad_account_id
     if not ad_account_id:
         return jsonify({"success": False, "error": "no_ad_account"}), 400
