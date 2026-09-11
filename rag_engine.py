@@ -141,11 +141,26 @@ class RAGEngine:
 
     def get_embedding(self, text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> List[float]:
         """
-        Generate embeddings (Gemini API: gemini-embedding-001, Vertex: text-embedding-004).
+        Generate embeddings via bridge (Gemini or OpenAI depending on GENAI_TEXT_PROVIDER).
         task_type: RETRIEVAL_DOCUMENT | RETRIEVAL_QUERY
         """
         if not text or not text.strip():
             return []
+
+        from core.genai_bridge import is_openai_mode, embed_content
+
+        if is_openai_mode():
+            try:
+                return embed_content(
+                    model=self._embedding_model,
+                    contents=text,
+                    dimensions=google_embed_config.vector_size,
+                    feature="rag_embedding",
+                )
+            except Exception as e:
+                logger.error("OpenAI embedding failed: %s", e)
+                print(f"❌ Embedding Error: {e}")
+                return []
 
         if not self.gemini_client:
             raise RuntimeError("GenAI client not initialized")

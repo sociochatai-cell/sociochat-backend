@@ -521,3 +521,69 @@ def build_function_response_content(tool_name: str, result: dict,
         "tool_call_id": tool_call_id or f"call_{tool_name}",
         "content": _json.dumps(result),
     }
+
+
+# ---------------------------------------------------------------------------
+# Embedding support
+# ---------------------------------------------------------------------------
+_GEMINI_EMBED_TO_OPENAI = {
+    "gemini-embedding-001": "text-embedding-3-small",
+    "text-embedding-004": "text-embedding-3-small",
+}
+
+_TASK_TYPE_MAP = {
+    "RETRIEVAL_DOCUMENT": "RETRIEVAL_DOCUMENT",
+    "RETRIEVAL_QUERY": "RETRIEVAL_QUERY",
+}
+
+
+def embed_content(
+    model: str,
+    contents: str,
+    config: Any = None,
+    gemini_client: Any = None,
+    workspace_id: Optional[str] = None,
+    feature: Optional[str] = None,
+    dimensions: int = 768,
+) -> List[float]:
+    """Generate embeddings via Gemini or OpenAI depending on GENAI_TEXT_PROVIDER.
+
+    Returns a list of floats (the embedding vector).
+    In OpenAI mode, uses text-embedding-3-small with matching dimensions
+    so existing Qdrant vectors stay compatible.
+    """
+    if is_openai_mode():
+        return _embed_openai(model, contents, workspace_id, feature, dimensions)
+    else:
+        return _embed_gemini(model, contents, config, gemini_client)
+
+
+def _embed_gemini(model, contents, config, gemini_client) -> List[float]:
+    if gemini_client is None:
+        raise RuntimeError("GenAI client not initialized")
+    result = gemini_client.models.embed_content(
+        model=model, contents=contents, config=config,
+    )
+    return result.embeddings[0].values
+
+
+def _embed_openai(model, contents, workspace_id, feature, dimensions) -> List[float]:
+    client = _get_openai_client()
+    if client is None:
+        raise RuntimeError("OpenAI client not initialized for embeddings")
+
+    openai_model = _GEMINI_EMBED_TO_OPENAI.get(model, "text-embedding-3-small")
+
+    extra_headers = {}
+    if workspace_id:
+        extra_headers["x-workspace-id"] = str(workspace_id)
+    if feature:
+        extra_headers["x-feature"] = str(feature)
+
+    response = client.embeddings.create(
+        model=openai_model,
+        input=contents,
+        dimensions=dimensions,
+        extra_headers=extra_headers if extra_headers else None,
+    )
+    return response.data[0].embedding
