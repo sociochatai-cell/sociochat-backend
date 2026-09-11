@@ -2236,9 +2236,19 @@ def enroll_user(account_id: int, campaign_id: int, account: WhatsAppAccount, wor
         # Create enrollment
         # First step runs after its delay relative to NOW
         first_step = WhatsAppDripStep.query.filter_by(campaign_id=campaign_id, step_order=1).first()
-        
-        next_run = first_step.get_next_run_at(datetime.now(timezone.utc)) if first_step else None
-            
+        if not first_step:
+            return jsonify({"error": "Campaign has no first step (step_order=1) to send"}), 400
+
+        next_run = first_step.get_next_run_at(datetime.now(timezone.utc))
+
+        # A manual enrollment means the campaign is active again. If it was
+        # auto-completed (or is still draft/scheduled), reactivate it so the
+        # processor will pick this enrollment up — otherwise it silently never sends.
+        if campaign.status not in ("active", "running"):
+            _prev_status = campaign.status
+            campaign.status = "active"
+            logger.info(f"[ENROLL] Reactivated campaign {campaign_id} (was {_prev_status}) for new manual enrollment")
+
         enrollment = WhatsAppDripEnrollment(
             campaign_id=campaign_id,
             phone_number=phone_number,
@@ -2388,15 +2398,18 @@ def bulk_enroll(account_id: int, campaign_id: int, account: WhatsAppAccount, wor
             enrolled += 1
         
         campaign.enrolled_count += enrolled
+        # Reactivate if it was auto-completed/draft so the processor sends these.
+        if enrolled > 0 and campaign.status not in ("active", "running"):
+            campaign.status = "active"
         db.session.commit()
-        
+
         return jsonify({
             "success": True,
             "enrolled": enrolled,
             "skipped": skipped,
             "message": f"Enrolled {enrolled} contacts ({skipped} skipped)"
         })
-        
+
     except Exception as e:
         db.session.rollback()
         logger.exception(f"Error in bulk enroll: {e}")
@@ -2883,12 +2896,15 @@ def enroll_dataset(account_id: int, campaign_id: int, account: WhatsAppAccount, 
             
         if enrolled > 0:
             campaign.enrolled_count += enrolled
-            
+            # Reactivate if it was auto-completed/draft so the processor sends these.
+            if campaign.status not in ("active", "running"):
+                campaign.status = "active"
+
         db.session.commit()
-        
+
         return jsonify({
-            "success": True, 
-            "enrolled": enrolled, 
+            "success": True,
+            "enrolled": enrolled,
             "skipped": skipped,
             "message": f"Successfully enrolled {enrolled} contacts ({skipped} skipped)"
         })
