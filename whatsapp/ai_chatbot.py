@@ -1860,7 +1860,10 @@ class WhatsAppAIChatbot:
             if getattr(cand, "content", None) is not None:
                 contents.append(cand.content)
             if _openai_mode:
-                for fc in calls:
+                for part in parts:
+                    fc = part.function_call
+                    if not fc:
+                        continue
                     nm = fc.name
                     fargs = dict(fc.args or {})
                     result = self._execute_agent_tool(nm, fargs)
@@ -1869,7 +1872,8 @@ class WhatsAppAIChatbot:
                         used_rag = True
                         rag_chunks = max(rag_chunks, int(result.get("count", 0) or 0))
                         max_score = max(max_score, float(result.get("max_score", 0.0) or 0.0))
-                    contents.append(build_function_response_content(nm, result))
+                    tc_id = getattr(part, "_tool_call_id", None)
+                    contents.append(build_function_response_content(nm, result, tool_call_id=tc_id))
             else:
                 resp_parts: List[Any] = []
                 for fc in calls:

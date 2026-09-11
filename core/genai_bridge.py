@@ -201,6 +201,30 @@ def _generate_openai(model, contents, config, workspace_id=None,
         return BridgeResponse(text=None)
 
 
+def _convert_dict_content(item: dict, messages: list):
+    """Convert a Gemini-format dict (role+parts) or OpenAI-format dict to OpenAI messages."""
+    if "parts" in item:
+        # Gemini dict format: {"role": "model"/"user", "parts": [{"text": "..."}]}
+        role = item.get("role", "user")
+        role = "assistant" if role == "model" else role
+        texts = []
+        for p in item["parts"]:
+            if isinstance(p, dict) and p.get("text"):
+                texts.append(p["text"])
+            elif hasattr(p, "text") and p.text:
+                texts.append(p.text)
+        if texts:
+            messages.append({"role": role, "content": "\n".join(texts)})
+    elif "content" in item or "role" in item:
+        # Already OpenAI format — just fix role
+        msg = dict(item)
+        if msg.get("role") == "model":
+            msg["role"] = "assistant"
+        messages.append(msg)
+    else:
+        messages.append({"role": "user", "content": str(item)})
+
+
 def _contents_to_messages(contents: Any) -> list:
     """Convert Gemini-style contents to OpenAI messages format."""
     if isinstance(contents, str):
@@ -212,9 +236,8 @@ def _contents_to_messages(contents: Any) -> list:
             if isinstance(item, str):
                 messages.append({"role": "user", "content": item})
             elif isinstance(item, dict):
-                messages.append(item)
+                _convert_dict_content(item, messages)
             elif hasattr(item, "role") and hasattr(item, "parts"):
-                # google.genai.types.Content object
                 role = "assistant" if item.role == "model" else item.role
                 text_parts = []
                 for p in (item.parts or []):
@@ -376,7 +399,10 @@ def _agentic_openai(model, contents, config, tools,
                 args = _json.loads(tc.function.arguments) if tc.function.arguments else {}
             except Exception:
                 args = {}
-            parts.append(_Part(function_call=_FunctionCall(name=tc.function.name, args=args)))
+            fc = _FunctionCall(name=tc.function.name, args=args)
+            part = _Part(function_call=fc)
+            part._tool_call_id = tc.id  # preserve OpenAI's unique ID for response matching
+            parts.append(part)
         content = _Content(role="model", parts=parts)
         return AgenticResponse(
             text=None,
@@ -398,7 +424,7 @@ def _agentic_contents_to_messages(contents: list) -> list:
     messages = []
     for item in contents:
         if isinstance(item, dict):
-            messages.append(item)
+            _convert_dict_content(item, messages)
         elif isinstance(item, _Content):
             # Our own wrapper from a previous OpenAI turn
             _convert_bridge_content(item, messages)
@@ -421,8 +447,9 @@ def _convert_bridge_content(content, messages):
     for p in (content.parts or []):
         if isinstance(p, _Part) and p.function_call:
             import json as _json
+            tc_id = getattr(p, "_tool_call_id", None) or f"call_{p.function_call.name}"
             tool_calls.append({
-                "id": f"call_{p.function_call.name}",
+                "id": tc_id,
                 "type": "function",
                 "function": {
                     "name": p.function_call.name,
@@ -484,12 +511,13 @@ def _convert_gemini_content(content, messages):
         messages.append({"role": role, "content": "\n".join(texts)})
 
 
-def build_function_response_content(tool_name: str, result: dict) -> dict:
+def build_function_response_content(tool_name: str, result: dict,
+                                    tool_call_id: Optional[str] = None) -> dict:
     """Build an OpenAI-format tool response message for the agentic loop.
     In OpenAI mode, the loop appends this instead of Part.from_function_response."""
     import json as _json
     return {
         "role": "tool",
-        "tool_call_id": f"call_{tool_name}",
+        "tool_call_id": tool_call_id or f"call_{tool_name}",
         "content": _json.dumps(result),
     }
