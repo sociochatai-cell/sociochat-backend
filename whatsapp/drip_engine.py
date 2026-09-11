@@ -13,6 +13,15 @@ from .services import WhatsAppService
 
 logger = logging.getLogger(__name__)
 
+# Campaigns that receive new enrollments over time and must never auto-complete.
+# A completed campaign is skipped by the processor, so auto-completing these would
+# silently drop any later manual/CRM/sheet enrollment.
+_ONGOING_TRIGGER_TYPES = {
+    "manual", "drip_manual",
+    "new_lead", "new_contact",
+    "google_sheet_row", "new_message",
+}
+
 
 def _is_url_like(value: str) -> bool:
     candidate = str(value or "").strip().lower()
@@ -701,15 +710,17 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
         enrollment.status = "blocked_missing_data"
         enrollment.status_reason = f"Required template parameters are missing: {', '.join(missing_vars)}"
         
-        # Check for campaign completion since this finishes the enrollment
-        total = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign.id).count()
-        finished = WhatsAppDripEnrollment.query.filter(
-            WhatsAppDripEnrollment.campaign_id == campaign.id,
-            WhatsAppDripEnrollment.status.in_(["completed", "failed", "blocked_missing_data"])
-        ).count()
-        if finished >= total and total > 0:
-            campaign.status = "completed"
-            logger.info(f"Campaign {campaign.id} COMPLETED (All {total} enrollments finished due to parameter missing)")
+        # Check for campaign completion since this finishes the enrollment.
+        # Ongoing campaigns never auto-complete (see note in the success path below).
+        if campaign.trigger_type not in _ONGOING_TRIGGER_TYPES:
+            total = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign.id).count()
+            finished = WhatsAppDripEnrollment.query.filter(
+                WhatsAppDripEnrollment.campaign_id == campaign.id,
+                WhatsAppDripEnrollment.status.in_(["completed", "failed", "blocked_missing_data"])
+            ).count()
+            if finished >= total and total > 0:
+                campaign.status = "completed"
+                logger.info(f"Campaign {campaign.id} COMPLETED (All {total} enrollments finished due to parameter missing)")
             
         db.session.commit()
         return
@@ -762,17 +773,20 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
             campaign.completed_count = (campaign.completed_count or 0) + 1
             
             # CHECK FOR CAMPAIGN COMPLETION
-            # If all enrollments are either completed or failed, mark campaign as completed
-            # This handles the "Auto-complete" requirement
-            total = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign.id).count()
-            finished = WhatsAppDripEnrollment.query.filter(
-                WhatsAppDripEnrollment.campaign_id == campaign.id,
-                WhatsAppDripEnrollment.status.in_(["completed", "failed", "blocked_missing_data"])
-            ).count()
-            
-            if finished >= total and total > 0:
-                campaign.status = "completed"
-                logger.info(f"Campaign {campaign.id} COMPLETED (All {total} enrollments finished)")
+            # Ongoing campaigns (manual + auto-triggers) receive new enrollments over
+            # time, so they must NEVER auto-complete — otherwise a later manual/auto
+            # enrollment lands on a 'completed' campaign and the processor skips it
+            # (campaign not active/running) so it never sends.
+            if campaign.trigger_type not in _ONGOING_TRIGGER_TYPES:
+                total = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign.id).count()
+                finished = WhatsAppDripEnrollment.query.filter(
+                    WhatsAppDripEnrollment.campaign_id == campaign.id,
+                    WhatsAppDripEnrollment.status.in_(["completed", "failed", "blocked_missing_data"])
+                ).count()
+
+                if finished >= total and total > 0:
+                    campaign.status = "completed"
+                    logger.info(f"Campaign {campaign.id} COMPLETED (All {total} enrollments finished)")
 
         logger.info(f"[DRIP] Campaign {campaign.id} Step {step.step_order} sent to {enrollment.phone_number}")
         
