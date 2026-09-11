@@ -2122,7 +2122,7 @@ def enroll_from_crm(entity_type: str, entity_data: dict, workspace_id: int, comm
             logger.info(f"[CRM Drip] Entity data keys: {list(entity_data.keys())}")
             
             variables = {}
-            
+
             # 1. Apply column mappings from CRM entity data
             if campaign.column_mapping:
                 for step_key, field_name in campaign.column_mapping.items():
@@ -2131,16 +2131,30 @@ def enroll_from_crm(entity_type: str, entity_data: dict, workspace_id: int, comm
                         val = entity_data[field_name]
                     elif field_name.lower() in entity_data:
                         val = entity_data[field_name.lower()]
-                    
+
                     if val is not None and str(val).strip():
                         variables[step_key] = str(val)
                 logger.info(f"[CRM Drip] Variables after column_mapping: {variables}")
             else:
-                # No mapping configured - campaigns may have been created before fix
-                logger.warning(f"[CRM Drip] Campaign {campaign.id} has no column_mapping! Please re-create the campaign.")
-                # Use raw data as is, but it won't work with extract_step_params
-                variables = entity_data.copy()
-            
+                # No mapping configured — auto-map common fields as positional params
+                # so templates using {{1}}, {{2}} still get useful values
+                logger.warning(f"[CRM Drip] Campaign {campaign.id} has no column_mapping, using auto-map.")
+                common_fields = ["name", "company", "email", "source", "status", "job_title"]
+                pos = 1
+                for field in common_fields:
+                    val = entity_data.get(field) or entity_data.get(field.lower())
+                    if val and str(val).strip():
+                        variables[f"step_1_{pos}"] = str(val).strip()
+                        pos += 1
+
+            # Always include raw field keys so named templates ({{name}}, {{phone}}) resolve directly
+            for field, val in entity_data.items():
+                if field not in ("phone",) and val and str(val).strip():
+                    variables.setdefault(field, str(val).strip())
+            # phone is the enrollment target; include it in variables only if explicitly mapped above
+            if "phone" in (campaign.column_mapping or {}).values() and entity_data.get("phone"):
+                variables.setdefault("phone", str(entity_data["phone"]).strip())
+
             # 2. Apply fallback values for any missing keys
             if campaign.fallback_values:
                 for step_key, default_val in campaign.fallback_values.items():
