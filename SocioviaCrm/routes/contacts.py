@@ -451,7 +451,7 @@ def create_contact():
                 'role': getattr(c, 'role', None),
                 'tags': str(getattr(c, 'tags', None)) if getattr(c, 'tags', None) else None,
             }
-            ws_id = int(create_kwargs.get('workspace_id')) if create_kwargs.get('workspace_id') else None
+            ws_id = ws_val  # ws_val already validated above from query param
             if ws_id:
                 result = enroll_from_crm('contact', contact_data, ws_id)
                 if result.get('enrolled_campaigns', 0) > 0:

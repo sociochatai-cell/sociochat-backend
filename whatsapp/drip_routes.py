@@ -2089,14 +2089,15 @@ def enroll_from_crm(entity_type: str, entity_data: dict, workspace_id: int, comm
     if not phone:
         return {"enrolled_campaigns": 0, "errors": ["Invalid phone number"]}
     
-    # Find all active campaigns with matching trigger type
+    # Find all active campaigns with matching trigger type AND workspace
     campaigns = WhatsAppDripCampaign.query.filter_by(
         trigger_type=trigger_type,
-        status='active'
+        status='active',
+        workspace_id=str(workspace_id)
     ).all()
-    
+
     if not campaigns:
-        logger.debug(f"[CRM Drip] No active campaigns for trigger_type={trigger_type}")
+        logger.debug(f"[CRM Drip] No active campaigns for trigger_type={trigger_type} workspace={workspace_id}")
         return {"enrolled_campaigns": 0, "errors": []}
     
     enrolled_campaigns = 0
