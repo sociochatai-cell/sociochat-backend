@@ -386,13 +386,17 @@ def classify_lead_status(text, workspace_id):
         try:
             from google.genai.types import GenerateContentConfig
 
-            response = client.models.generate_content(
+            from core.genai_bridge import generate_text
+            response = generate_text(
                 model=MODEL,
                 contents=prompt,
                 config=GenerateContentConfig(
                     max_output_tokens=8,
                     temperature=0.0,
                 ),
+                gemini_client=client,
+                workspace_id=workspace_id,
+                feature="lead_status_classify",
             )
 
             # --- AI usage metering (fail-soft) ---

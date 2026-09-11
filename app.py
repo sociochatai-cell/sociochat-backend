@@ -1056,10 +1056,13 @@ def analyze_workspace_url():
             "social_links = comma-separated social/profile URLs if present, else \"\".\n\n"
             "WEBSITE (" + url + "):\n" + text
         )
-        resp = client.models.generate_content(
+        from core.genai_bridge import generate_text
+        resp = generate_text(
             model=_os.getenv("SC_ANALYZE_MODEL", "gemini-2.5-flash"),
             contents=prompt,
             config={"response_mime_type": "application/json"},
+            gemini_client=client,
+            feature="app_test",
         )
         raw = (resp.text or "").strip()
         if raw.startswith("```"):

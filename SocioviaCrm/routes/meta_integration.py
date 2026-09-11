@@ -103,10 +103,13 @@ def _generate_content_robust(contents, temperature=0.7):
     logger.info(f"[GenAI] Using model: {GENAI_MODEL}")
     
     # Vertex AI client usage
-    response = client.models.generate_content(
+    from core.genai_bridge import generate_text
+    response = generate_text(
         model=GENAI_MODEL,
         contents=contents,
-        config=config
+        config=config,
+        gemini_client=client,
+        feature="meta_integration",
     )
     
     # Debug: Log raw response
@@ -1414,9 +1417,12 @@ def generate_targeting():
     """
     
     try:
-        response = client.models.generate_content(
+        from core.genai_bridge import generate_text
+        response = generate_text(
             model="gemini-3.1-flash-lite",
-            contents=prompt
+            contents=prompt,
+            gemini_client=client,
+            feature="meta_integration",
         )
         text = response.text
 

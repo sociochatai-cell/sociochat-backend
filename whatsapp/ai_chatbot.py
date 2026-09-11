@@ -713,17 +713,21 @@ def classify_intent(
         
         prompt = INTENT_CLASSIFICATION_PROMPT.format(message=message[:300])
         
-        response = client.models.generate_content(
+        from core.genai_bridge import generate_text
+        response = generate_text(
             model=model_name or DEFAULT_MODEL,
             contents=prompt,
             config=GenerateContentConfig(
                 max_output_tokens=256,
                 temperature=0.1
-            )
+            ),
+            gemini_client=client,
+            workspace_id=workspace_id,
+            feature="ai_intent",
         )
-        
+
         elapsed_ms = int((time.time() - start_time) * 1000)
-        
+
         if not response.text:
             return IntentResult(intent="other", success=False, error="Empty response", response_time_ms=elapsed_ms)
 
@@ -1805,12 +1809,14 @@ class WhatsAppAIChatbot:
         used_rag = False
         rag_chunks = 0
         max_score = 0.0
+        from core.genai_bridge import generate_agentic, is_openai_mode, build_function_response_content
+        _openai_mode = is_openai_mode()
         MAX_STEPS = 4
         for step in range(MAX_STEPS):
             # On the final step, drop tools so the model MUST return a text reply
             # (guarantees a real answer instead of "loop exhausted").
             force_final = step == (MAX_STEPS - 1)
-            response = self.client.models.generate_content(
+            response = generate_agentic(
                 model=self.config.model,
                 contents=contents,
                 config=GenerateContentConfig(
@@ -1819,6 +1825,10 @@ class WhatsAppAIChatbot:
                     system_instruction=system_prompt,
                     tools=(None if (force_final or not tools) else tools),
                 ),
+                tools=(None if (force_final or not tools) else tools),
+                gemini_client=self.client,
+                workspace_id=self.config.workspace_id,
+                feature="ai_agent",
             )
             cand = (getattr(response, "candidates", None) or [None])[0]
             parts = list(getattr(getattr(cand, "content", None), "parts", None) or [])
@@ -1845,24 +1855,34 @@ class WhatsAppAIChatbot:
                     escalation_reason=self._agent_escalate_reason,
                 )
 
-            # Model asked to call one or more tools. Append the model's ACTUAL response
-            # content (this preserves the Gemini 3.x thought_signature on the function_call
-            # parts — required, else the next turn 400s), run the tools, then feed the
-            # function responses back as a proper Content of Part.from_function_response.
+            # Model asked to call one or more tools. Append the model's response,
+            # run the tools, then feed function responses back.
             if getattr(cand, "content", None) is not None:
                 contents.append(cand.content)
-            resp_parts: List[Any] = []
-            for fc in calls:
-                nm = fc.name
-                fargs = dict(fc.args or {})
-                result = self._execute_agent_tool(nm, fargs)
-                self._agent_tool_log.append({"name": nm, "args": fargs, "result": result, "timestamp": datetime.utcnow().isoformat()})
-                if nm == "search_knowledge_base":
-                    used_rag = True
-                    rag_chunks = max(rag_chunks, int(result.get("count", 0) or 0))
-                    max_score = max(max_score, float(result.get("max_score", 0.0) or 0.0))
-                resp_parts.append(Part.from_function_response(name=nm, response=result))
-            contents.append(Content(role="user", parts=resp_parts))
+            if _openai_mode:
+                for fc in calls:
+                    nm = fc.name
+                    fargs = dict(fc.args or {})
+                    result = self._execute_agent_tool(nm, fargs)
+                    self._agent_tool_log.append({"name": nm, "args": fargs, "result": result, "timestamp": datetime.utcnow().isoformat()})
+                    if nm == "search_knowledge_base":
+                        used_rag = True
+                        rag_chunks = max(rag_chunks, int(result.get("count", 0) or 0))
+                        max_score = max(max_score, float(result.get("max_score", 0.0) or 0.0))
+                    contents.append(build_function_response_content(nm, result))
+            else:
+                resp_parts: List[Any] = []
+                for fc in calls:
+                    nm = fc.name
+                    fargs = dict(fc.args or {})
+                    result = self._execute_agent_tool(nm, fargs)
+                    self._agent_tool_log.append({"name": nm, "args": fargs, "result": result, "timestamp": datetime.utcnow().isoformat()})
+                    if nm == "search_knowledge_base":
+                        used_rag = True
+                        rag_chunks = max(rag_chunks, int(result.get("count", 0) or 0))
+                        max_score = max(max_score, float(result.get("max_score", 0.0) or 0.0))
+                    resp_parts.append(Part.from_function_response(name=nm, response=result))
+                contents.append(Content(role="user", parts=resp_parts))
 
         logger.warning("[ai_chatbot][agent] loop exhausted after %s steps", MAX_STEPS)
         return ChatResponse(
@@ -2055,16 +2075,20 @@ CRITICAL RULES (NEVER VIOLATE):
                 contents = _history
 
             out_tokens = max(256, min(int(self.config.max_tokens or DEFAULT_MAX_OUTPUT_TOKENS), 8192))
-            response = self.client.models.generate_content(
+            from core.genai_bridge import generate_text
+            response = generate_text(
                 model=self.config.model,
                 contents=contents,
                 config=GenerateContentConfig(
                     max_output_tokens=out_tokens,
                     temperature=self.config.temperature,
                     system_instruction=effective_system_prompt,
-                )
+                ),
+                gemini_client=self.client,
+                workspace_id=self.config.workspace_id,
+                feature="ai_chat",
             )
-            
+
             response_text = self._clean_response(response.text.strip()) if response.text else ""
             
             # Safety: If response is empty or too short, use fallback

@@ -554,13 +554,17 @@ Original message: {message}
 
 Rewritten message:"""
 
-        response = client.models.generate_content(
+        from core.genai_bridge import generate_text
+        response = generate_text(
             model=os.environ.get("TEXT_MODEL") or os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash",
             contents=prompt,
             config=GenerateContentConfig(
                 max_output_tokens=256,
                 temperature=0.7
-            )
+            ),
+            gemini_client=client,
+            workspace_id=workspace_id,
+            feature="ai_suggestion",
         )
         
         rewritten = response.text.strip() if response.text else message

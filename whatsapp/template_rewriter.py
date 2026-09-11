@@ -135,9 +135,12 @@ class TemplateRewriter:
         prompt = self._build_prompt(body, target_category, mode, preserved_variables)
         
         try:
-            response = self.client.models.generate_content(
+            from core.genai_bridge import generate_text
+            response = generate_text(
                 model=self.model,
                 contents=prompt,
+                gemini_client=self.client,
+                feature="template_rewrite",
             )
             result_text = (response.text or "").strip()
             

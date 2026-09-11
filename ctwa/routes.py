@@ -1504,10 +1504,13 @@ def _generate_ad_images(client, prompt, count):
     # Fallback — Gemini native image generation (generateContent, inline image parts)
     for model in [m for m in _GEMINI_IMAGE_CANDIDATES if m]:
         try:
-            resp = client.models.generate_content(
+            from core.genai_bridge import generate_text
+            resp = generate_text(
                 model=model,
                 contents=prompt,
                 config={"response_modalities": ["TEXT", "IMAGE"]},
+                gemini_client=client,
+                feature="ctwa",
             )
             imgs = _extract_inline_image_bytes(resp)
             if imgs:

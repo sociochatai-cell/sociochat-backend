@@ -3367,10 +3367,14 @@ RULES:
 - Use numbers and percentages when possible"""
         
         start_t = time.time()
-        response = client.models.generate_content(
+        from core.genai_bridge import generate_text
+        response = generate_text(
             model=model_name,
             contents=prompt,
-            config=GenerateContentConfig(response_mime_type="application/json")
+            config=GenerateContentConfig(response_mime_type="application/json"),
+            gemini_client=client,
+            workspace_id=workspace_id,
+            feature="wa_routes",
         )
         duration_ms = (time.time() - start_t) * 1000
         
@@ -4661,9 +4665,12 @@ Return ONLY the cleaned template text. No explanations.
             if not client:
                 raise RuntimeError("GenAI client not available")
 
-            response = client.models.generate_content(
+            from core.genai_bridge import generate_text
+            response = generate_text(
                 model=text_model,
-                contents=prompt
+                contents=prompt,
+                gemini_client=client,
+                feature="wa_routes",
             )
             
             rewritten_text = response.text.strip() if response.text else original_text

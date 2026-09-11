@@ -345,9 +345,12 @@ OUTPUT FORMAT (strict JSON):
             raw = ""
             if self._use_new_sdk and self._client:
                 # Newer google-genai SDK
-                response = self._client.models.generate_content(
+                from core.genai_bridge import generate_text
+                response = generate_text(
                     model="gemini-3.1-flash-lite",
                     contents=system_prompt + "\n\n" + user_prompt,
+                    gemini_client=self._client,
+                    feature="intent_parser",
                 )
                 raw = response.text.strip()
             else:

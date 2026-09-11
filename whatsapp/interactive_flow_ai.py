@@ -720,10 +720,14 @@ def generate_interactive_flow_draft(
     ws_hint = f"Workspace context id: {workspace_id}\n" if workspace_id else ""
     system_prompt = _SYSTEM_PROMPT.replace("{brief}", f"{ws_hint}{brief}")
 
-    response = client.models.generate_content(
+    from core.genai_bridge import generate_text
+    response = generate_text(
         model=model_id,
         contents=system_prompt,
         config={"temperature": 0.2, "max_output_tokens": 16384},
+        gemini_client=client,
+        workspace_id=workspace_id,
+        feature="interactive_flow",
     )
     raw = getattr(response, "text", "") or ""
     parsed = _extract_json_object(raw)
