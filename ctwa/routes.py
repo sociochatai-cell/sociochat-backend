@@ -1474,8 +1474,33 @@ def _extract_inline_image_bytes(resp):
     return out
 
 
-def _generate_ad_images(client, prompt, count):
-    """Return (list_of_image_bytes, model_used). Tries Imagen then Gemini image."""
+def _generate_ad_images(client, prompt, count, workspace_id=None):
+    """Return (list_of_image_bytes, model_used). Uses gateway (DALL-E 3) in
+    OpenAI mode, otherwise tries Imagen then Gemini image."""
+    import requests as _requests
+    from core.genai_bridge import is_openai_mode
+
+    # --- OpenAI mode: DALL-E 3 via gateway ---
+    if is_openai_mode():
+        from core.genai_bridge import generate_image
+        results = generate_image(
+            prompt=prompt, count=count, size="1024x1792",
+            workspace_id=str(workspace_id) if workspace_id else None,
+            feature="ctwa_image",
+        )
+        imgs = []
+        for r in results:
+            try:
+                resp = _requests.get(r["url"], timeout=30)
+                if resp.ok:
+                    imgs.append(resp.content)
+            except Exception as e:
+                logger.warning("ctwa generate-image: failed to download DALL-E URL: %s", e)
+        if imgs:
+            return imgs, "dall-e-3"
+        raise RuntimeError("no_images_generated")
+
+    # --- Gemini mode: Imagen then Gemini image fallback ---
     last_err = None
 
     for model in [m for m in _IMAGEN_CANDIDATES if m]:
@@ -1501,7 +1526,6 @@ def _generate_ad_images(client, prompt, count):
                 last_err = e
                 logger.info("ctwa generate-image: imagen %s (%s) failed: %s", model, cfg_kind, e)
 
-    # Fallback — Gemini native image generation (generateContent, inline image parts)
     for model in [m for m in _GEMINI_IMAGE_CANDIDATES if m]:
         try:
             from core.genai_bridge import generate_text
@@ -1571,7 +1595,7 @@ def generate_image():
             return jsonify({"success": False, "error": "genai_client_not_initialized"}), 500
 
         try:
-            images, _model_used = _generate_ad_images(client, final_prompt, count)
+            images, _model_used = _generate_ad_images(client, final_prompt, count, workspace_id=workspace_id)
         except Exception as e:
             logger.exception("ctwa generate-image: all image models failed")
             return jsonify({"success": False, "error": str(e)}), 502

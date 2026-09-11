@@ -587,3 +587,52 @@ def _embed_openai(model, contents, workspace_id, feature, dimensions) -> List[fl
         extra_headers=extra_headers if extra_headers else None,
     )
     return response.data[0].embedding
+
+
+# ---------------------------------------------------------------------------
+# Image generation support
+# ---------------------------------------------------------------------------
+
+def generate_image(
+    prompt: str,
+    count: int = 1,
+    size: str = "1024x1792",
+    workspace_id: Optional[str] = None,
+    feature: Optional[str] = None,
+) -> list:
+    """Generate images via OpenAI DALL-E 3 through the gateway.
+
+    Returns a list of dicts: [{"url": "...", "revised_prompt": "..."}]
+    DALL-E 3 only supports n=1 per call, so we loop for count > 1.
+    """
+    client = _get_openai_client()
+    if client is None:
+        raise RuntimeError("OpenAI client not initialized for image generation")
+
+    extra_headers = {}
+    if workspace_id:
+        extra_headers["x-workspace-id"] = str(workspace_id)
+    if feature:
+        extra_headers["x-feature"] = str(feature)
+
+    results = []
+    for _ in range(min(count, 4)):
+        try:
+            response = client.images.generate(
+                model="dall-e-3",
+                prompt=prompt,
+                n=1,
+                size=size,
+                quality="standard",
+                extra_headers=extra_headers if extra_headers else None,
+            )
+            for img in response.data:
+                results.append({
+                    "url": img.url,
+                    "revised_prompt": getattr(img, "revised_prompt", None),
+                })
+        except Exception as e:
+            logger.error("OpenAI image generation failed: %s", e)
+            if not results:
+                raise
+    return results
