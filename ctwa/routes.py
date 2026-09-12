@@ -1475,12 +1475,12 @@ def _extract_inline_image_bytes(resp):
 
 
 def _generate_ad_images(client, prompt, count, workspace_id=None):
-    """Return (list_of_image_bytes, model_used). Uses gateway (DALL-E 3) in
+    """Return (list_of_image_bytes, model_used). Uses gateway (gpt-image-1) in
     OpenAI mode, otherwise tries Imagen then Gemini image."""
-    import requests as _requests
+    import base64 as _b64
     from core.genai_bridge import is_openai_mode
 
-    # --- OpenAI mode: DALL-E 3 via gateway ---
+    # --- OpenAI mode: gpt-image-1 via gateway ---
     if is_openai_mode():
         from core.genai_bridge import generate_image
         results = generate_image(
@@ -1490,14 +1490,11 @@ def _generate_ad_images(client, prompt, count, workspace_id=None):
         )
         imgs = []
         for r in results:
-            try:
-                resp = _requests.get(r["url"], timeout=30)
-                if resp.ok:
-                    imgs.append(resp.content)
-            except Exception as e:
-                logger.warning("ctwa generate-image: failed to download DALL-E URL: %s", e)
+            b64 = r.get("b64_json")
+            if b64:
+                imgs.append(_b64.b64decode(b64))
         if imgs:
-            return imgs, "dall-e-3"
+            return imgs, "gpt-image-1"
         raise RuntimeError("no_images_generated")
 
     # --- Gemini mode: Imagen then Gemini image fallback ---
