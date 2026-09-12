@@ -1484,7 +1484,7 @@ def _generate_ad_images(client, prompt, count, workspace_id=None):
     if is_openai_mode():
         from core.genai_bridge import generate_image
         results = generate_image(
-            prompt=prompt, count=count, size="1024x1792",
+            prompt=prompt, count=count, size="1024x1536",
             workspace_id=str(workspace_id) if workspace_id else None,
             feature="ctwa_image",
         )

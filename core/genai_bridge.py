@@ -567,20 +567,27 @@ def _embed_gemini(model, contents, config, gemini_client) -> List[float]:
     return result.embeddings[0].values
 
 
+_VALID_GPT_IMAGE_SIZES = {"1024x1024", "1024x1536", "1536x1024", "auto"}
+
+
 def generate_image(
     prompt: str,
     count: int = 1,
-    size: str = "1024x1792",
+    size: str = "1024x1536",
     workspace_id: Optional[str] = None,
     feature: Optional[str] = None,
 ) -> list:
     """Generate images via OpenAI gateway (gpt-image-1).
 
     Returns list of dicts with 'b64_json' key containing base64-encoded PNG data.
+    Supported sizes: 1024x1024, 1024x1536, 1536x1024, auto.
     """
     client = _get_openai_client()
     if client is None:
         raise RuntimeError("OpenAI client not initialized for image generation")
+
+    if size not in _VALID_GPT_IMAGE_SIZES:
+        size = "1024x1536"
 
     extra_headers = {}
     if workspace_id:
