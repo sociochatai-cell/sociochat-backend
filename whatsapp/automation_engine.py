@@ -219,19 +219,32 @@ class AutomationEngine:
         if rule_type == "command":
             command = trigger_config.get("command", "").lower().strip()
             aliases = trigger_config.get("aliases", [])
-            
+
             text_lower = message_text.lower().strip()
-            
-            # Check main command
-            if command and (text_lower == command or text_lower.startswith(command + " ")):
-                return {"matched": True, "matched_keyword": command}
-            
-            # Check aliases
+
+            # Check main command (with or without leading slash)
+            if command:
+                cmd_variants = [command]
+                if command.startswith("/"):
+                    cmd_variants.append(command[1:])
+                else:
+                    cmd_variants.append("/" + command)
+                for cmd in cmd_variants:
+                    if text_lower == cmd or text_lower.startswith(cmd + " "):
+                        return {"matched": True, "matched_keyword": command}
+
+            # Check aliases (with or without leading slash)
             for alias in aliases:
                 alias_lower = alias.lower().strip()
-                if text_lower == alias_lower or text_lower.startswith(alias_lower + " "):
-                    return {"matched": True, "matched_keyword": alias}
-            
+                alias_variants = [alias_lower]
+                if alias_lower.startswith("/"):
+                    alias_variants.append(alias_lower[1:])
+                else:
+                    alias_variants.append("/" + alias_lower)
+                for av in alias_variants:
+                    if text_lower == av or text_lower.startswith(av + " "):
+                        return {"matched": True, "matched_keyword": alias}
+
             return {"matched": False}
         
         # KEYWORD: Triggers on keyword match

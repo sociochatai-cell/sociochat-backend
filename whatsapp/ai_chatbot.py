@@ -952,7 +952,16 @@ You are an AI assistant for this business on WhatsApp. You may call tools to hel
 - When the customer asks for a human/agent, is upset, or has a request you cannot handle, call `escalate_to_human` and tell them a team member will follow up shortly.
 - When the customer tells you their name, email, or company, call `capture_lead` and pass those EXACT values (from their message), plus their interest. Address the customer by the name they just gave — not any older saved name.
 - To send an approved TEMPLATE you MUST call `send_template` — never just type the template's wording as a normal text message. Call `list_templates` first to see the exact names and how many {{n}} variables each needs, then `send_template` with the values in order. Good times to send a template: a welcome/greeting template when the customer says hi/hello or it's first contact, and structured content like an order/booking confirmation, a reminder, or an offer. Do NOT send a template that doesn't fit the moment, and never invent a template name. For everything else, reply with normal text/interactive.
-- Always finish your turn with a plain-text reply to the customer (no markdown), match the customer's language, keep it concise for WhatsApp."""
+- Always finish your turn with a plain-text reply to the customer (no markdown), match the customer's language, keep it concise for WhatsApp.
+
+CONVERSATION CLOSING (CRITICAL):
+- When the conversation has naturally ended — the customer says "ok", "okay", "thanks", "thank you", "bye", "alright", "got it", "cool", "fine", or similar SHORT acknowledgement AFTER you have already answered their question or escalated to a human — reply with a brief, warm closing like "You're welcome! Feel free to reach out anytime." or "Happy to help! Have a great day." Do NOT ask follow-up questions, do NOT say "I don't understand", do NOT ask them to clarify. The conversation is done.
+- If you already told them "a team member will connect shortly" or similar, and they reply with just "ok", "okay", "thanks", "hmm", "alright" — simply acknowledge warmly and close. Do NOT restart the conversation or ask new questions.
+- Signs a conversation is ending: short 1-3 word replies after a resolution, farewell words, acknowledgements. Respond gracefully, never with confusion.
+
+CONTACT DETAILS:
+- When the customer asks for contact details, a phone number, or an email to reach the business, call `get_business_info` first. If it returns a phone number or email, share those details clearly. If no contact info is available, say a team member will reach out to them, and call `escalate_to_human` so someone follows up.
+- Always provide whatever contact details are available from get_business_info — never say "I don't have that information" without checking first."""
 
 
 def _agent_guardrails(workspace_id: Optional[Any]) -> Dict[str, Any]:
@@ -1322,6 +1331,21 @@ class WhatsAppAIChatbot:
                 if not row:
                     return {"found": False, "note": "No business profile on file for this workspace."}
                 info = {k: v for k, v in dict(row).items() if v}
+                try:
+                    wa_row = _db.session.execute(
+                        _text(
+                            "select display_phone_number, notification_email "
+                            "from whatsapp_accounts where workspace_id = :wid and is_active = true limit 1"
+                        ),
+                        {"wid": str(self.config.workspace_id)},
+                    ).mappings().first()
+                    if wa_row:
+                        if wa_row.get("display_phone_number"):
+                            info["contact_phone"] = wa_row["display_phone_number"]
+                        if wa_row.get("notification_email"):
+                            info["contact_email"] = wa_row["notification_email"]
+                except Exception:
+                    pass
                 return {"found": True, "business": info}
             if name == "list_products":
                 import requests as _rq
@@ -1659,17 +1683,27 @@ class WhatsAppAIChatbot:
             return {"ok": False, "note": "Could not create the payment link right now."}
 
     def _tool_escalate_to_human(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """PHASE 4: flag this conversation for a human in the inbox and mark the
-        ChatResponse so the automation layer escalates. Wraps
-        human_escalation.mark_conversation_human_required."""
+        """PHASE 4: flag this conversation for a human in the inbox, send notification
+        email, and mark the ChatResponse so the automation layer escalates."""
         reason = (args.get("reason") or "customer requested human").strip()[:200]
         self._agent_escalate = True
         self._agent_escalate_reason = reason
         conv_id = self.config.conversation_id
         if conv_id:
             try:
-                from .human_escalation import mark_conversation_human_required
+                from .human_escalation import mark_conversation_human_required, _send_escalation_email
                 mark_conversation_human_required(int(conv_id), reason)
+                try:
+                    from .models import WhatsAppAccount, WhatsAppConversation
+                    conv = WhatsAppConversation.query.get(int(conv_id))
+                    if conv:
+                        acc = WhatsAppAccount.query.filter_by(
+                            workspace_id=str(self.config.workspace_id), is_active=True
+                        ).first()
+                        if acc:
+                            _send_escalation_email(acc, conv, reason, _last_user_text(None))
+                except Exception as e2:
+                    logger.warning("[ai_chatbot][agent] escalate email failed: %s", e2)
             except Exception as e:  # noqa: BLE001
                 logger.warning("[ai_chatbot][agent] escalate mark failed: %s", e)
         return {"ok": True, "note": "Conversation flagged for a human team member."}

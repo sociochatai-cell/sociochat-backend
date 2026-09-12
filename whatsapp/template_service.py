@@ -125,7 +125,23 @@ class WhatsAppTemplateService:
                     existing.meta_template_id = meta_id
                     existing.status = status
                     existing.category = category
-                    existing.components = tpl.get("components", [])
+                    # Preserve header_handle from local components (Meta strips it after creation)
+                    new_components = tpl.get("components", [])
+                    if existing.components and isinstance(existing.components, list):
+                        old_header = next(
+                            (c for c in existing.components
+                             if isinstance(c, dict) and (c.get("type") or "").upper() == "HEADER"),
+                            None,
+                        )
+                        if old_header:
+                            old_handles = (old_header.get("example") or {}).get("header_handle")
+                            if old_handles:
+                                for nc in new_components:
+                                    if isinstance(nc, dict) and (nc.get("type") or "").upper() == "HEADER":
+                                        if not (nc.get("example") or {}).get("header_handle"):
+                                            nc.setdefault("example", {})["header_handle"] = old_handles
+                                        break
+                    existing.components = new_components
                     existing.rejection_reason = tpl.get("rejected_reason")
                     existing.quality_score = _coerce_quality_score(tpl.get("quality_score"))
 
