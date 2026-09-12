@@ -686,16 +686,52 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
             body_parameters = [{"type": "text", "text": str(p)} for p in params]
             components.append({"type": "body", "parameters": body_parameters})
     
+    # Apply campaign fallback_values for any missing/empty params before validation
+    campaign_fallbacks = campaign.fallback_values if hasattr(campaign, 'fallback_values') and campaign.fallback_values else {}
+    if is_named_template and template_record:
+        for name in expected_params:
+            val = final_named_params.get(name)
+            if (val is None or str(val).strip() == "") and campaign_fallbacks:
+                fb = campaign_fallbacks.get(name) or campaign_fallbacks.get(f"step_{step.step_order}_{name}")
+                if fb and str(fb).strip():
+                    final_named_params[name] = str(fb).strip()
+            if (val is None or str(val).strip() == "") and name.lower() in ("name", "customer_name"):
+                final_named_params.setdefault(name, "Customer")
+    else:
+        expected_count = template_record.variable_count if template_record else 0
+        while len(params) < expected_count:
+            idx = len(params) + 1
+            fb_key = f"step_{step.step_order}_{idx}"
+            fb_val = campaign_fallbacks.get(fb_key) or campaign_fallbacks.get(str(idx))
+            params.append(str(fb_val).strip() if fb_val and str(fb_val).strip() else "")
+            idx += 1
+        for idx, p in enumerate(params):
+            if (p is None or str(p).strip() == "") and campaign_fallbacks:
+                fb_key = f"step_{step.step_order}_{idx+1}"
+                fb_val = campaign_fallbacks.get(fb_key) or campaign_fallbacks.get(str(idx+1))
+                if fb_val and str(fb_val).strip():
+                    params[idx] = str(fb_val).strip()
+        # Rebuild body components if we patched params
+        if params:
+            body_parameters = [{"type": "text", "text": str(p)} for p in params]
+            components = [c for c in components if c.get("type") != "body"]
+            components.append({"type": "body", "parameters": body_parameters})
+
     # STRICT RUNTIME PARAMETER VALIDATION
     missing_vars = []
     if is_named_template and template_record:
-        # Check named params
         for name in expected_params:
             val = final_named_params.get(name)
             if val is None or str(val).strip() == "":
                 missing_vars.append(name)
+        # Rebuild body components after fallback application
+        if not missing_vars and final_named_params:
+            body_parameters = []
+            for name, value in final_named_params.items():
+                body_parameters.append({"type": "text", "parameter_name": name, "text": str(value)})
+            components = [c for c in components if c.get("type") != "body"]
+            components.append({"type": "body", "parameters": body_parameters})
     else:
-        # Check positional params
         expected_count = template_record.variable_count if template_record else 0
         if len(params) < expected_count:
             for idx in range(len(params) + 1, expected_count + 1):
