@@ -475,6 +475,44 @@ class WhatsAppMessagingService:
             builder.add_header_document(header_document_url)
         elif header_text:
             builder.add_header_text(header_text)
+        else:
+            # Auto-lookup header_handle from stored template, download and
+            # re-upload to Meta to get a valid media_id for sending.
+            try:
+                from .models import WhatsAppTemplate, WhatsAppAccount
+                acct = WhatsAppAccount.query.filter_by(
+                    phone_number_id=str(self.phone_number_id)
+                ).first()
+                tpl = None
+                if acct:
+                    tpl = WhatsAppTemplate.query.filter_by(
+                        name=template_name, account_id=acct.id
+                    ).first()
+                if tpl and tpl.components:
+                    for comp in (tpl.components if isinstance(tpl.components, list) else []):
+                        if isinstance(comp, dict) and (comp.get("type") or "").upper() == "HEADER":
+                            fmt = (comp.get("format") or "").upper()
+                            handles = (comp.get("example") or {}).get("header_handle")
+                            if handles and isinstance(handles, list) and handles[0]:
+                                handle_url = handles[0]
+                                if fmt == "IMAGE":
+                                    media_id = self.upload_media_from_url(handle_url, media_kind="image")
+                                    if media_id:
+                                        builder.add_header_image_by_id(media_id)
+                                        logger.info("[header_handle] Uploaded image, media_id=%s", media_id)
+                                    else:
+                                        logger.warning("[header_handle] Failed to upload image from %s", handle_url[:80])
+                                elif fmt == "VIDEO":
+                                    media_id = self.upload_media_from_url(handle_url, media_kind="video")
+                                    if media_id:
+                                        builder._header_component = {"type": "header", "parameters": [{"type": "video", "video": {"id": media_id}}]}
+                                elif fmt == "DOCUMENT":
+                                    media_id = self.upload_media_from_url(handle_url, media_kind="document")
+                                    if media_id:
+                                        builder._header_component = {"type": "header", "parameters": [{"type": "document", "document": {"id": media_id}}]}
+                            break
+            except Exception:
+                logger.debug("Auto-lookup header_handle failed (non-fatal)", exc_info=True)
 
         # Add body params if provided
         if body_params:

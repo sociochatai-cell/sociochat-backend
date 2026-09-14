@@ -114,9 +114,9 @@ class TemplateBuilder:
     def add_header_image(self, url: str) -> "TemplateBuilder":
         """
         Add image header.
-        
+
         Use when template has IMAGE header type.
-        
+
         Args:
             url: Public URL of the image
         """
@@ -125,6 +125,17 @@ class TemplateBuilder:
             parameters=[{
                 "type": "image",
                 "image": {"link": url}
+            }]
+        )
+        return self
+
+    def add_header_image_by_id(self, media_id: str) -> "TemplateBuilder":
+        """Add image header using a previously uploaded media ID."""
+        self._header_component = TemplateComponent(
+            type="header",
+            parameters=[{
+                "type": "image",
+                "image": {"id": media_id}
             }]
         )
         return self
