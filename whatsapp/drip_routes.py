@@ -3140,3 +3140,110 @@ def dataset_export_csv(dataset_id: int):
     resp.headers["Content-Disposition"] = f"attachment; filename=\"{safe_name}.csv\""
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
+
+
+# ─────────────────────────────────────────────────────────────
+# CRM Audience endpoints for Drip Campaign enrollment dialog
+# ─────────────────────────────────────────────────────────────
+
+def _crm_audience_query(workspace_id, model_name, campaign_id=None, limit=None):
+    """Shared helper: fetch CRM leads or contacts for a workspace."""
+    from flask import current_app
+    crm_models = getattr(current_app, "crm_models", None)
+    if not crm_models or model_name not in crm_models:
+        return [], 0
+
+    model = crm_models[model_name]
+    query = model.query.filter_by(workspace_id=str(workspace_id))
+
+    total = query.count()
+    if limit:
+        records = query.order_by(model.created_at.desc()).limit(limit).all()
+    else:
+        records = query.order_by(model.created_at.desc()).all()
+
+    already_enrolled_phones = set()
+    if campaign_id:
+        enrolled = WhatsAppDripEnrollment.query.filter_by(
+            campaign_id=campaign_id
+        ).filter(WhatsAppDripEnrollment.status.in_(["active", "completed"])).all()
+        for e in enrolled:
+            already_enrolled_phones.add(e.phone_number)
+
+    items = []
+    with_phone = 0
+    for r in records:
+        raw_phone = getattr(r, "phone", "") or ""
+        norm_phone = normalize_phone_number(raw_phone) if raw_phone else None
+        is_valid = norm_phone is not None and len(norm_phone) > 5
+        if raw_phone:
+            with_phone += 1
+
+        items.append({
+            "id": str(getattr(r, "id", "")),
+            "name": getattr(r, "name", None),
+            "phone": raw_phone,
+            "phone_normalized": norm_phone,
+            "email": getattr(r, "email", None),
+            "company": getattr(r, "company", None),
+            "status": getattr(r, "status", None),
+            "whatsapp_ready": is_valid,
+            "already_enrolled": norm_phone in already_enrolled_phones if norm_phone else False,
+            "created_at": r.created_at.isoformat() if getattr(r, "created_at", None) else None,
+        })
+
+    return items, with_phone
+
+
+@drip_bp.route("/accounts/<int:account_id>/crm-audience/summary", methods=["GET"])
+@require_account_access
+def crm_audience_summary(account_id: int, account: WhatsAppAccount, workspace_id: str):
+    campaign_id = request.args.get("campaign_id", type=int)
+    try:
+        leads, leads_with_phone = _crm_audience_query(workspace_id, "Lead", campaign_id)
+        contacts, contacts_with_phone = _crm_audience_query(workspace_id, "Contact", campaign_id)
+
+        already_enrolled = sum(1 for l in leads if l.get("already_enrolled")) + \
+                           sum(1 for c in contacts if c.get("already_enrolled"))
+        suppressed = sum(1 for l in leads if not l.get("whatsapp_ready")) + \
+                     sum(1 for c in contacts if not c.get("whatsapp_ready"))
+        enrollable = sum(1 for l in leads if l.get("whatsapp_ready") and not l.get("already_enrolled")) + \
+                     sum(1 for c in contacts if c.get("whatsapp_ready") and not c.get("already_enrolled"))
+
+        return jsonify({
+            "leads_with_phone": leads_with_phone,
+            "contacts_with_phone": contacts_with_phone,
+            "suppressed": suppressed,
+            "already_enrolled": already_enrolled,
+            "estimated_enrollable": enrollable,
+        })
+    except Exception as e:
+        logger.exception(f"crm_audience_summary error: {e}")
+        return jsonify({"leads_with_phone": 0, "contacts_with_phone": 0,
+                        "suppressed": 0, "already_enrolled": 0, "estimated_enrollable": 0})
+
+
+@drip_bp.route("/accounts/<int:account_id>/crm-audience/leads", methods=["GET"])
+@require_account_access
+def crm_audience_leads(account_id: int, account: WhatsAppAccount, workspace_id: str):
+    campaign_id = request.args.get("campaign_id", type=int)
+    limit = request.args.get("limit", 100, type=int)
+    try:
+        leads, _ = _crm_audience_query(workspace_id, "Lead", campaign_id, limit)
+        return jsonify({"success": True, "leads": leads})
+    except Exception as e:
+        logger.exception(f"crm_audience_leads error: {e}")
+        return jsonify({"success": False, "leads": []})
+
+
+@drip_bp.route("/accounts/<int:account_id>/crm-audience/contacts", methods=["GET"])
+@require_account_access
+def crm_audience_contacts(account_id: int, account: WhatsAppAccount, workspace_id: str):
+    campaign_id = request.args.get("campaign_id", type=int)
+    limit = request.args.get("limit", 100, type=int)
+    try:
+        contacts, _ = _crm_audience_query(workspace_id, "Contact", campaign_id, limit)
+        return jsonify({"success": True, "contacts": contacts})
+    except Exception as e:
+        logger.exception(f"crm_audience_contacts error: {e}")
+        return jsonify({"success": False, "contacts": []})

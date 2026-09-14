@@ -142,6 +142,23 @@ def upsert_contact_from_conversation(conversation, account, db_session=None):
             "Created CRM contact %s from whatsapp conversation %s (workspace %s)",
             getattr(contact, "id", "?"), conversation.id, workspace_id,
         )
+        # Drip Campaign Auto-Enrollment Hook
+        try:
+            from whatsapp.drip_routes import enroll_from_crm
+            contact_data = {
+                'name': getattr(contact, 'name', None),
+                'email': getattr(contact, 'email', None),
+                'phone': getattr(contact, 'phone', None),
+                'company': getattr(contact, 'company', None),
+            }
+            if workspace_id:
+                result = enroll_from_crm('contact', contact_data, int(workspace_id))
+                if result.get('enrolled_campaigns', 0) > 0:
+                    logger.info("[CRM Drip] Contact %s enrolled in %d drip campaigns",
+                                getattr(contact, 'id', '?'), result['enrolled_campaigns'])
+        except Exception:
+            logger.exception("[CRM Drip] Failed to process drip enrollment for contact %s",
+                             getattr(contact, 'id', '?'))
         return contact
 
     except Exception:
@@ -299,6 +316,25 @@ def upsert_lead_from_conversation(conversation, account, db_session=None):
             "Created CRM lead %s from whatsapp conversation %s (workspace %s)",
             getattr(lead, "id", "?"), conversation.id, workspace_id,
         )
+        # Drip Campaign Auto-Enrollment Hook
+        try:
+            from whatsapp.drip_routes import enroll_from_crm
+            lead_data = {
+                'name': getattr(lead, 'name', None),
+                'email': getattr(lead, 'email', None),
+                'phone': getattr(lead, 'phone', None),
+                'company': getattr(lead, 'company', None),
+                'source': getattr(lead, 'source', None),
+                'status': getattr(lead, 'status', None),
+            }
+            if workspace_id:
+                result = enroll_from_crm('lead', lead_data, int(workspace_id))
+                if result.get('enrolled_campaigns', 0) > 0:
+                    logger.info("[CRM Drip] Lead %s enrolled in %d drip campaigns",
+                                getattr(lead, 'id', '?'), result['enrolled_campaigns'])
+        except Exception:
+            logger.exception("[CRM Drip] Failed to process drip enrollment for lead %s",
+                             getattr(lead, 'id', '?'))
         # Mirror into Contacts so the lead also shows in the Contacts section.
         try:
             upsert_contact_from_conversation(conversation, account, db_session=session)
