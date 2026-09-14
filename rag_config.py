@@ -16,11 +16,15 @@ else:
 
 class QdrantConfig:
     """Qdrant database configuration."""
-    # Support both QDRANT_* and legacy QUADRANT_* env var spellings
+    # Local self-hosted Qdrant (preferred — no cloud dependency)
+    local_url: str = os.getenv("QDRANT_LOCAL_URL", "")
+    # Cloud fallback (legacy)
     endpoint: str = os.getenv("QDRANT_ENDPOINT") or os.getenv("QUADRANT_ENDPOINT", "")
     api_key: str = os.getenv("QDRANT_KEY") or os.getenv("QUADRANT_KEY", "")
     cluster_id: str = os.getenv("QDRANT_CLUSTER_ID") or os.getenv("QUADRANT_CLUSTER_ID", "")
     cluster_name: str = os.getenv("QDRANT_CLUSTER_NAME") or os.getenv("QUADRANT_CLUSTER_NAME", "")
+    # When True, use local FastEmbed instead of Gemini/OpenAI for embeddings
+    use_local_embed: bool = os.getenv("QDRANT_USE_LOCAL_EMBED", "").lower() in ("1", "true", "yes")
 
 
 class GoogleEmbeddingConfig:
@@ -28,6 +32,9 @@ class GoogleEmbeddingConfig:
     api_model_name: str = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
     vertex_model_name: str = os.getenv("VERTEX_EMBEDDING_MODEL", "text-embedding-004")
     vector_size: int = int(os.getenv("EMBEDDING_VECTOR_SIZE", "768"))
+    # FastEmbed local model
+    local_model: str = os.getenv("FASTEMBED_MODEL", "BAAI/bge-small-en-v1.5")
+    local_vector_size: int = int(os.getenv("FASTEMBED_VECTOR_SIZE", "384"))
 
 
 class GeminiConfig:

@@ -63,3 +63,4 @@ gspread>=6.0.0
 # RAG / Knowledge Base
 qdrant-client>=1.16.2
 tenacity>=8.2.3
+fastembed>=0.4.0

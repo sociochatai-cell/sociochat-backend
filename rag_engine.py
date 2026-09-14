@@ -54,6 +54,14 @@ except ImportError:
     EmbedContentConfig = None  # type: ignore
     print("⚠️ google-genai not installed. Run: pip install google-genai")
 
+# FastEmbed for local embeddings (no external API dependency)
+try:
+    from fastembed import TextEmbedding
+    FASTEMBED_AVAILABLE = True
+except ImportError:
+    FASTEMBED_AVAILABLE = False
+    TextEmbedding = None
+
 
 class RAGEngine:
     """
@@ -64,18 +72,30 @@ class RAGEngine:
     """
 
     def __init__(self):
-        """Initialize Qdrant and Gemini clients."""
+        """Initialize Qdrant and embedding clients."""
         self.qdrant_client = None
         self.gemini_client = None
         self._use_vertex = False
+        self._use_local_embed = qdrant_config.use_local_embed
+        self._fastembed_model = None
         self._embedding_model = google_embed_config.api_model_name
         self._initialize_clients()
 
     def _initialize_clients(self):
         """Initialize API clients with error handling."""
         try:
-            # Initialize Qdrant Cloud
-            if qdrant_config.endpoint and qdrant_config.api_key and QDRANT_AVAILABLE:
+            # Initialize Qdrant — prefer local, fall back to cloud
+            if qdrant_config.local_url and QDRANT_AVAILABLE:
+                self.qdrant_client = QdrantClient(
+                    url=qdrant_config.local_url,
+                    timeout=120,
+                )
+                logger.info(
+                    "Connected to local Qdrant: %s (collection=%s)",
+                    qdrant_config.local_url,
+                    app_config.collection_name,
+                )
+            elif qdrant_config.endpoint and qdrant_config.api_key and QDRANT_AVAILABLE:
                 self.qdrant_client = QdrantClient(
                     url=qdrant_config.endpoint,
                     api_key=qdrant_config.api_key,
@@ -89,6 +109,15 @@ class RAGEngine:
                 )
             else:
                 logger.warning("Qdrant credentials not found or client not available.")
+
+            # Initialize FastEmbed (local embeddings — no external API)
+            if self._use_local_embed and FASTEMBED_AVAILABLE:
+                self._fastembed_model = TextEmbedding(
+                    model_name=google_embed_config.local_model,
+                )
+                logger.info("FastEmbed initialized: %s (dim=%d)",
+                            google_embed_config.local_model,
+                            google_embed_config.local_vector_size)
             
             # Initialize Gemini: API key (dev/Docker) or Vertex AI (GCP production)
             if GENAI_AVAILABLE:
@@ -141,11 +170,23 @@ class RAGEngine:
 
     def get_embedding(self, text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> List[float]:
         """
-        Generate embeddings via bridge (Gemini or OpenAI depending on GENAI_TEXT_PROVIDER).
-        task_type: RETRIEVAL_DOCUMENT | RETRIEVAL_QUERY
+        Generate embeddings. Priority:
+        1. FastEmbed (local, no API dependency) when QDRANT_USE_LOCAL_EMBED=true
+        2. OpenAI via gateway when GENAI_TEXT_PROVIDER=openai
+        3. Gemini API (legacy fallback)
         """
         if not text or not text.strip():
             return []
+
+        # Local FastEmbed — no external API needed
+        if self._use_local_embed and self._fastembed_model is not None:
+            try:
+                embeddings = list(self._fastembed_model.embed([text]))
+                return embeddings[0].tolist()
+            except Exception as e:
+                logger.error("FastEmbed failed: %s", e)
+                print(f"❌ FastEmbed Error: {e}")
+                return []
 
         from core.genai_bridge import is_openai_mode, embed_content
 
@@ -560,10 +601,13 @@ class RAGEngine:
         
         try:
             if not self.qdrant_client.collection_exists(collection_name):
+                vec_size = (google_embed_config.local_vector_size
+                            if self._use_local_embed
+                            else google_embed_config.vector_size)
                 self.qdrant_client.create_collection(
                     collection_name=collection_name,
                     vectors_config=models.VectorParams(
-                        size=google_embed_config.vector_size,  # 768
+                        size=vec_size,
                         distance=models.Distance.COSINE
                     )
                 )
