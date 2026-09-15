@@ -668,7 +668,16 @@ def _map_meta_fields_to_crm(raw_fields: Dict[str, Any]) -> Dict[str, Any]:
     ])
     
     mapped["source"] = "Facebook Lead Ad"
-    mapped["details"] = raw_fields
+
+    # Build details: user-submitted form answers + ad attribution metadata
+    details = {k: v for k, v in raw_fields.items() if not k.startswith("_meta_")}
+    ad_attribution = {}
+    for k, v in raw_fields.items():
+        if k.startswith("_meta_") and v:
+            ad_attribution[k[6:]] = v  # strip "_meta_" prefix
+    if ad_attribution:
+        details["ad_attribution"] = ad_attribution
+    mapped["details"] = details
     return mapped
 
 
@@ -824,6 +833,18 @@ def meta_leadgen_realtime():
                 current_app.logger.info(f"Final lead_data: {lead_data}, workspace_id: {workspace_id}")
                 
                 if lead_data:
+                    # Ensure webhook-level attribution is available for mapping
+                    if form_id and "_meta_form_id" not in lead_data:
+                        lead_data["_meta_form_id"] = str(form_id)
+                    if ad_id and "_meta_ad_id" not in lead_data:
+                        lead_data["_meta_ad_id"] = str(ad_id)
+                    if adgroup_id and "_meta_adgroup_id" not in lead_data:
+                        lead_data["_meta_adgroup_id"] = str(adgroup_id)
+                    if campaign and "_meta_campaign_name" not in lead_data:
+                        lead_data["_meta_campaign_name"] = campaign.name
+                    if campaign and "_meta_campaign_id" not in lead_data:
+                        lead_data["_meta_campaign_id"] = str(campaign.id)
+
                     # Upsert into CRM
                     lead_obj, created, err = _upsert_lead_from_provider(
                         external_source="meta_leadgen",
@@ -982,16 +1003,16 @@ def _fetch_lead_from_meta(leadgen_id: str, page_id: str, workspace_id: str = Non
             url,
             params={
                 "access_token": access_token,
-                "fields": "id,created_time,field_data"
+                "fields": "id,created_time,field_data,form_id,ad_id,campaign_id,adgroup_id"
             },
             timeout=30
         )
-        
+
         data = resp.json()
         if data.get("error"):
             current_app.logger.warning(f"Meta API error fetching lead: {data}")
             return None
-        
+
         # Parse field_data into a flat dict
         lead_fields = {}
         for field in data.get("field_data", []):
@@ -999,7 +1020,27 @@ def _fetch_lead_from_meta(leadgen_id: str, page_id: str, workspace_id: str = Non
             values = field.get("values", [])
             if values:
                 lead_fields[name] = values[0]
-        
+
+        # Carry ad attribution metadata so the caller can store it on the lead
+        for meta_key in ("form_id", "ad_id", "campaign_id", "adgroup_id"):
+            if data.get(meta_key):
+                lead_fields[f"_meta_{meta_key}"] = str(data[meta_key])
+
+        # Fetch the form name from Meta so we can label which form the lead came from
+        _form_id = data.get("form_id")
+        if _form_id and access_token:
+            try:
+                form_resp = requests.get(
+                    f"https://graph.facebook.com/v21.0/{_form_id}",
+                    params={"access_token": access_token, "fields": "name"},
+                    timeout=10,
+                )
+                form_data = form_resp.json()
+                if form_data.get("name"):
+                    lead_fields["_meta_form_name"] = form_data["name"]
+            except Exception:
+                pass
+
         current_app.logger.info(f"Parsed Meta lead fields for {leadgen_id}: {lead_fields}")
         return lead_fields
         
