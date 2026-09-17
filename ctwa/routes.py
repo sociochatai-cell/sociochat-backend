@@ -1503,8 +1503,26 @@ def _workspace_context(workspace_id):
 
     Mirrors how meta_integration.generate_copy resolves the workspace. Returns
     all-None when the workspace can't be read, so callers fall back to generic
-    copy/imagery instead of failing.
+    copy/imagery instead of failing. Kept for backward compatibility — new code
+    should use _workspace_profile() for the fuller business profile + logo.
     """
+    p = _workspace_profile(workspace_id)
+    return p.get("business_name"), p.get("description"), p.get("website")
+
+
+def _workspace_profile(workspace_id):
+    """Full business profile dict for `workspace_id`, best effort.
+
+    Returns every field the AI copy/image generators can use — so a workspace
+    created from a website scrape (name/industry/USP/audience/…) and a manually
+    uploaded logo both flow into generation. Missing/unreadable workspace -> all
+    keys present but None, so callers degrade to generic output instead of failing.
+    """
+    keys = (
+        "business_name", "business_type", "industry", "description",
+        "audience_description", "usp", "website", "city", "country", "logo_path",
+    )
+    empty = {k: None for k in keys}
     try:
         from models import Workspace
         ws = None
@@ -1513,15 +1531,29 @@ def _workspace_context(workspace_id):
         except (TypeError, ValueError):
             ws = Workspace.query.filter_by(id=workspace_id).first()
         if not ws:
-            return None, None, None
-        return (
-            (getattr(ws, "business_name", None) or None),
-            (getattr(ws, "description", None) or None),
-            (getattr(ws, "website", None) or None),
-        )
+            return empty
+        return {k: (getattr(ws, k, None) or None) for k in keys}
     except Exception:
         logger.warning("ctwa: could not resolve workspace ws=%s", workspace_id, exc_info=True)
-        return None, None, None
+        return empty
+
+
+def _business_prompt_block(profile):
+    """Render a compact 'Business profile' text block from a profile dict for
+    injection into copy/image prompts. Empty string when nothing is known."""
+    label_map = [
+        ("business_name", "Business name"),
+        ("business_type", "Business type"),
+        ("industry", "Industry"),
+        ("description", "What the business does"),
+        ("usp", "Unique selling points"),
+        ("audience_description", "Target audience"),
+        ("city", "City"),
+        ("country", "Country"),
+        ("website", "Website"),
+    ]
+    lines = [f"{label}: {profile[key]}" for key, label in label_map if profile.get(key)]
+    return "\n".join(lines)
 
 
 def _extract_image_bytes(resp):
@@ -1641,6 +1673,53 @@ def _generate_ad_images(client, prompt, count, workspace_id=None):
     raise RuntimeError("no_images_generated")
 
 
+def _generate_ad_images_with_logo(prompt, logo_url, count, workspace_id=None):
+    """Generate ad images that composite the workspace's real logo, via
+    gpt-image-1's edit endpoint (OpenAI mode only). Returns list of image bytes.
+
+    Raises on any problem (no OpenAI mode, logo download fails, edit fails) so the
+    caller falls back to plain text-to-image generation — the logo is a bonus,
+    never a hard requirement.
+    """
+    import base64 as _b64
+    from core.genai_bridge import is_openai_mode, generate_image_with_reference
+
+    if not is_openai_mode():
+        # The reference-image edit path is implemented for the OpenAI gateway
+        # (what we run in production). Skip in Gemini/Vertex mode.
+        raise RuntimeError("logo_composition_requires_openai_mode")
+
+    # Download the logo bytes.
+    resp = requests.get(logo_url, timeout=15)
+    if not resp.ok or not resp.content:
+        raise RuntimeError(f"logo_download_failed_{resp.status_code}")
+    ctype = (resp.headers.get("Content-Type") or "image/png").split(";")[0].strip()
+    fname = "logo.png" if "png" in ctype else ("logo.jpg" if "jpe" in ctype or "jpg" in ctype else "logo.png")
+
+    logo_prompt = (
+        f"{prompt}\n\nIMPORTANT: Incorporate the provided brand logo naturally and "
+        "tastefully into the advertising image (e.g. as a small corner watermark or "
+        "on a product/sign), keeping it crisp, correctly proportioned and unaltered "
+        "in colour. Do not add any other text."
+    )
+    results = generate_image_with_reference(
+        prompt=logo_prompt,
+        reference_images=[(resp.content, fname, ctype)],
+        count=count,
+        size="1024x1536",
+        workspace_id=str(workspace_id) if workspace_id else None,
+        feature="ctwa_image_logo",
+    )
+    imgs = []
+    for r in results:
+        b64 = r.get("b64_json")
+        if b64:
+            imgs.append(_b64.b64decode(b64))
+    if not imgs:
+        raise RuntimeError("no_images_generated_with_logo")
+    return imgs
+
+
 @ctwa_bp.route("/generate-image", methods=["POST"])
 def generate_image():
     """AI-generate 1-4 vertical (9:16) ad images and return public Spaces URLs.
@@ -1664,15 +1743,17 @@ def generate_image():
         count = max(1, min(count, 4))
 
         # 1) Prompt — caller's wording wins; otherwise build one from the business.
+        profile = _workspace_profile(workspace_id)
         user_prompt = (payload.get("prompt") or "").strip()
         if user_prompt:
             base_prompt = user_prompt
         else:
-            business_name, description, _website = _workspace_context(workspace_id)
-            if business_name or description:
+            profile_block = _business_prompt_block(profile)
+            if profile_block:
                 base_prompt = (
-                    f"A professional, eye-catching vertical 9:16 advertising image for "
-                    f"{business_name or 'the business'}. {description or ''} "
+                    "A professional, eye-catching vertical 9:16 advertising image for "
+                    f"{profile.get('business_name') or 'the business'}, tailored to this business:\n"
+                    f"{profile_block}\n"
                     "Clean modern commercial photography, bright lighting, "
                     "no text overlay, no watermark."
                 ).strip()
@@ -1680,14 +1761,32 @@ def generate_image():
                 base_prompt = _GENERIC_AD_IMAGE_PROMPT
         final_prompt = f"{base_prompt}{_AD_IMAGE_SUFFIX}"
 
-        # 2) Generate via Vertex Imagen.
+        # 2) Generate. Compose the workspace logo into the creative when we have
+        # one AND the caller didn't opt out (include_logo defaults true), mirroring
+        # how Sociovia composes the real logo into ad images. Best-effort: any
+        # failure in the logo path falls back to plain generation so image
+        # generation never breaks.
         from SocioviaCrm.routes.meta_integration import get_genai_client
         client = get_genai_client()
         if not client:
             return jsonify({"success": False, "error": "genai_client_not_initialized"}), 500
 
+        include_logo = payload.get("include_logo", True)
+        logo_url = profile.get("logo_path") if include_logo else None
+
         try:
-            images, _model_used = _generate_ad_images(client, final_prompt, count, workspace_id=workspace_id)
+            images = None
+            if logo_url:
+                try:
+                    images = _generate_ad_images_with_logo(
+                        final_prompt, logo_url, count, workspace_id=workspace_id
+                    )
+                except Exception:
+                    logger.warning("ctwa generate-image: logo composition failed, "
+                                   "falling back to plain generation", exc_info=True)
+                    images = None
+            if not images:
+                images, _model_used = _generate_ad_images(client, final_prompt, count, workspace_id=workspace_id)
         except Exception as e:
             logger.exception("ctwa generate-image: all image models failed")
             return jsonify({"success": False, "error": str(e)}), 502
@@ -1739,15 +1838,7 @@ def generate_copy():
             else "a Click-to-WhatsApp ad"
         )
 
-        business_name, description, website = _workspace_context(workspace_id)
-        context_lines = []
-        if business_name:
-            context_lines.append(f"Business name: {business_name}")
-        if description:
-            context_lines.append(f"What the business does: {description}")
-        if website:
-            context_lines.append(f"Website: {website}")
-        business_context = "\n".join(context_lines) or "No business details available."
+        business_context = _business_prompt_block(_workspace_profile(workspace_id)) or "No business details available."
 
         direction = (
             f"The advertiser's direction: {user_prompt}"

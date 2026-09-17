@@ -605,6 +605,61 @@ def generate_image(
     return [{"b64_json": item.b64_json, "url": getattr(item, "url", None)} for item in response.data]
 
 
+def generate_image_with_reference(
+    prompt: str,
+    reference_images: list,
+    count: int = 1,
+    size: str = "1024x1536",
+    workspace_id: Optional[str] = None,
+    feature: Optional[str] = None,
+) -> list:
+    """Generate images that incorporate one or more REFERENCE images (e.g. a
+    brand logo) via OpenAI gpt-image-1's edit endpoint.
+
+    `reference_images` is a list of (bytes, filename, content_type) tuples.
+    Returns list of dicts with 'b64_json'. Raises on failure so the caller can
+    fall back to plain text-to-image generation.
+    """
+    client = _get_openai_client()
+    if client is None:
+        raise RuntimeError("OpenAI client not initialized for image generation")
+
+    if size not in _VALID_GPT_IMAGE_SIZES:
+        size = "1024x1536"
+
+    extra_headers = {}
+    if workspace_id:
+        extra_headers["x-workspace-id"] = str(workspace_id)
+    if feature:
+        extra_headers["x-feature"] = str(feature)
+
+    import io
+    image_files = []
+    for item in reference_images:
+        if not item:
+            continue
+        data, fname, ctype = item
+        if not data:
+            continue
+        bio = io.BytesIO(data)
+        bio.name = fname or "logo.png"
+        image_files.append(bio)
+    if not image_files:
+        raise RuntimeError("no_reference_images")
+
+    # gpt-image-1 accepts a single image or a list; pass a list when >1.
+    image_arg = image_files if len(image_files) > 1 else image_files[0]
+    response = client.images.edit(
+        model="gpt-image-1",
+        image=image_arg,
+        prompt=prompt,
+        n=count,
+        size=size,
+        extra_headers=extra_headers if extra_headers else None,
+    )
+    return [{"b64_json": item.b64_json, "url": getattr(item, "url", None)} for item in response.data]
+
+
 def _embed_openai(model, contents, workspace_id, feature, dimensions) -> List[float]:
     client = _get_openai_client()
     if client is None:

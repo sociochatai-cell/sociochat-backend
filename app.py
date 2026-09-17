@@ -921,8 +921,64 @@ def update_workspace(workspace_id):
             "city": workspace.city,
             "country": workspace.country,
             "social_links": workspace.social_links,
+            "logo_path": workspace.logo_path,
         },
     })
+
+
+@app.route("/api/workspaces/<int:workspace_id>/logo", methods=["POST"])
+def upload_workspace_logo(workspace_id):
+    """Upload a brand logo for the workspace and store its public URL in
+    logo_path. The logo feeds ad-image generation (composed into creatives) and
+    is shown in the profile. Multipart form field: `logo`.
+    """
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "error": "Not authenticated"}), 401
+
+    workspace = Workspace.query.get(workspace_id)
+    if not workspace:
+        return jsonify({"success": False, "error": "Workspace not found"}), 404
+    if workspace.user_id != user.id:
+        return jsonify({"success": False, "error": "Unauthorized"}), 403
+
+    file = request.files.get("logo")
+    if not file or not file.filename:
+        return jsonify({"success": False, "error": "No logo file provided"}), 400
+
+    # Validate it's an image and within a sane size.
+    ctype = (file.mimetype or "").lower()
+    if not ctype.startswith("image/"):
+        return jsonify({"success": False, "error": "Logo must be an image file"}), 400
+
+    try:
+        from core.spaces_storage import (
+            is_spaces_configured, get_s3_client, build_object_key, build_public_url,
+        )
+        if not is_spaces_configured():
+            return jsonify({"success": False, "error": "storage_not_configured"}), 503
+
+        import secrets as _secrets
+        from werkzeug.utils import secure_filename
+        fname = secure_filename(file.filename) or "logo.png"
+        data = file.read()
+        if len(data) > 5 * 1024 * 1024:
+            return jsonify({"success": False, "error": "Logo exceeds 5MB limit"}), 400
+
+        client, bucket = get_s3_client()
+        key = build_object_key("uploads", "logos", str(workspace_id), f"{_secrets.token_hex(8)}_{fname}")
+        client.put_object(
+            Bucket=bucket, Key=key, Body=data, ContentType=ctype,
+            ACL="public-read", CacheControl="public, max-age=31536000",
+        )
+        url = build_public_url(key)
+        workspace.logo_path = url
+        db.session.commit()
+        return jsonify({"success": True, "logo_path": url})
+    except Exception as e:
+        db.session.rollback()
+        app.logger.exception("workspace logo upload failed")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/workspaces", methods=["POST"])
