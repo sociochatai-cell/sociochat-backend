@@ -598,12 +598,39 @@ def upload_template_media():
             logger.info("Starting resumable upload: file=%s, mime=%s, account_id=%s, token_set=%s",
                         filename, mime_type, account_id, bool(access_token))
             handle = service.resumable_media_upload(temp_path, mime_type, access_token=access_token)
-            
+
             if not handle:
                 return jsonify({"success": False, "error": "Upload failed. Meta did not return a media handle."}), 500
 
-            return jsonify({"success": True, "handle": handle}), 200
-            
+            # Meta's `handle` is an OPAQUE resumable-upload token — it is NOT a
+            # viewable URL and cannot be re-downloaded. Also host the image on our
+            # object storage and return a real `url`, so the template preview can
+            # render it and sends can re-upload it later. Best-effort: if storage
+            # isn't configured we still return the handle (no regression).
+            media_url = None
+            try:
+                from core.spaces_storage import (
+                    is_spaces_configured, get_s3_client, build_object_key, build_public_url,
+                )
+                if is_spaces_configured():
+                    import secrets as _secrets
+                    with open(temp_path, "rb") as _fh:
+                        _body = _fh.read()
+                    client, bucket = get_s3_client()
+                    key = build_object_key(
+                        "uploads", "templates", str(account_id or "shared"),
+                        f"{_secrets.token_hex(8)}_{filename}",
+                    )
+                    client.put_object(
+                        Bucket=bucket, Key=key, Body=_body, ContentType=mime_type,
+                        ACL="public-read", CacheControl="public, max-age=31536000",
+                    )
+                    media_url = build_public_url(key)
+            except Exception:
+                logger.warning("template media: object-storage hosting failed (non-fatal)", exc_info=True)
+
+            return jsonify({"success": True, "handle": handle, "url": media_url}), 200
+
         finally:
             # Clean up temp file
             if os.path.exists(temp_path):
@@ -700,7 +727,9 @@ def upload_template_media_url():
             if not handle:
                 return jsonify({"success": False, "error": "Upload failed. Meta did not return a media handle."}), 500
 
-            return jsonify({"success": True, "handle": handle, "content_type": content_type}), 200
+            # The source `media_url` is already a hosted, viewable URL — return it
+            # so the template preview can render it and sends can re-upload it.
+            return jsonify({"success": True, "handle": handle, "url": media_url, "content_type": content_type}), 200
         finally:
             try:
                 if os.path.exists(temp_path):

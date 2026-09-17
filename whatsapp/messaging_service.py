@@ -200,6 +200,13 @@ class WhatsAppMessagingService:
                 name=template_name,
                 language=language_code
             ).first()
+            if not template_record:
+                # Approved language often differs from the caller's (e.g. "en" vs
+                # "en_US"). Fall back to the same-named template in any language so
+                # header-media auto-attach + metadata still resolve.
+                template_record = WhatsAppTemplate.query.filter_by(
+                    name=template_name
+                ).first()
             if template_record:
                 template_body_text = template_record.body_text
                 template_header_text = template_record.header_text

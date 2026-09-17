@@ -549,10 +549,25 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
     # We need to fetch the template to know its schema
     from .models import WhatsAppTemplate
     template_record = WhatsAppTemplate.query.filter_by(
+        account_id=account.id,
         name=step.template_name,
         language=step.language
     ).first()
-    
+    if not template_record:
+        # The step defaults language to "en_US", but the APPROVED template's
+        # language is whatever Meta stored (often "en" / "en_GB"). On a mismatch
+        # the exact-language lookup returns None, which (a) skips the header-media
+        # attach, (b) bypasses named-param detection, and (c) sends with the wrong
+        # language so Meta rejects it (132001) and the enrollment loops forever.
+        # Fall back to this account's template of the same name in ANY language.
+        template_record = WhatsAppTemplate.query.filter_by(
+            account_id=account.id,
+            name=step.template_name,
+        ).first()
+
+    # Always send with the template's ACTUAL approved language.
+    send_language = (template_record.language if template_record else step.language) or step.language
+
     is_named_template = False
     if template_record and template_record.components:
         # Check components schema for named params or named usage in example
@@ -596,7 +611,29 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
             "type": "header",
             "parameters": [{"type": "text", "text": str(header_text)}]
         })
-    
+    else:
+        # Auto-lookup header_handle from template when no media provided
+        try:
+            if template_record and template_record.components:
+                for _comp in (template_record.components if isinstance(template_record.components, list) else []):
+                    if isinstance(_comp, dict) and (_comp.get("type") or "").upper() == "HEADER":
+                        _fmt = (_comp.get("format") or "").upper()
+                        _handles = (_comp.get("example") or {}).get("header_handle")
+                        if _handles and isinstance(_handles, list) and _handles[0] and _fmt in ("IMAGE", "VIDEO", "DOCUMENT"):
+                            _handle_url = _handles[0]
+                            _svc = WhatsAppService(db.session, account.phone_number_id, account.get_access_token())
+                            _media_id = _svc.upload_media_from_url(_handle_url, media_kind=_fmt.lower())
+                            if _media_id:
+                                _media_type = _fmt.lower()
+                                components.append({
+                                    "type": "header",
+                                    "parameters": [{"type": _media_type, _media_type: {"id": _media_id}}]
+                                })
+                                logger.info("[drip header_handle] Uploaded %s, media_id=%s", _fmt, _media_id)
+                        break
+        except Exception:
+            logger.debug("[drip header_handle] fallback failed (non-fatal)", exc_info=True)
+
     if is_named_template and template_record:
         # NAMED PARAMETERS LOGIC
         # 1. Extract raw variables for this step (e.g. {"var_1": "John", "var_2": "123"} or {"name": "John"})
@@ -775,7 +812,7 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
     result = service.send_template(
         to=enrollment.phone_number,
         template_name=step.template_name,
-        language_code=step.language,
+        language_code=send_language,
         components=components,
         campaign_id=campaign.id,
     )

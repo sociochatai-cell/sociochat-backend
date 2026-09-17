@@ -174,8 +174,15 @@ class AutomationEngine:
                 WhatsAppAutomationRule.priority.asc()
             ).all()
 
-            # Safety: AI chat should always remain a fallback even if mis-prioritized.
-            rules.sort(key=lambda r: (1 if r.rule_type == "ai_chat" else 0, r.priority or 0, r.id or 0))
+            # Specific matchers (command/keyword) must get first shot at a message
+            # before BROAD condition matchers (away), otherwise an active "away"
+            # rule outside business hours matches every message and shadows every
+            # command/keyword — the classic "my command doesn't trigger" bug.
+            # welcome stays first (it only matches a contact's very first message)
+            # and ai_chat stays the last-resort fallback. Within the same group the
+            # user-configured `priority` still applies.
+            _type_rank = {"welcome": 0, "command": 1, "keyword": 2, "away": 3, "ai_chat": 5}
+            rules.sort(key=lambda r: (_type_rank.get(r.rule_type, 2), r.priority or 0, r.id or 0))
             
             self._rules_cache = rules
             return rules

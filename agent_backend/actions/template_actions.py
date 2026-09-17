@@ -97,12 +97,30 @@ class CreateTemplateAction(BaseAction):
         body = params["body"]
         language = params.get("language", "en_US")
 
-        # Check if template name already exists
+        # Check if template name already exists. WhatsApp does NOT allow editing a
+        # template's media/buttons/body once it's submitted — so "add an image /
+        # CTA to this template" can't modify the existing one. Return an
+        # actionable message (not a bare "already exists" that reads as a loop).
         existing = WhatsAppTemplate.query.filter_by(
             account_id=account_id, name=name, language=language
         ).first()
         if existing:
-            return {"status": "error", "message": f"A template named **{name}** already exists (status: {existing.status})."}
+            _status = (existing.status or "").upper()
+            return {
+                "status": "error",
+                "cannot_edit_existing": True,
+                "message": (
+                    f"A template named **{name}** already exists (status: {existing.status}). "
+                    "WhatsApp doesn't allow changing a submitted template's image, buttons, or "
+                    "text — you can't add them to this one. To get a version with an image and a "
+                    "CTA button:\n"
+                    f"• Create it under a **new name** (e.g. `{name}_v2`) with the image + button, or\n"
+                    f"• Delete **{name}** first "
+                    + ("(it's still pending), then recreate it with the image + button."
+                       if _status in ("PENDING", "DRAFT", "REJECTED")
+                       else "in the Templates page, then recreate it with the image + button.")
+                ),
+            }
 
         import re
         variable_count = len(set(re.findall(r'\{\{\d+\}\}', body)))

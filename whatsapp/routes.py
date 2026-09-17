@@ -4657,23 +4657,43 @@ Return ONLY the cleaned template text. No explanations.
         # STEP 6: Call Gemini API
         # ===========================================
         try:
-            from whatsapp.ai_chatbot import get_genai_client
+            from whatsapp.ai_chatbot import get_genai_client, DEFAULT_MODEL, _resolve_generation_model
 
-            text_model = os.environ.get("TEXT_MODEL") or os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash"
+            # Resolve the model through the SAME alias map the working chatbot
+            # path uses, so a legacy/aliased name never reaches the provider raw.
+            text_model = _resolve_generation_model(
+                os.environ.get("TEXT_MODEL") or os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL
+            )
 
             client = get_genai_client()
             if not client:
                 raise RuntimeError("GenAI client not available")
 
             from core.genai_bridge import generate_text
+            from google.genai.types import GenerateContentConfig
             response = generate_text(
                 model=text_model,
                 contents=prompt,
+                # Match the working chatbot call — an explicit config avoids an
+                # empty/blocked completion that would otherwise surface as a
+                # generic failure.
+                config=GenerateContentConfig(max_output_tokens=1024, temperature=0.3),
                 gemini_client=client,
                 feature="wa_routes",
             )
-            
-            rewritten_text = response.text.strip() if response.text else original_text
+
+            # A blocked/empty completion returns no text — treat that as a clear,
+            # user-facing error instead of silently "succeeding" with the original.
+            if not (response and response.text and response.text.strip()):
+                return jsonify({
+                    "success": False,
+                    "error": "The AI could not rewrite this template (empty response — the content may have been blocked). Try rephrasing.",
+                    "rewritten_text": None,
+                    "confidence": "LOW",
+                    "notes": "AI returned an empty response.",
+                    "cannot_rewrite": True,
+                })
+            rewritten_text = response.text.strip()
             
             # ===========================================
             # STEP 7: Validate placeholder preservation
@@ -4726,9 +4746,13 @@ Return ONLY the cleaned template text. No explanations.
             })
             
         except Exception as gemini_error:
-            logger.error(f"Gemini API error: {gemini_error}")
+            logger.exception("AI rewrite Gemini call failed")
             return jsonify({
                 "success": False,
+                # `error` is what the frontend reads; without it the UI only ever
+                # shows the generic "Failed to rewrite template" and the real
+                # cause (model/quota/safety) is invisible.
+                "error": f"AI service error: {str(gemini_error)}",
                 "rewritten_text": None,
                 "confidence": "LOW",
                 "notes": f"AI service error: {str(gemini_error)}",
@@ -5062,7 +5086,9 @@ def create_template():
 
                 # Media header (image/video/document/gif)
                 if header_format in {"IMAGE", "VIDEO", "DOCUMENT", "GIF"} and comp.get("example", {}).get("header_handle"):
-                    header_comp["example"] = comp.get("example")
+                    # Meta only accepts `header_handle` inside example — send just
+                    # that (drop our own `header_url` key, which Meta would reject).
+                    header_comp["example"] = {"header_handle": comp["example"]["header_handle"]}
 
                 # Location header has no extra properties for create payload
                 api_components.append(header_comp)
@@ -5215,6 +5241,24 @@ def create_template():
                 "meta_error": error_info
             }), 400
         
+        # Store the HOSTED image URL in the local header_handle so the template
+        # preview, bulk-send, and drip can render/re-upload it. Meta's opaque
+        # resumable-upload handle isn't a viewable URL, so we keep the hosted URL
+        # (sent by the frontend as example.header_url) for our own record. Meta
+        # already got the opaque handle in the api_components payload above.
+        try:
+            for _comp in (components if isinstance(components, list) else []):
+                if isinstance(_comp, dict) and (_comp.get("type") or "").upper() == "HEADER":
+                    _ex = _comp.get("example") or {}
+                    _hosted = _ex.get("header_url")
+                    if _hosted:
+                        _ex["header_handle"] = [_hosted]
+                        _ex.pop("header_url", None)
+                        _comp["example"] = _ex
+                    break
+        except Exception:
+            logger.warning("template create: could not fold header_url into header_handle", exc_info=True)
+
         # Save to database
         tpl = WhatsAppTemplate(
             account_id=account_id,

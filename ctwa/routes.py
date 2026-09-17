@@ -722,6 +722,69 @@ def _fmt_meta_err(stage, j):
     return f"{stage}: {detail}"
 
 
+# Meta account_status codes that mean the account cannot currently run ads.
+# 1=ACTIVE, 2=DISABLED, 3=UNSETTLED, 7=PENDING_RISK_REVIEW, 8=PENDING_SETTLEMENT,
+# 9=IN_GRACE_PERIOD, 100=PENDING_CLOSURE, 101=CLOSED.
+_UNRUNNABLE_ACCOUNT_STATUS = {2, 3, 100, 101}
+
+
+def _ad_account_funding_error(ad_account_id, access_token):
+    """Return a human-readable reason the ad account can't go live, or None.
+
+    Meta happily creates campaign/ad-set/ad objects in ACTIVE state even when the
+    ad account has no payment method attached — the ad then simply never delivers,
+    which the UI misreads as "live". Before we activate we check the account's
+    funding + status so we can tell the user to add a payment method instead of
+    silently publishing a non-delivering ad.
+
+    Fail-open: any error fetching the account returns None (we do NOT block), so a
+    transient Graph hiccup never breaks publishing for a properly funded account.
+    """
+    try:
+        if not str(ad_account_id).startswith("act_"):
+            ad_account_id = f"act_{ad_account_id}"
+        resp = requests.get(
+            f"{BASE_URL}/{ad_account_id}",
+            params={
+                "access_token": access_token,
+                "fields": "account_status,disable_reason,funding_source,funding_source_details",
+            },
+            timeout=15,
+        )
+        j = resp.json()
+        if not resp.ok:
+            # Can't determine — don't block a publish on our own read failing.
+            logger.warning("ctwa funding check: account read failed :: %s", j)
+            return None
+
+        status = j.get("account_status")
+        funding_source = j.get("funding_source")
+        funding_details = j.get("funding_source_details") or {}
+
+        if status in _UNRUNNABLE_ACCOUNT_STATUS:
+            return (
+                "Your Meta ad account can't run ads yet (account status: "
+                f"{status}). Open Meta Ads Manager → Billing and add a payment "
+                "method to activate the account, then publish again."
+            )
+
+        # No payment method at all — the usual cause of a "published but not
+        # delivering" ad. funding_source is a numeric id string when a method is
+        # attached; funding_source_details carries the type/display for prepaid or
+        # credit-line accounts. Treat both being empty as "no payment method".
+        has_funding = bool(funding_source) or bool(funding_details.get("id") or funding_details.get("type"))
+        if not has_funding:
+            return (
+                "No payment method is set on your Meta ad account, so the ad would "
+                "be created but never deliver. Add a payment method in Meta Ads "
+                "Manager → Billing, then publish again."
+            )
+        return None
+    except Exception as e:
+        logger.warning("ctwa funding check errored (ignored): %s", e)
+        return None
+
+
 def _build_targeting(row):
     t = dict(row.targeting or {})
     # Merge the placement pin (Status ads -> whatsapp/status) into targeting,
@@ -941,6 +1004,20 @@ def publish_campaign(cid):
 
     creative = row.creative or {}
     initial_status = "ACTIVE" if activate else "PAUSED"
+
+    # Going live requires a funded ad account. Check BEFORE creating any Meta
+    # objects so we don't leave orphaned campaign/ad-set/ad rows on an account
+    # that can't deliver. Only enforced when actually activating — saving a
+    # PAUSED draft is always allowed.
+    if activate:
+        funding_err = _ad_account_funding_error(ad_account_id, access_token)
+        if funding_err:
+            return jsonify({
+                "success": False,
+                "error": funding_err,
+                "error_code": "no_payment_method",
+                "campaign": _campaign_payload(row),
+            }), 400
 
     try:
         # 1) Campaign
@@ -1166,6 +1243,15 @@ def activate_campaign(cid):
     if error:
         return error  # (jsonify, status) tuple from the CRM helper
 
+    funding_err = _ad_account_funding_error(row.ad_account_id or ad_account_id, access_token)
+    if funding_err:
+        return jsonify({
+            "success": False,
+            "error": funding_err,
+            "error_code": "no_payment_method",
+            "campaign": _campaign_payload(row),
+        }), 400
+
     try:
         # To go live, the AD, AD SET and CAMPAIGN must ALL be ACTIVE — Meta won't
         # deliver an active ad whose parent ad set/campaign is still paused. Flip
@@ -1356,7 +1442,8 @@ def audiences():
         resp = requests.get(
             f"{BASE_URL}/{ad_account_id}/customaudiences",
             params={"access_token": access_token,
-                    "fields": "id,name,approximate_count,subtype", "limit": 100},
+                    "fields": "id,name,approximate_count_lower_bound,approximate_count_upper_bound,subtype",
+                    "limit": 100},
             timeout=15,
         )
         j = resp.json()
@@ -1364,10 +1451,18 @@ def audiences():
             return jsonify({"success": False, "error": _fmt_meta_err("audiences", j)}), 502
         out = []
         for item in (j.get("data") or []):
+            # Meta removed the flat `approximate_count` field; it now returns
+            # lower/upper bounds. Surface the upper bound as the headline count
+            # (falls back to lower bound) so the wizard keeps showing a size.
+            approx = item.get("approximate_count_upper_bound")
+            if approx is None:
+                approx = item.get("approximate_count_lower_bound")
             out.append({
                 "id": item.get("id"),
                 "name": item.get("name"),
-                "approximate_count": item.get("approximate_count"),
+                "approximate_count": approx,
+                "approximate_count_lower_bound": item.get("approximate_count_lower_bound"),
+                "approximate_count_upper_bound": item.get("approximate_count_upper_bound"),
                 "subtype": item.get("subtype"),
             })
         return jsonify({"success": True, "custom_audiences": out})

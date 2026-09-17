@@ -346,13 +346,30 @@ OUTPUT FORMAT (strict JSON):
             if self._use_new_sdk and self._client:
                 # Newer google-genai SDK
                 from core.genai_bridge import generate_text
+                # Cap the model wait server-side (20s). A hung/slow call then
+                # raises and drops to the keyword fallback below, so the agent
+                # answers quickly instead of leaving the panel spinning.
+                _cfg = None
+                try:
+                    from google.genai.types import GenerateContentConfig, HttpOptions
+                    _cfg = GenerateContentConfig(
+                        temperature=0.1,
+                        max_output_tokens=512,
+                        http_options=HttpOptions(timeout=20000),
+                    )
+                except Exception:
+                    _cfg = None
                 response = generate_text(
                     model="gemini-3.1-flash-lite",
                     contents=system_prompt + "\n\n" + user_prompt,
+                    config=_cfg,
                     gemini_client=self._client,
                     feature="intent_parser",
                 )
-                raw = response.text.strip()
+                raw = (response.text or "").strip()
+                if not raw:
+                    # Empty/blocked completion — use keywords rather than error out.
+                    raise RuntimeError("empty intent response")
             else:
                 # Older google-generativeai SDK
                 response = self._model.generate_content(

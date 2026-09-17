@@ -1,6 +1,7 @@
 """
-DigitalOcean Spaces (S3-compatible) helpers for SocioChat uploads.
+S3-compatible object storage helpers for SocioChat uploads.
 
+Works with both AWS S3 and DigitalOcean Spaces.
 All objects are stored under SPACE_PREFIX (default: sociochat/) inside the bucket.
 """
 from __future__ import annotations
@@ -9,25 +10,25 @@ import os
 from typing import Optional, Tuple
 
 
-def _normalize_spaces_endpoint(
+def _normalize_endpoint(
     endpoint: str,
     region: Optional[str],
     bucket: Optional[str],
 ) -> str:
     """
-    DigitalOcean Spaces expects a regional endpoint only, e.g.
-    https://blr1.digitaloceanspaces.com — not the bucket hostname and not /sociochat paths.
+    Normalize the storage endpoint for boto3.
+    Handles both DO Spaces and AWS S3 endpoint formats.
     """
     endpoint = endpoint.rstrip("/")
     if not endpoint and region:
-        return f"https://{region}.digitaloceanspaces.com"
+        return f"https://s3.{region}.amazonaws.com"
 
-    # Strip accidental path suffixes like /sociochat (prefix belongs in object keys, not endpoint).
+    # DO Spaces: strip accidental path suffixes like /sociochat
     if "digitaloceanspaces.com/" in endpoint:
         endpoint = endpoint.split("digitaloceanspaces.com/", 1)[0] + "digitaloceanspaces.com"
 
-    # Convert bucket virtual-host URLs back to regional endpoint for boto3.
-    if bucket and region:
+    # DO Spaces: convert bucket virtual-host URLs back to regional endpoint
+    if bucket and region and "digitaloceanspaces.com" in endpoint:
         bucket_host = f"https://{bucket}.{region}.digitaloceanspaces.com"
         if endpoint.startswith(bucket_host):
             endpoint = f"https://{region}.digitaloceanspaces.com"
@@ -47,13 +48,12 @@ def get_spaces_config() -> Tuple[Optional[str], Optional[str], Optional[str], Op
     bucket = os.getenv("SPACE_NAME") or os.getenv("DO_SPACES_BUCKET")
     region = os.getenv("SPACE_REGION") or os.getenv("DO_SPACES_REGION")
     access_key = os.getenv("ACCESS_KEY") or os.getenv("DO_ACCESS_KEY_ID")
-    # Never use Flask SESSION_SECRET / SECRET_KEY for object storage.
     secret_key = (
         os.getenv("DO_SPACES_SECRET_KEY")
         or os.getenv("SPACE_SECRET_KEY")
         or os.getenv("DO_SECRET_ACCESS_KEY")
     )
-    endpoint = _normalize_spaces_endpoint(
+    endpoint = _normalize_endpoint(
         (os.getenv("SPACE_ENDPOINT") or "").strip(),
         region,
         bucket,
@@ -76,12 +76,11 @@ def build_object_key(*parts: str) -> str:
 
 def build_public_url(key: str) -> str:
     """Public URL — prefers SPACE_CDN when set."""
-    _, _, _, _, _, cdn = get_spaces_config()
+    bucket, region, _, _, _, cdn = get_spaces_config()
     normalized_key = key.lstrip("/")
     if cdn:
         return f"{cdn}/{normalized_key}"
-    bucket, region, _, _, _, _ = get_spaces_config()
-    return f"https://{bucket}.{region}.digitaloceanspaces.com/{normalized_key}"
+    return f"https://{bucket}.s3.{region}.amazonaws.com/{normalized_key}"
 
 
 def get_s3_client():
@@ -90,7 +89,7 @@ def get_s3_client():
     bucket, region, access_key, secret_key, endpoint, _ = get_spaces_config()
     if not all([bucket, region, access_key, secret_key, endpoint]):
         raise RuntimeError(
-            "DigitalOcean Spaces not configured. Set SPACE_NAME, SPACE_REGION, "
+            "Object storage not configured. Set SPACE_NAME, SPACE_REGION, "
             "ACCESS_KEY, DO_SPACES_SECRET_KEY, and SPACE_ENDPOINT."
         )
     from botocore.client import Config
