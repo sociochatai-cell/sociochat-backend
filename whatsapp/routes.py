@@ -8502,13 +8502,8 @@ def upload_chat_media():
             }), 500
         
         # Initialize S3 client
-        SPACE_ENDPOINT = f'https://{SPACE_REGION}.digitaloceanspaces.com'
-        s3_client = boto3.client(
-            's3',
-            aws_access_key_id=ACCESS_KEY,
-            aws_secret_access_key=SECRET_KEY,
-            endpoint_url=SPACE_ENDPOINT
-        )
+        from core.spaces_storage import get_s3_client, build_public_url
+        s3_client, SPACE_NAME = get_s3_client()
         
         # Generate unique key
         # Keep part of original filename in object key so downstream fetchers (Meta/clients)
@@ -8528,13 +8523,12 @@ def upload_chat_media():
                 SPACE_NAME,
                 key,
                 ExtraArgs={
-                    "ACL": "public-read",
                     "ContentType": content_type,
                     "ContentDisposition": f'inline; filename="{original_filename}"'
                 }
             )
             
-            public_url = f"https://{SPACE_NAME}.{SPACE_REGION}.digitaloceanspaces.com/{key}"
+            public_url = build_public_url(key)
             
             logger.info(f"Uploaded chat media: {public_url} ({media_type}, {file_size} bytes)")
             
@@ -8550,7 +8544,7 @@ def upload_chat_media():
             })
             
         except Exception as upload_err:
-            logger.exception(f"Failed to upload to DigitalOcean Spaces: {upload_err}")
+            logger.exception(f"Failed to upload to storage: {upload_err}")
             return jsonify({
                 "success": False,
                 "error": "upload_failed",

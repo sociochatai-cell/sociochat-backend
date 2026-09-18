@@ -154,7 +154,6 @@ def upload_branding_asset(admin):
                 Key=key,
                 Body=data,
                 ContentType=resolved_ct,
-                ACL="public-read",
                 CacheControl="public, max-age=31536000",
             )
             url = build_public_url(key)

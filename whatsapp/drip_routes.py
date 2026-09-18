@@ -13,6 +13,18 @@ from .http_rate_limit import rate_limit
 
 logger = logging.getLogger(__name__)
 
+def _decode_csv_bytes(raw: bytes) -> str:
+    """Decode uploaded CSV bytes, tolerating non-UTF8 files (Excel/Windows exports).
+    Tries utf-8-sig first (handles BOM), then cp1252, then latin-1 which never fails."""
+    if isinstance(raw, str):
+        return raw
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
 drip_bp = Blueprint("drip", __name__, url_prefix="/api/whatsapp")
 
 
@@ -809,7 +821,7 @@ def dataset_import_csv(dataset_id: int):
     file = request.files["file"]
     
     try:
-        content = file.read().decode("utf-8-sig")
+        content = _decode_csv_bytes(file.read())
         reader = csv.DictReader(io.StringIO(content))
         
         rows_added = 0
@@ -866,7 +878,7 @@ def dataset_upload_mapped(dataset_id: int):
         column_mapping = {}
         
     try:
-        content = file.read().decode("utf-8-sig")
+        content = _decode_csv_bytes(file.read())
         reader = csv.DictReader(io.StringIO(content))
         
         # Clear existing rows if replace is true
@@ -1483,7 +1495,7 @@ def preview_csv_data():
         import io
         
         # Read CSV content
-        content = file.read().decode('utf-8-sig')  # Handle BOM
+        content = _decode_csv_bytes(file.read())
         reader = csv.reader(io.StringIO(content))
         
         rows = list(reader)
@@ -2447,7 +2459,7 @@ def import_contacts_csv(account_id: int, campaign_id: int, account: WhatsAppAcco
             account_id=account_id
         ).first_or_404()
         
-        content = file.read().decode("utf-8-sig")
+        content = _decode_csv_bytes(file.read())
         reader = csv.DictReader(io.StringIO(content))
         
         first_step = WhatsAppDripStep.query.filter_by(

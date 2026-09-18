@@ -283,7 +283,7 @@ def upload_media():
         key = build_object_key("uploads", "ads", str(workspace_id), unique)
         client.put_object(
             Bucket=bucket, Key=key, Body=data, ContentType=resolved_ct,
-            ACL="public-read", CacheControl="public, max-age=31536000",
+            CacheControl="public, max-age=31536000",
         )
         return jsonify({
             "success": True,
@@ -1809,7 +1809,7 @@ def generate_image():
             key = build_object_key("uploads", "ads", str(workspace_id), unique)
             s3_client.put_object(
                 Bucket=bucket, Key=key, Body=data, ContentType="image/png",
-                ACL="public-read", CacheControl="public, max-age=31536000",
+                CacheControl="public, max-age=31536000",
             )
             urls.append({"url": build_public_url(key)})
 

@@ -969,7 +969,7 @@ def upload_workspace_logo(workspace_id):
         key = build_object_key("uploads", "logos", str(workspace_id), f"{_secrets.token_hex(8)}_{fname}")
         client.put_object(
             Bucket=bucket, Key=key, Body=data, ContentType=ctype,
-            ACL="public-read", CacheControl="public, max-age=31536000",
+            CacheControl="public, max-age=31536000",
         )
         url = build_public_url(key)
         workspace.logo_path = url

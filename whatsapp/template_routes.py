@@ -623,7 +623,7 @@ def upload_template_media():
                     )
                     client.put_object(
                         Bucket=bucket, Key=key, Body=_body, ContentType=mime_type,
-                        ACL="public-read", CacheControl="public, max-age=31536000",
+                        CacheControl="public, max-age=31536000",
                     )
                     media_url = build_public_url(key)
             except Exception:
