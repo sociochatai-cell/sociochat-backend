@@ -301,6 +301,21 @@ def get_limits(user):
     }
     """
     plan_info = get_plan_limits(user)
+    # TEMP custom bypass — enable `agent_login` for the Journey Of Miles client
+    # (owner user 508 / workspace 211) until the founder confirms a plan change.
+    # Targeted to specific user id(s) via env; reversible; no other user affected.
+    try:
+        import os as _os
+        _jom_ids = {int(x) for x in _os.getenv("JOM_ENTERPRISE_USER_IDS", "508").replace(" ", "").split(",") if x.strip().isdigit()}
+        if getattr(user, "id", None) in _jom_ids:
+            _feats = plan_info.setdefault("features", {})
+            _cur = _feats.get("agent_login")
+            if isinstance(_cur, dict):
+                _cur["enabled"] = True
+            else:
+                _feats["agent_login"] = {"enabled": True}
+    except Exception:
+        pass
     return jsonify({
         "success": True,
         "billing_scope": getattr(user, "billing_scope", None) or "global",
