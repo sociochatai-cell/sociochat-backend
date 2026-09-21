@@ -64,6 +64,14 @@ def scheduler_tick():
         logger.error(f"Error processing due enrollments during tick: {e}")
         results["drip_enrollments_error"] = str(e)
 
+    # 3a. JOM vertical (gated) — fire due Ghosted/Dormant follow-ups + auto-close.
+    try:
+        from custom.jom.scheduler import run_jom_ticks
+        results["jom"] = run_jom_ticks()
+    except Exception as e:
+        logger.warning("JOM tick during scheduler sweep: %s", e)
+        results["jom_error"] = str(e)
+
     # 3b. Usage/billing events (replaces always-on whatsapp-usage-consumer)
     try:
         from monolith_integration.usage_consumer import poll_usage_events_for_scheduler

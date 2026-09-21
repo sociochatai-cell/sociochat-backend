@@ -1,0 +1,71 @@
+"""
+Phase 4 — Meta Conversions API (Conversion Leads) for the JOM vertical.
+
+Reuses the existing SocioviaCrm.capi_service.send_capi_event. We add:
+  - capture the Meta Lead ID (+ email) on the lifecycle row when a lead-form lead enters,
+  - fire down-funnel events (QualifiedLead, Converted) so Meta's "Conversion Leads"
+    performance goal can auto-optimise.
+Junk leads: we simply DO NOT send a positive event (absence = low-quality signal).
+All workspace-scoped; call behind is_jom_workspace().
+"""
+import logging
+from datetime import datetime, timezone
+
+from models import db
+from .models import JomLifecycleState
+
+logger = logging.getLogger(__name__)
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def set_lead_identity(workspace_id, customer_phone, meta_lead_id=None, email=None):
+    """Store the Meta Lead ID + email on the lifecycle row (captured at ingest)."""
+    row = JomLifecycleState.query.filter_by(
+        workspace_id=int(workspace_id), customer_phone=str(customer_phone)).first()
+    if not row:
+        row = JomLifecycleState(workspace_id=int(workspace_id), customer_phone=str(customer_phone))
+        db.session.add(row)
+    if meta_lead_id:
+        row.meta_lead_id = str(meta_lead_id)[:40]
+    if email:
+        row.email = str(email)[:160]
+    row.updated_at = _now()
+    db.session.commit()
+    return row
+
+
+def _send(workspace_id, customer_phone, event_name, value=None):
+    """Fire a CAPI event. Fail-safe — never raises into the caller."""
+    try:
+        row = JomLifecycleState.query.filter_by(
+            workspace_id=int(workspace_id), customer_phone=str(customer_phone)).first()
+        user_data = {"phone": customer_phone}
+        if row and row.email:
+            user_data["email"] = row.email
+        if row and row.meta_lead_id:
+            user_data["lead_id"] = row.meta_lead_id  # ties the event to the Meta lead/ad
+        custom = {"value": value, "currency": "INR"} if value is not None else None
+        from SocioviaCrm.capi_service import send_capi_event
+        res = send_capi_event(
+            event_name=event_name,
+            user_data_dict=user_data,
+            custom_data_dict=custom,
+            workspace_id=int(workspace_id),
+            action_source="business_messaging",
+        )
+        logger.info("[jom] CAPI %s sent for %s: %s", event_name, customer_phone, res)
+        return res
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[jom] CAPI %s failed for %s: %s", event_name, customer_phone, exc)
+        return {"success": False, "error": str(exc)}
+
+
+def on_qualified(workspace_id, customer_phone):
+    return _send(workspace_id, customer_phone, "QualifiedLead")
+
+
+def on_converted(workspace_id, customer_phone, value=None):
+    return _send(workspace_id, customer_phone, "Converted", value=value)

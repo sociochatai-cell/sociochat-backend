@@ -512,6 +512,12 @@ app.register_blueprint(agent_admin_bp)
 app.register_blueprint(assignment_bp)
 app.register_blueprint(agent_superadmin_bp)
 
+try:
+    from custom.jom import jom_bp
+    app.register_blueprint(jom_bp)
+except Exception as _jom_e:  # noqa: BLE001
+    logger.warning(f"JOM vertical blueprint skipped: {_jom_e}")
+
 
 with app.app_context():
     # Ensure link tracking + subscription tables exist
@@ -563,6 +569,12 @@ with app.app_context():
         ensure_agent_auth_schema(db.engine)
     except Exception as e:
         logger.warning(f"agent_auth schema patch skipped: {e}")
+
+    try:
+        from custom.jom.schema_patch import ensure_jom_schema
+        ensure_jom_schema(db.engine)
+    except Exception as e:
+        logger.warning(f"JOM schema patch skipped: {e}")
 
     # WhatsApp schema patch: add new ORM columns to EXISTING whatsapp_accounts (+ operational
     # tables) that create_all() cannot add on an already-provisioned (prod) DB. Idempotent;

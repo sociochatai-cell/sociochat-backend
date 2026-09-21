@@ -503,8 +503,10 @@ class WebhookProcessor:
         if getattr(conversation, "_is_new", False):
             try:
                 if account.workspace_id is not None:
-                    from agent_auth.inbox_scope import auto_assign_new_number
-                    auto_assign_new_number(int(account.workspace_id), from_phone)
+                    from custom.jom.gate import is_jom_workspace
+                    if not is_jom_workspace(account.workspace_id):
+                        from agent_auth.inbox_scope import auto_assign_new_number
+                        auto_assign_new_number(int(account.workspace_id), from_phone)
             except Exception:
                 logger.exception(
                     "auto_assign hook failed (conversation %s, account %s)",
@@ -519,7 +521,16 @@ class WebhookProcessor:
                 content = enrich_order_content(content, account)
             except Exception as enrich_err:
                 logger.warning(f"Order enrichment skipped: {enrich_err}")
-        
+
+        try:
+            if account.workspace_id is not None:
+                from custom.jom.gate import is_jom_workspace
+                if is_jom_workspace(account.workspace_id):
+                    from custom.jom.hooks import on_inbound_message
+                    on_inbound_message(int(account.workspace_id), from_phone, content)
+        except Exception:
+            logger.exception("JOM inbound hook failed (conversation %s)", conversation.id)
+
         # Parse message timestamp
         from datetime import timedelta
         msg_timestamp = parse_whatsapp_timestamp(timestamp) or datetime.now(timezone.utc)
