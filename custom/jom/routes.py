@@ -160,3 +160,68 @@ def remove_agent(user, department_id, agent_id):
         return err
     ok = dept_svc.remove_agent(int(_wsid()), department_id, agent_id)
     return jsonify({"success": ok, "agent_ids": dept_svc.list_agent_ids(department_id)}), (200 if ok else 404)
+
+
+# --------------------------------------------------------------------------- #
+# Lead tracker (read-only) — lifecycle rows joined with department + agent names
+# --------------------------------------------------------------------------- #
+@jom_bp.get("/leads")
+@require_owner_user
+def list_leads(user):
+    err = _guard(user, _wsid())
+    if err:
+        return err
+    wsid = int(_wsid())
+    from .models import JomLifecycleState, JomBehaviorScore, JomDepartment
+    from agent_auth.models import WorkspaceAgent
+
+    status_filter = (request.args.get("status") or "").strip().lower()
+    q = JomLifecycleState.query.filter_by(workspace_id=wsid)
+    if status_filter:
+        q = q.filter(JomLifecycleState.status == status_filter)
+    rows = q.order_by(JomLifecycleState.id.desc()).limit(500).all()
+
+    # bulk lookups
+    dep_names = {d.id: d.name for d in JomDepartment.query.filter_by(workspace_id=wsid).all()}
+    agent_ids = {r.assigned_agent_id for r in rows if r.assigned_agent_id}
+    agent_names = {}
+    if agent_ids:
+        for a in WorkspaceAgent.query.filter(WorkspaceAgent.id.in_(agent_ids)).all():
+            agent_names[a.id] = a.display_name or a.username
+    scores = {}
+    for b in JomBehaviorScore.query.filter_by(workspace_id=wsid).all():
+        scores[b.customer_phone] = b
+
+    def _row(r):
+        b = scores.get(r.customer_phone)
+        return {
+            "customer_phone": r.customer_phone,
+            "status": r.status,
+            "department_id": r.department_id,
+            "department": dep_names.get(r.department_id),
+            "assigned_agent_id": r.assigned_agent_id,
+            "agent": agent_names.get(r.assigned_agent_id),
+            "drip_stage": r.drip_stage,
+            "status_since": r.status_since.isoformat() if r.status_since else None,
+            "next_followup_at": r.next_followup_at.isoformat() if r.next_followup_at else None,
+            "last_inbound_at": r.last_inbound_at.isoformat() if r.last_inbound_at else None,
+            "last_outbound_at": r.last_outbound_at.isoformat() if r.last_outbound_at else None,
+            "reopen_count": r.reopen_count,
+            "meta_lead_id": r.meta_lead_id,
+            "email": r.email,
+            "total_inbound": getattr(b, "total_inbound", None),
+            "total_outbound": getattr(b, "total_outbound", None),
+            "consecutive_no_reply": getattr(b, "consecutive_no_reply", None),
+            "last_intent": getattr(b, "last_intent", None),
+            "last_confidence": getattr(b, "last_confidence", None),
+            "engagement_score": getattr(b, "engagement_score", None),
+        }
+
+    leads = [_row(r) for r in rows]
+    # status counts across the (unfiltered) workspace for the summary strip
+    counts = {}
+    for (st, c) in db.session.query(JomLifecycleState.status, db.func.count()).filter_by(
+        workspace_id=wsid
+    ).group_by(JomLifecycleState.status).all():
+        counts[st] = c
+    return jsonify({"success": True, "leads": leads, "counts": counts, "total": len(leads)})
