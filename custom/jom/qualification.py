@@ -111,7 +111,10 @@ def evaluate(workspace_id, customer_phone, message_text, flow_completed=False):
     intent, conf = _ai_intent(message_text, workspace_id)
     record_inbound(workspace_id, customer_phone, intent=intent, confidence=conf)
 
-    ai_ok = bool(intent == cfg.QUALIFY_INTENT and conf is not None and conf >= cfg.QUALIFY_CONFIDENCE)
+    ai_ok = bool(
+        intent and str(intent).lower() in cfg.QUALIFY_INTENTS
+        and conf is not None and conf >= cfg.QUALIFY_CONFIDENCE
+    )
     kw_ok = _keyword_hit(workspace_id, message_text)
     is_qualified = bool(ai_ok or kw_ok or flow_completed)
 

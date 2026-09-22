@@ -2,13 +2,22 @@
 JOM vertical config — cadences, thresholds, status vocabulary. Central so the
 follow-up days / qualify thresholds can be tuned in one place during build & QA.
 """
+import os
 
 # Follow-up cadences (days after the status is set)
 GHOSTED_DAYS = [1, 5, 15]      # stopped replying after quotation
 DORMANT_DAYS = [15, 30, 45]    # future / undecided traveller
 
 # Qualification thresholds (Phase 2)
-QUALIFY_INTENT = "sales"       # AI intent that signals a buyer
+QUALIFY_INTENT = "sales"       # kept for backward-compat / reference
+# Buyer intents that qualify a lead. Travel enquiries are often labelled
+# "appointment" or "info" by the shared classifier (not "sales"), so we accept
+# those too. Env-overridable (comma-separated) without a code change.
+QUALIFY_INTENTS = {
+    i.strip().lower()
+    for i in os.getenv("JOM_QUALIFY_INTENTS", "sales,appointment,info").split(",")
+    if i.strip()
+}
 QUALIFY_CONFIDENCE = 0.60      # min confidence from classify_intent
 GHOSTED_AFTER_NO_REPLY = 3     # consecutive no-replies before auto-Ghosted (Phase 3 v2)
 
