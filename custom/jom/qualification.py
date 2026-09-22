@@ -74,7 +74,13 @@ def _ai_intent(message_text, workspace_id=None):
     or (None, None) if unavailable."""
     try:
         from whatsapp.ai_chatbot import classify_intent
-        res = classify_intent(message_text)
+        # Pass workspace_id so it uses the tenant's configured Gemini key (the
+        # global client isn't configured on this backend). Without it the call
+        # returns success=False and the lead's last_intent is never recorded.
+        res = classify_intent(
+            message_text,
+            workspace_id=str(workspace_id) if workspace_id is not None else None,
+        )
         intent = getattr(res, "intent", None)
         conf = getattr(res, "confidence", None)
         ok = getattr(res, "success", True)
