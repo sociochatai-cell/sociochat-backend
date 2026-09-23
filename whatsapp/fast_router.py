@@ -325,6 +325,24 @@ def route_message(
 
         # Button replies can fall through to regular keyword automations if not handled by interactive flows
 
+        # ── Food image analysis (per-workspace) ──
+        if msg_type == "image" and not is_flow_reply:
+            try:
+                from .food_analysis import handle_food_image, is_food_analysis_enabled
+                if is_food_analysis_enabled(account.workspace_id):
+                    handled = handle_food_image(
+                        account=account, conversation=conversation,
+                        raw_message=raw_message or {}, from_phone=from_phone,
+                        workspace_id=account.workspace_id,
+                    )
+                    if handled:
+                        elapsed = time.time() - start
+                        trace_event(stage="router.food_analysis", wamid=inbound_wamid, status="ok", elapsed_ms=elapsed * 1000)
+                        return
+            except Exception as e:
+                logger.exception(f"[fast_router] Food analysis error (non-fatal): {e}")
+                _safe_rollback()
+
         # Only process text messages from here (flow replies are handled above)
         if is_flow_reply or msg_type != "text" or not message_text:
             return

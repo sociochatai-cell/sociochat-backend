@@ -1033,6 +1033,21 @@ class WebhookProcessor:
                     inbound_wamid=wamid,
                 )
         
+        elif msg_type == "image":
+            # Route image messages for food analysis (per-workspace)
+            self._process_automation(
+                account=account,
+                conversation=conversation,
+                message_text="",
+                message_id=msg_record.id,
+                from_phone=from_phone,
+                is_button_reply=False,
+                button_payload=None,
+                inbound_wamid=wamid,
+                msg_type="image",
+                raw_message=message,
+            )
+
         # Check for Lead Keywords / Ref Tags in text messages
         if msg_type == "text":
             text_content = extract_message_text(message)
@@ -2118,6 +2133,7 @@ class WebhookProcessor:
         is_button_reply: bool = False,
         button_payload: Optional[str] = None,
         inbound_wamid: Optional[str] = None,
+        msg_type: str = "text",
         automation_replay: bool = False,
         is_flow_reply: bool = False,
         raw_message: Optional[dict] = None,
@@ -2194,7 +2210,7 @@ class WebhookProcessor:
                 message_text=message_text,
                 message_id=message_id,
                 from_phone=from_phone,
-                msg_type="interactive" if is_flow_reply else "text",
+                msg_type="interactive" if is_flow_reply else msg_type,
                 is_button_reply=is_button_reply,
                 button_payload=button_payload,
                 is_first_inbound=is_first,
