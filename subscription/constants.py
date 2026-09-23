@@ -16,6 +16,14 @@ PLAN_ENTERPRISE = "enterprise"  # display: Ultimate
 # All valid plans
 VALID_PLANS = [PLAN_BETA, PLAN_STARTER, PLAN_GROWTH, PLAN_PREMIUM, PLAN_ENTERPRISE]
 
+# Sociovia plan slugs that differ from SocioChat equivalents
+SOCIOVIA_PLAN_MAP = {
+    "ai_free": PLAN_BETA,
+    "ai_starter": PLAN_STARTER,
+    "ai_growth": PLAN_GROWTH,
+    "free": PLAN_BETA,
+}
+
 # Billing / plan scope
 BILLING_SCOPE_GLOBAL = "global"
 BILLING_SCOPE_PRIVATE = "private"

@@ -13,7 +13,7 @@ from sqlalchemy import func
 from decimal import Decimal
 from shared_models import db, User, Workspace, AIUsage, AIUsageDailySummary
 from subscription.constants import (
-    PLAN_FEATURES, VALID_PLANS, PLAN_STARTER, PLAN_BETA, UNLIMITED,
+    PLAN_FEATURES, VALID_PLANS, PLAN_STARTER, PLAN_BETA, UNLIMITED, SOCIOVIA_PLAN_MAP,
     BILLING_SCOPE_GLOBAL, BILLING_SCOPE_PRIVATE, PLAN_SCOPE_PRIVATE,
     PRIVATE_SLOT_GLOBAL_TIERS,
     get_plan_features, is_unlimited
@@ -251,6 +251,7 @@ def get_effective_plan_slug(user: User) -> str:
     if _is_subscription_expired(user):
         return PLAN_STARTER
     plan = getattr(user, "plan", None)
+    plan = SOCIOVIA_PLAN_MAP.get(plan, plan)
     if plan in VALID_PLANS:
         return plan
     from subscription.plan_models import SubscriptionPlan
