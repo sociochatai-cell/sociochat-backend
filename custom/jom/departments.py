@@ -188,5 +188,45 @@ def route_qualified_lead(workspace_id, customer_phone, text):
         workspace_id, customer_phone,
         status=cfg.STATUS_ASSIGNED, department_id=dep.id, assigned_agent_id=agent_id,
     )
+    if agent_id:
+        bridge_to_agent_inbox(workspace_id, customer_phone, agent_id)
     logger.info("[jom] routed %s → dept=%s agent=%s", customer_phone, dep.name, agent_id)
     return dep, agent_id
+
+
+def bridge_to_agent_inbox(workspace_id, customer_phone, agent_id):
+    """Mirror a JOM department assignment into the agent's own scoped inbox.
+
+    Without this the lead is assigned in jom_lifecycle_state but the human agent never
+    SEES it — JOM skips SocioChat's standard auto-assign, so nothing else creates the
+    agent_number_assignments row. Exclusive per (workspace, phone): if the number is
+    already held by another agent we re-point it, which is what makes re-engagement to
+    the SAME agent actually show up for that agent.
+    Fail-safe: a problem here must never break routing."""
+    try:
+        from agent_auth.models import AgentNumberAssignment
+        try:
+            from whatsapp.utils import normalize_phone
+            phone = normalize_phone(customer_phone) or str(customer_phone)
+        except Exception:  # noqa: BLE001
+            phone = str(customer_phone)
+        row = AgentNumberAssignment.query.filter_by(
+            workspace_id=int(workspace_id), customer_phone=phone).first()
+        if row:
+            if row.agent_id != int(agent_id):
+                row.agent_id = int(agent_id)
+                db.session.commit()
+                logger.info("[jom] inbox bridge re-pointed %s → agent %s", phone, agent_id)
+            return row
+        row = AgentNumberAssignment(
+            workspace_id=int(workspace_id), customer_phone=phone,
+            agent_id=int(agent_id), assignment_type="auto",
+        )
+        db.session.add(row)
+        db.session.commit()
+        logger.info("[jom] inbox bridge created %s → agent %s", phone, agent_id)
+        return row
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[jom] agent-inbox bridge failed for %s: %s", customer_phone, exc)
+        db.session.rollback()
+        return None

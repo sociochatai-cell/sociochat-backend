@@ -1837,6 +1837,18 @@ class WhatsAppAIChatbot:
             pass
         if getattr(self.config, "flow_context", None):
             system_prompt += "\n\nCONVERSATION FLOW CONTEXT:\n" + str(self.config.flow_context)
+        # JOM custom vertical (workspace-gated, no-op for every other tenant): the warm
+        # travel-consultant persona + this traveller's memory card, so the agent never
+        # re-asks a known fact and resumes after a gap as if it never paused.
+        try:
+            from custom.jom.persona import system_suffix as _jom_system_suffix
+            _jom_suffix = _jom_system_suffix(
+                self.config.workspace_id, getattr(self.config, "customer_phone", None)
+            )
+            if _jom_suffix:
+                system_prompt += _jom_suffix
+        except Exception:  # noqa: BLE001
+            pass
         contents = self._build_contents(context, message)  # list[dict]
         tools = _agent_tools(self._guardrails.get("disabled"))
         out_tokens = max(256, min(int(self.config.max_tokens or DEFAULT_MAX_OUTPUT_TOKENS), 8192))

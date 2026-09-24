@@ -207,6 +207,13 @@ def list_leads(user):
             "last_inbound_at": r.last_inbound_at.isoformat() if r.last_inbound_at else None,
             "last_outbound_at": r.last_outbound_at.isoformat() if r.last_outbound_at else None,
             "reopen_count": r.reopen_count,
+            "close_reason": getattr(r, "close_reason", None),
+            # memory card — what we know about this traveller
+            "customer_name": getattr(r, "customer_name", None),
+            "destination": getattr(r, "destination", None),
+            "budget": getattr(r, "budget", None),
+            "travel_dates": getattr(r, "travel_dates", None),
+            "party_size": getattr(r, "party_size", None),
             "meta_lead_id": r.meta_lead_id,
             "email": r.email,
             "total_inbound": getattr(b, "total_inbound", None),
@@ -225,3 +232,67 @@ def list_leads(user):
     ).group_by(JomLifecycleState.status).all():
         counts[st] = c
     return jsonify({"success": True, "leads": leads, "counts": counts, "total": len(leads)})
+
+
+# --------------------------------------------------------------------------- #
+# Daily outcome report — "how many went Closed / Dormant / Ghosted / Qualified
+# each day", with the close reason broken out. Drives the CRM date filter.
+# --------------------------------------------------------------------------- #
+@jom_bp.get("/leads/summary")
+@require_owner_user
+def leads_summary(user):
+    err = _guard(user, _wsid())
+    if err:
+        return err
+    wsid = int(_wsid())
+    from .models import JomLifecycleState
+
+    try:
+        days = max(1, min(int(request.args.get("days", 30)), 365))
+    except (TypeError, ValueError):
+        days = 30
+
+    # Per-day x per-status counts, keyed on when the status was set.
+    day = db.func.date(JomLifecycleState.status_since)
+    rows = (
+        db.session.query(day.label("d"), JomLifecycleState.status, db.func.count())
+        .filter(
+            JomLifecycleState.workspace_id == wsid,
+            JomLifecycleState.status_since.isnot(None),
+            JomLifecycleState.status_since >= db.func.now() - text(f"INTERVAL '{days} days'"),
+        )
+        .group_by(day, JomLifecycleState.status)
+        .order_by(day.desc())
+        .all()
+    )
+    by_day = {}
+    for d, status, count in rows:
+        key = str(d)
+        by_day.setdefault(key, {})[status] = count
+
+    # Why leads closed (not_interested / booked_elsewhere / drip_exhausted)
+    reasons = {}
+    for reason, count in (
+        db.session.query(JomLifecycleState.close_reason, db.func.count())
+        .filter(
+            JomLifecycleState.workspace_id == wsid,
+            JomLifecycleState.status == "closed",
+            JomLifecycleState.close_reason.isnot(None),
+        )
+        .group_by(JomLifecycleState.close_reason)
+        .all()
+    ):
+        reasons[reason] = count
+
+    totals = {}
+    for statuses in by_day.values():
+        for st, c in statuses.items():
+            totals[st] = totals.get(st, 0) + c
+
+    return jsonify({
+        "success": True,
+        "days": days,
+        "by_day": by_day,        # {"2026-09-25": {"closed": 3, "dormant": 5}, ...}
+        "totals": totals,        # rolled up across the window
+        "close_reasons": reasons,
+    })

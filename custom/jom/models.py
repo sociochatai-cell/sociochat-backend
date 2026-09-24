@@ -67,6 +67,10 @@ class JomLifecycleState(db.Model):
     next_followup_at = db.Column(db.DateTime(timezone=True), nullable=True)  # when next Ghosted/Dormant msg is due
     last_inbound_at = db.Column(db.DateTime(timezone=True), nullable=True)
     last_outbound_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    # When we last sent the "Continue" re-opener because WhatsApp's 24h free-text
+    # window had closed mid-conversation. Cleared on every inbound so each new silence
+    # gets at most one nudge.
+    continue_sent_at = db.Column(db.DateTime(timezone=True), nullable=True)
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=_now)
     updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
     __table_args__ = (db.UniqueConstraint("workspace_id", "customer_phone", name="uq_jom_lifecycle_ws_phone"),)

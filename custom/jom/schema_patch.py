@@ -72,6 +72,8 @@ _STATEMENTS = [
     "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS party_size VARCHAR(40)",
     "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS preferences JSONB",
     "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS last_summary TEXT",
+    # 24h-window re-opener bookkeeping (one nudge per silence period)
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS continue_sent_at TIMESTAMP WITH TIME ZONE",
 
     # Behaviour / engagement score per lead --------------------------------
     """CREATE TABLE IF NOT EXISTS jom_behavior_score (
