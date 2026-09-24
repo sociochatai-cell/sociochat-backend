@@ -86,6 +86,15 @@ def on_inbound_message(workspace_id, customer_phone, message_text, meta=None, fl
 
         text = _as_text(message_text)
 
+        # 0b) Clear disinterest in FREE TEXT also outranks re-engagement. Without this a
+        # "not interested" reply from a Ghosted/Dormant lead would be treated as them
+        # coming back and re-activate them — the opposite of what the client wants.
+        if qualification.is_negative(text):
+            qualification.record_inbound(workspace_id, customer_phone)
+            lifecycle.mark_not_interested(workspace_id, customer_phone)
+            logger.info("[jom] %s closed — disinterest in free text", customer_phone)
+            return {"action": "closed_disinterest", "reason": cfg.CLOSE_REASON_NOT_INTERESTED}
+
         # 1) re-engagement (reply to a Ghosted/Dormant/Closed lead → Active, same agent)
         re = lifecycle.on_reply(workspace_id, customer_phone)
         if re.get("reengaged"):

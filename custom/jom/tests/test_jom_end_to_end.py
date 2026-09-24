@@ -55,19 +55,19 @@ def run():
         db.session.add_all([a1, a2]); db.session.commit()
 
         # --- create a department + attach both agents ---
-        dep = D.create_department(WS, "TEST_Kashmir", keywords=["kashmir", "srinagar"])
+        dep = D.create_department(WS, "TEST_Dept", keywords=["zztestdestqx"])
         D.add_agent(WS, dep.id, a1.id)
         D.add_agent(WS, dep.id, a2.id)
         check("department + 2 agents created", len(D.list_agent_ids(dep.id)) == 2)
 
-        # --- qualify + route (keyword) → assigned to an agent in the dept ---
-        out1 = Q.qualify_and_route(WS, P1, "Hi, I want a Kashmir honeymoon package")
+        # --- qualify + route (unique keyword, no collision with real depts) ---
+        out1 = Q.qualify_and_route(WS, P1, "Hi, I want a zztestdestqx honeymoon package")
         check("lead1 qualified", out1["qualified"] is True)
-        check("lead1 routed to TEST_Kashmir", out1.get("department") == "TEST_Kashmir")
+        check("lead1 routed to TEST_Dept", out1.get("department") == "TEST_Dept")
         check("lead1 got an agent", out1.get("agent_id") in (a1.id, a2.id))
 
         # --- round-robin: second lead → the OTHER agent ---
-        out2 = Q.qualify_and_route(WS, P2, "Kashmir trip please")
+        out2 = Q.qualify_and_route(WS, P2, "zztestdestqx trip please")
         check("lead2 different agent (round-robin)", out2.get("agent_id") != out1.get("agent_id"))
 
         # --- ghosted drip: mark ghosted, then tick into the future through all steps ---
