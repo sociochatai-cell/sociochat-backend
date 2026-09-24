@@ -61,6 +61,17 @@ _STATEMENTS = [
     "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS meta_lead_id VARCHAR(40)",
     "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS email VARCHAR(160)",
     "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS reopen_count INTEGER NOT NULL DEFAULT 0",
+    # Close reason (for CRM daily filtering: not_interested / booked_elsewhere / drip_exhausted)
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS close_reason VARCHAR(32)",
+    # MEMORY CARD (additive) — seeded from the lead form, enriched by the AI, read back
+    # into every AI turn so it never re-asks and can resume after a gap.
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS customer_name VARCHAR(120)",
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS destination VARCHAR(80)",
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS budget VARCHAR(80)",
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS travel_dates VARCHAR(120)",
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS party_size VARCHAR(40)",
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS preferences JSONB",
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS last_summary TEXT",
 
     # Behaviour / engagement score per lead --------------------------------
     """CREATE TABLE IF NOT EXISTS jom_behavior_score (
@@ -77,6 +88,9 @@ _STATEMENTS = [
         CONSTRAINT uq_jom_behavior_ws_phone UNIQUE (workspace_id, customer_phone)
     )""",
     "CREATE INDEX IF NOT EXISTS ix_jom_behavior_ws ON jom_behavior_score(workspace_id)",
+    # Per-episode customer message counter (reset on re-engage/reopen) — drives the
+    # "do we know within 5-6 turns?" verdict. Lifetime total_inbound can't do that.
+    "ALTER TABLE jom_behavior_score ADD COLUMN IF NOT EXISTS episode_inbound INTEGER NOT NULL DEFAULT 0",
 ]
 
 

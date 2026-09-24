@@ -40,9 +40,23 @@ def reopen_as_fresh(workspace_id, customer_phone):
     row.drip_stage = None
     row.next_followup_at = None
     row.status_since = _now()
+    row.close_reason = None
     row.reopen_count = (row.reopen_count or 0) + 1
     row.updated_at = _now()
     db.session.commit()
+    # Fresh inquiry = fresh episode, so the "qualified within 5-6 turns?" verdict starts
+    # over. Lifetime counters and the memory card are deliberately PRESERVED (history kept).
+    try:
+        from .models import JomBehaviorScore
+        s = JomBehaviorScore.query.filter_by(
+            workspace_id=int(workspace_id), customer_phone=str(customer_phone)).first()
+        if s:
+            s.episode_inbound = 0
+            s.consecutive_no_reply = 0
+            s.updated_at = _now()
+            db.session.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[jom] episode reset on reopen failed: %s", exc)
     logger.info("[jom] reopened %s as fresh (reopen_count=%s)", customer_phone, row.reopen_count)
     return row
 

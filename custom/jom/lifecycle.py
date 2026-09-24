@@ -39,18 +39,27 @@ def _get(workspace_id, customer_phone):
 # Enter a stall state → schedule the first follow-up
 # --------------------------------------------------------------------------- #
 def _enter_drip(workspace_id, customer_phone, status):
+    """Tag the lead Ghosted/Dormant AND auto-enrol it in the matching drip.
+    Setting the status IS the enrolment — status_since + drip_stage=0 + next_followup_at
+    are what the scheduler tick picks up. Switching between Ghosted/Dormant re-enrols
+    from step 0 (never both at once)."""
     row = _get(workspace_id, customer_phone)
     if not row:
         return None
+    was = row.status                      # capture BEFORE mutating (was reported wrong)
+    if was == status and row.next_followup_at is not None:
+        return row                        # already enrolled in this drip — don't restart
     now = _now()
     days = _cadence(status)
     row.status = status
     row.status_since = now
     row.drip_stage = "0"
     row.next_followup_at = now + timedelta(days=days[0])
+    row.close_reason = None
     row.updated_at = now
     db.session.commit()
-    _fire_status_change(workspace_id, customer_phone, row.status, status)
+    logger.info("[jom] %s auto-enrolled in %s drip (first step in %sd)", customer_phone, status, days[0])
+    _fire_status_change(workspace_id, customer_phone, was, status)
     return row
 
 
@@ -60,6 +69,34 @@ def mark_ghosted(workspace_id, customer_phone):
 
 def mark_dormant(workspace_id, customer_phone):
     return _enter_drip(workspace_id, customer_phone, cfg.STATUS_DORMANT)
+
+
+def mark_closed(workspace_id, customer_phone, reason=None):
+    """Close a lead NOW and STOP any running drip. Used when the customer shows clear
+    disinterest (free text or a button) — the client's explicit rule is that we do NOT
+    finish the remaining drip steps in that case."""
+    row = _get(workspace_id, customer_phone)
+    if not row:
+        return None
+    was = row.status
+    if was == cfg.STATUS_CLOSED and row.next_followup_at is None:
+        return row
+    now = _now()
+    row.status = cfg.STATUS_CLOSED
+    row.status_since = now
+    row.next_followup_at = None       # <- stops the drip dead
+    row.drip_stage = None
+    row.close_reason = reason
+    row.updated_at = now
+    db.session.commit()
+    logger.info("[jom] %s CLOSED (reason=%s, was=%s) — drip stopped", customer_phone, reason, was)
+    _fire_status_change(workspace_id, customer_phone, was, cfg.STATUS_CLOSED)
+    return row
+
+
+def mark_not_interested(workspace_id, customer_phone):
+    """Explicit disinterest → close immediately with a reportable reason."""
+    return mark_closed(workspace_id, customer_phone, reason=cfg.CLOSE_REASON_NOT_INTERESTED)
 
 
 # --------------------------------------------------------------------------- #
@@ -109,7 +146,9 @@ def tick(workspace_id, now=None, send_fn=None):
                 row.status = cfg.STATUS_CLOSED
                 row.next_followup_at = None
                 row.drip_stage = None
+                row.close_reason = cfg.CLOSE_REASON_DRIP_EXHAUSTED
                 closed += 1
+                _fire_status_change(workspace_id, row.customer_phone, cfg.STATUS_GHOSTED, cfg.STATUS_CLOSED)
             row.updated_at = now
             db.session.commit()
     return {"sent": sent, "closed": closed}
@@ -145,13 +184,16 @@ def on_reply(workspace_id, customer_phone):
     row.last_inbound_at = _now()
     row.updated_at = _now()
     db.session.commit()
-    # reset no-reply streak
+    # Reset the no-reply streak. NOTE: message COUNTING lives in
+    # qualification.record_inbound (single source of truth) — incrementing here too
+    # double-counted every inbound. On a genuine re-engagement we also start a FRESH
+    # episode so the "qualified within 5-6 turns?" verdict restarts.
     s = JomBehaviorScore.query.filter_by(
         workspace_id=int(workspace_id), customer_phone=str(customer_phone)).first()
     if s:
         s.consecutive_no_reply = 0
-        s.total_inbound = (s.total_inbound or 0) + 1
-        s.engagement_score = (s.engagement_score or 0) + 1
+        if reengaged:
+            s.episode_inbound = 0
         s.updated_at = _now()
         db.session.commit()
     if reengaged:

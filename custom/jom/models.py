@@ -49,6 +49,20 @@ class JomLifecycleState(db.Model):
     email = db.Column(db.String(160), nullable=True)         # for CAPI match keys
     reopen_count = db.Column(db.Integer, nullable=False, default=0)  # returning-fresh-lead history
     drip_stage = db.Column(db.String(16), nullable=True)
+    close_reason = db.Column(db.String(32), nullable=True)  # not_interested / booked_elsewhere / drip_exhausted
+    # --- MEMORY CARD -------------------------------------------------------- #
+    # What we know about this traveller. Seeded from the campaign/lead form and then
+    # enriched by the AI as it talks. Read back into EVERY AI turn so the agent never
+    # re-asks a known fact and can resume after a gap "as if they never left".
+    # `destination` starts as the campaign destination but is OVERRIDABLE mid-chat
+    # (Kashmir -> Bali) and drives which destination knowledge the AI retrieves.
+    customer_name = db.Column(db.String(120), nullable=True)
+    destination = db.Column(db.String(80), nullable=True)
+    budget = db.Column(db.String(80), nullable=True)
+    travel_dates = db.Column(db.String(120), nullable=True)
+    party_size = db.Column(db.String(40), nullable=True)
+    preferences = db.Column(JSONB, nullable=True)            # free-form captured likes/needs
+    last_summary = db.Column(db.Text, nullable=True)         # "where you left off" recap
     status_since = db.Column(db.DateTime(timezone=True), nullable=True)      # when current status was set
     next_followup_at = db.Column(db.DateTime(timezone=True), nullable=True)  # when next Ghosted/Dormant msg is due
     last_inbound_at = db.Column(db.DateTime(timezone=True), nullable=True)
@@ -67,6 +81,10 @@ class JomBehaviorScore(db.Model):
     consecutive_no_reply = db.Column(db.Integer, nullable=False, default=0)
     total_inbound = db.Column(db.Integer, nullable=False, default=0)
     total_outbound = db.Column(db.Integer, nullable=False, default=0)
+    # Customer messages in the CURRENT episode (reset on re-engage / reopen). This is the
+    # "have we qualified them within 5-6 turns?" gauge — total_inbound is lifetime and
+    # keeps climbing across reopens, so it can't be used for that decision.
+    episode_inbound = db.Column(db.Integer, nullable=False, default=0)
     last_intent = db.Column(db.String(32), nullable=True)
     last_confidence = db.Column(db.Float, nullable=True)
     updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
