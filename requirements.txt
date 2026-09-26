@@ -43,6 +43,14 @@ Jinja2==3.1.4
 pycountry>=24.6.1
 PyJWT>=2.8.0
 pypdf>=4.0.0
+pdfplumber>=0.11.0
+# Knowledge-base file processors (PDF/DOCX/CSV/XLSX/OCR)
+python-docx>=1.1.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+# OCR for SCANNED PDFs (requires system pkgs tesseract-ocr + poppler-utils in the image)
+pytesseract>=0.3.10
+pdf2image>=1.17.0
 httpx>=0.28.1,<1.0.0
 
 # ----------------------------

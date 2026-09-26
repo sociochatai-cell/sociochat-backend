@@ -33,37 +33,101 @@ class PDFProcessor:
         Returns:
             Dict with extracted text, page count, and metadata
         """
+        # Try pdfplumber first (better layout/table extraction), then fall back
+        # to pypdf (already in requirements) so an image rebuild that missed
+        # one of them still processes PDFs instead of hard-failing.
         try:
             import pdfplumber
+            try:
+                all_text = []
+                page_texts = []
+                with pdfplumber.open(file_path) as pdf:
+                    for i, page in enumerate(pdf.pages):
+                        text = page.extract_text() or ""
+                        if text.strip():
+                            page_texts.append({"page": i + 1, "text": text})
+                            all_text.append(f"[Page {i+1}]\n{text}")
+                # Empty extraction => scanned/image-only PDF, try OCR fallback.
+                if not all_text:
+                    ocr_result = PDFProcessor._ocr_fallback(file_path)
+                    if ocr_result is not None:
+                        return ocr_result
+                return {
+                    "status": "success",
+                    "text": "\n\n".join(all_text),
+                    "page_count": len(page_texts),
+                    "pages": page_texts,
+                    "file_name": os.path.basename(file_path),
+                }
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
         except ImportError:
-            return {"status": "error", "message": "pdfplumber not installed. Run: pip install pdfplumber"}
-        
+            pass
+
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            return {"status": "error", "message": "No PDF library available (need pdfplumber or pypdf)."}
+
+        try:
+            reader = PdfReader(file_path)
+            all_text = []
+            page_texts = []
+            for i, page in enumerate(reader.pages):
+                text = page.extract_text() or ""
+                if text.strip():
+                    page_texts.append({"page": i + 1, "text": text})
+                    all_text.append(f"[Page {i+1}]\n{text}")
+            # If no text was found at all, PDF is likely SCANNED — try OCR.
+            if not all_text:
+                ocr_result = PDFProcessor._ocr_fallback(file_path)
+                if ocr_result is not None:
+                    return ocr_result
+            return {
+                "status": "success",
+                "text": "\n\n".join(all_text),
+                "page_count": len(page_texts),
+                "pages": page_texts,
+                "file_name": os.path.basename(file_path),
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    @staticmethod
+    def _ocr_fallback(file_path: str):
+        """Extract text from a scanned PDF via OCR (pdf2image + pytesseract).
+        Returns a normal PDFProcessor-shaped dict on success, or None if OCR
+        libraries or system binaries (tesseract/poppler) are not available so
+        the caller can fall back to the empty-text success path."""
+        try:
+            from pdf2image import convert_from_path
+            import pytesseract
+        except ImportError:
+            return None
+        try:
+            images = convert_from_path(file_path, dpi=200)
+        except Exception as e:
+            # Missing poppler binary or corrupt PDF — surface as an error the
+            # UI can show, rather than silently returning empty text.
+            return {"status": "error", "message": f"OCR unavailable: {e}"}
         try:
             all_text = []
             page_texts = []
-            
-            with pdfplumber.open(file_path) as pdf:
-                for i, page in enumerate(pdf.pages):
-                    text = page.extract_text() or ""
-                    if text.strip():
-                        page_texts.append({
-                            "page": i + 1,
-                            "text": text
-                        })
-                        all_text.append(f"[Page {i+1}]\n{text}")
-            
-            combined_text = "\n\n".join(all_text)
-            
+            for i, img in enumerate(images):
+                text = pytesseract.image_to_string(img) or ""
+                if text.strip():
+                    page_texts.append({"page": i + 1, "text": text})
+                    all_text.append(f"[Page {i+1}]\n{text}")
             return {
                 "status": "success",
-                "text": combined_text,
+                "text": "\n\n".join(all_text),
                 "page_count": len(page_texts),
                 "pages": page_texts,
-                "file_name": os.path.basename(file_path)
+                "file_name": os.path.basename(file_path),
+                "ocr": True,
             }
-            
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return {"status": "error", "message": f"OCR failed: {e}"}
 
 
 
