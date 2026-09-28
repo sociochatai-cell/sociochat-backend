@@ -91,6 +91,28 @@ class JomSettings(db.Model):
     updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
 
+class JomSheetConfig(db.Model):
+    """Google Sheet lead-intake config, one row per workspace. The owner pastes a
+    'anyone with the link can view' Google Sheet URL; a poller reads new rows and
+    creates JOM leads (firing the opening template). `header_map` optionally remaps
+    the sheet's column headers to our fields; when empty we auto-detect common names.
+    The last_* columns drive the green/red health badge in the UI."""
+    __tablename__ = "jom_sheet_config"
+    id = db.Column(db.Integer, primary_key=True)
+    workspace_id = db.Column(db.Integer, db.ForeignKey("workspaces2.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    sheet_url = db.Column(db.Text, nullable=True)
+    enabled = db.Column(db.Boolean, nullable=False, default=False)
+    header_map = db.Column(JSONB, nullable=True)          # {"Phone Number": "customer_phone", ...}
+    last_synced_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    last_status = db.Column(db.String(16), nullable=True)  # ok / error
+    last_error = db.Column(db.Text, nullable=True)
+    last_row_count = db.Column(db.Integer, nullable=True)     # rows seen in the sheet last sync
+    last_imported_count = db.Column(db.Integer, nullable=True)  # NEW leads created last sync
+    total_imported = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=_now)
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+
+
 class JomBehaviorScore(db.Model):
     __tablename__ = "jom_behavior_score"
     id = db.Column(db.Integer, primary_key=True)

@@ -105,6 +105,24 @@ _STATEMENTS = [
     # Per-episode customer message counter (reset on re-engage/reopen) — drives the
     # "do we know within 5-6 turns?" verdict. Lifetime total_inbound can't do that.
     "ALTER TABLE jom_behavior_score ADD COLUMN IF NOT EXISTS episode_inbound INTEGER NOT NULL DEFAULT 0",
+
+    # Google Sheet lead-intake config (one row per workspace) --------------
+    """CREATE TABLE IF NOT EXISTS jom_sheet_config (
+        id                  SERIAL PRIMARY KEY,
+        workspace_id        INTEGER NOT NULL REFERENCES workspaces2(id) ON DELETE CASCADE,
+        sheet_url           TEXT,
+        enabled             BOOLEAN NOT NULL DEFAULT FALSE,
+        header_map          JSONB,
+        last_synced_at      TIMESTAMP WITH TIME ZONE,
+        last_status         VARCHAR(16),
+        last_error          TEXT,
+        last_row_count      INTEGER,
+        last_imported_count INTEGER,
+        total_imported      INTEGER NOT NULL DEFAULT 0,
+        created_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_jom_sheet_ws UNIQUE (workspace_id)
+    )""",
 ]
 
 

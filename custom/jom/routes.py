@@ -385,6 +385,62 @@ def patch_settings_route(user):
 
 
 # --------------------------------------------------------------------------- #
+# Google Sheet lead intake — paste a share link, we poll it and import new leads
+# (firing the opening template). GET returns config + health; POST saves; the
+# /sync endpoint runs it on demand and returns the result immediately.
+# --------------------------------------------------------------------------- #
+@jom_bp.get("/sheet")
+@require_owner_user
+def get_sheet(user):
+    err = _guard(user, _wsid())
+    if err:
+        return err
+    from . import sheet as jom_sheet
+    return jsonify({"success": True, "config": jom_sheet.config_json(int(_wsid()))})
+
+
+@jom_bp.post("/sheet")
+@require_owner_user
+def save_sheet(user):
+    body = request.get_json(silent=True) or {}
+    err = _guard(user, body.get("workspace_id"))
+    if err:
+        return err
+    wsid = int(body["workspace_id"])
+    from . import sheet as jom_sheet
+    sheet_url = body.get("sheet_url")
+    if sheet_url:
+        # validate it looks like a Google Sheet before saving, so the health badge
+        # isn't the first place the owner learns the link is wrong.
+        if jom_sheet.csv_export_url(sheet_url) is None:
+            return jsonify({"success": False, "error": "Not a valid Google Sheets link."}), 400
+    cfg_json = jom_sheet.save_config(
+        wsid,
+        sheet_url=sheet_url,
+        enabled=body.get("enabled"),
+        header_map=body.get("header_map"),
+    )
+    logger.info("[jom] sheet config saved for ws %s by user %s", wsid, getattr(user, "id", None))
+    return jsonify({"success": True, "config": cfg_json})
+
+
+@jom_bp.post("/sheet/sync")
+@require_owner_user
+def sync_sheet(user):
+    body = request.get_json(silent=True) or {}
+    err = _guard(user, body.get("workspace_id"))
+    if err:
+        return err
+    wsid = int(body["workspace_id"])
+    from . import sheet as jom_sheet
+    # A manual sync can optionally skip messaging (dry preview of what would import).
+    send_opening = body.get("send_opening", True)
+    result = jom_sheet.sync_workspace(wsid, send_opening=bool(send_opening))
+    status = 200 if result.get("success") else 400
+    return jsonify({**result, "config": jom_sheet.config_json(wsid)}), status
+
+
+# --------------------------------------------------------------------------- #
 # Lead tracker (read-only) — lifecycle rows joined with department + agent names
 # --------------------------------------------------------------------------- #
 @jom_bp.get("/leads")
