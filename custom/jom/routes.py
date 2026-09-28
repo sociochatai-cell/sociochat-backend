@@ -163,6 +163,228 @@ def remove_agent(user, department_id, agent_id):
 
 
 # --------------------------------------------------------------------------- #
+# Manual status change — a human (owner/agent) can override the automation for one
+# lead: mark booked/closed, pull someone back to active, correct a wrong status.
+# Enrols/stops the drip correctly via the lifecycle helpers so the state stays coherent.
+# --------------------------------------------------------------------------- #
+_MANUAL_STATUSES = {"new", "contacted", "qualified", "assigned", "active", "ghosted", "dormant", "closed"}
+
+
+# Demo leads use a distinctive phone prefix so they can never collide with a real
+# customer and can be wiped in one call before go-live.
+_DEMO_PREFIX = "DEMO"
+
+
+@jom_bp.post("/leads/demo-seed")
+@require_owner_user
+def demo_seed(user):
+    body = request.get_json(silent=True) or {}
+    err = _guard(user, body.get("workspace_id"))
+    if err:
+        return err
+    wsid = int(body["workspace_id"])
+    from datetime import datetime, timezone, timedelta
+    from .models import JomLifecycleState, JomBehaviorScore, JomDepartment
+    now = datetime.now(timezone.utc)
+    depmap = {d.name: d.id for d in JomDepartment.query.filter_by(workspace_id=wsid).all()}
+
+    def dep(name):
+        return depmap.get(name)
+
+    rows = [
+        # name, phone, destination, budget, status, dept, days_ago, drip_stage, close_reason
+        ("Rahul Sharma", "DEMO0001", "Bali", "~1.2L", "qualified", "Bali", 0, None, None),
+        ("Anita Verma", "DEMO0002", "Kashmir", "~90k", "assigned", "Kashmir", 1, None, None),
+        ("Vikram Singh", "DEMO0003", "Vietnam", "~1.5L", "ghosted", "Vietnam", 7, "0", None),
+        ("Sara Khan", "DEMO0004", "Thailand", "~1.1L", "dormant", "Thailand", 14, "1", None),
+        ("Deepa Nair", "DEMO0005", "Bali", "~2L", "closed", "Bali", 20, None, "booked_elsewhere"),
+        ("Arjun Rao", "DEMO0006", "Ladakh", "~80k", "new", "Ladakh", 0, None, None),
+    ]
+    created = 0
+    for name, phone, dest, budget, status, dname, days_ago, stage, close_reason in rows:
+        JomLifecycleState.query.filter_by(workspace_id=wsid, customer_phone=phone).delete()
+        JomBehaviorScore.query.filter_by(workspace_id=wsid, customer_phone=phone).delete()
+        r = JomLifecycleState(
+            workspace_id=wsid, customer_phone=phone, status=status,
+            department_id=dep(dname), customer_name=name, destination=dest, budget=budget,
+            status_since=now - timedelta(days=days_ago),
+            last_inbound_at=now - timedelta(days=days_ago),
+            drip_stage=stage,
+            next_followup_at=(now + timedelta(days=3)) if status in ("ghosted", "dormant") else None,
+            close_reason=close_reason,
+            last_summary=f"Was planning a {dest} trip.",
+        )
+        db.session.add(r)
+        db.session.add(JomBehaviorScore(workspace_id=wsid, customer_phone=phone,
+                                        total_inbound=3, engagement_score=3))
+        created += 1
+    db.session.commit()
+    return jsonify({"success": True, "seeded": created, "note": "demo leads (phone prefix DEMO) — wipe via /leads/demo-clear"})
+
+
+@jom_bp.post("/leads/demo-clear")
+@require_owner_user
+def demo_clear(user):
+    body = request.get_json(silent=True) or {}
+    err = _guard(user, body.get("workspace_id"))
+    if err:
+        return err
+    wsid = int(body["workspace_id"])
+    from .models import JomLifecycleState, JomBehaviorScore
+    n = JomLifecycleState.query.filter(
+        JomLifecycleState.workspace_id == wsid,
+        JomLifecycleState.customer_phone.like(f"{_DEMO_PREFIX}%")).delete(synchronize_session=False)
+    JomBehaviorScore.query.filter(
+        JomBehaviorScore.workspace_id == wsid,
+        JomBehaviorScore.customer_phone.like(f"{_DEMO_PREFIX}%")).delete(synchronize_session=False)
+    db.session.commit()
+    return jsonify({"success": True, "cleared": n})
+
+
+@jom_bp.patch("/leads/<path:customer_phone>/status")
+@require_owner_user
+def set_lead_status(user, customer_phone):
+    body = request.get_json(silent=True) or {}
+    err = _guard(user, body.get("workspace_id"))
+    if err:
+        return err
+    wsid = int(body["workspace_id"])
+    new_status = str(body.get("status") or "").strip().lower()
+    reason = body.get("reason")
+    if new_status not in _MANUAL_STATUSES:
+        return jsonify({"success": False, "error": "invalid_status",
+                        "allowed": sorted(_MANUAL_STATUSES)}), 400
+
+    from .models import JomLifecycleState
+    from . import lifecycle
+    row = JomLifecycleState.query.filter_by(workspace_id=wsid, customer_phone=str(customer_phone)).first()
+    if not row:
+        return jsonify({"success": False, "error": "lead_not_found"}), 404
+    old = row.status
+
+    # Route through the lifecycle helpers so drips/close reasons stay consistent, rather
+    # than blindly overwriting the column.
+    if new_status == "ghosted":
+        lifecycle.mark_ghosted(wsid, customer_phone)
+    elif new_status == "dormant":
+        lifecycle.mark_dormant(wsid, customer_phone)
+    elif new_status == "closed":
+        lifecycle.mark_closed(wsid, customer_phone, reason=reason or "manual")
+    elif new_status == "active":
+        # bring them back into conversation, keep the sticky agent, stop any drip
+        row.status = "active"
+        row.next_followup_at = None
+        row.drip_stage = None
+        row.close_reason = None
+        row.updated_at = db.func.now()
+        db.session.commit()
+        lifecycle._fire_status_change(wsid, customer_phone, old, "active")
+    else:
+        # new / contacted / qualified / assigned — set directly, clear any pending drip
+        row.status = new_status
+        if new_status in ("new", "contacted", "qualified"):
+            row.next_followup_at = None
+            row.drip_stage = None
+        row.updated_at = db.func.now()
+        db.session.commit()
+        lifecycle._fire_status_change(wsid, customer_phone, old, new_status)
+
+    row = JomLifecycleState.query.filter_by(workspace_id=wsid, customer_phone=str(customer_phone)).first()
+    logger.info("[jom] manual status change %s: %s -> %s (by user %s)",
+                customer_phone, old, row.status, getattr(user, "id", None))
+    return jsonify({"success": True, "customer_phone": str(customer_phone),
+                    "old_status": old, "status": row.status})
+
+
+# --------------------------------------------------------------------------- #
+# Settings — owner-editable cadence / qualify threshold / template mapping.
+# GET returns the merged live view (defaults + overrides) plus the workspace's
+# Meta-approved templates so the UI can offer them in dropdowns. PATCH upserts.
+# --------------------------------------------------------------------------- #
+def _approved_templates(wsid):
+    """Best-effort list of the workspace's approved WhatsApp template names, for the
+    template-picker dropdowns. Fail-safe: returns [] if the account/table isn't there."""
+    try:
+        from whatsapp.models import WhatsAppAccount, WhatsAppTemplate  # type: ignore
+        acc = WhatsAppAccount.query.filter_by(workspace_id=str(wsid)).first()
+        if not acc:
+            return []
+        q = WhatsAppTemplate.query.filter_by(account_id=acc.id)
+        names = []
+        for t in q.all():
+            if getattr(t, "is_archived", False):
+                continue
+            status = (getattr(t, "meta_status", None) or getattr(t, "status", "") or "").upper()
+            if status in ("", "APPROVED"):
+                nm = getattr(t, "name", None)
+                if nm:
+                    names.append(nm)
+        return sorted(set(names))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[jom] approved-template lookup unavailable: %s", exc)
+        return []
+
+
+@jom_bp.get("/settings")
+@require_owner_user
+def get_settings_route(user):
+    err = _guard(user, _wsid())
+    if err:
+        return err
+    wsid = int(_wsid())
+    from . import settings as jom_settings
+    data = jom_settings.get_settings(wsid)
+    return jsonify({
+        "success": True,
+        "settings": data,
+        "template_keys": list(jom_settings.DEFAULT_TEMPLATES.keys()),
+        "approved_templates": _approved_templates(wsid),
+    })
+
+
+@jom_bp.patch("/settings")
+@require_owner_user
+def patch_settings_route(user):
+    body = request.get_json(silent=True) or {}
+    err = _guard(user, body.get("workspace_id"))
+    if err:
+        return err
+    wsid = int(body["workspace_id"])
+    from . import settings as jom_settings
+
+    def _days(val):
+        if val is None:
+            return None
+        if not isinstance(val, list) or not val:
+            raise ValueError("cadence must be a non-empty list of day offsets")
+        out = sorted({int(x) for x in val if int(x) >= 0})
+        if not out:
+            raise ValueError("cadence must contain at least one day offset")
+        return out
+
+    try:
+        ghosted = _days(body.get("ghosted_days"))
+        dormant = _days(body.get("dormant_days"))
+        qmt = body.get("qualify_max_turns")
+        if qmt is not None:
+            qmt = int(qmt)
+            if qmt < 1 or qmt > 50:
+                raise ValueError("qualify_max_turns must be between 1 and 50")
+        templates = body.get("templates")
+        if templates is not None and not isinstance(templates, dict):
+            raise ValueError("templates must be an object")
+    except (TypeError, ValueError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+    data = jom_settings.save(
+        wsid, ghosted_days=ghosted, dormant_days=dormant,
+        qualify_max_turns=qmt, templates=templates,
+    )
+    logger.info("[jom] settings updated for ws %s by user %s", wsid, getattr(user, "id", None))
+    return jsonify({"success": True, "settings": data})
+
+
+# --------------------------------------------------------------------------- #
 # Lead tracker (read-only) — lifecycle rows joined with department + agent names
 # --------------------------------------------------------------------------- #
 @jom_bp.get("/leads")

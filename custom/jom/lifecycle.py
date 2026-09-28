@@ -26,8 +26,9 @@ def _now():
     return datetime.now(timezone.utc)
 
 
-def _cadence(status):
-    return cfg.GHOSTED_DAYS if status == cfg.STATUS_GHOSTED else cfg.DORMANT_DAYS
+def _cadence(workspace_id, status):
+    from . import settings
+    return settings.cadence(workspace_id, status)
 
 
 def _get(workspace_id, customer_phone):
@@ -50,7 +51,7 @@ def _enter_drip(workspace_id, customer_phone, status):
     if was == status and row.next_followup_at is not None:
         return row                        # already enrolled in this drip — don't restart
     now = _now()
-    days = _cadence(status)
+    days = _cadence(workspace_id, status)
     row.status = status
     row.status_since = now
     row.drip_stage = "0"
@@ -123,7 +124,7 @@ def tick(workspace_id, now=None, send_fn=None):
         # drain every stage that is due as of `now`
         while (row.status in (cfg.STATUS_GHOSTED, cfg.STATUS_DORMANT)
                and row.next_followup_at is not None and row.next_followup_at <= now):
-            days = _cadence(row.status)
+            days = _cadence(workspace_id, row.status)
             stage = int(row.drip_stage or 0)
             if send_fn:
                 try:

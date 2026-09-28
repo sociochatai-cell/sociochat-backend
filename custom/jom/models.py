@@ -76,6 +76,21 @@ class JomLifecycleState(db.Model):
     __table_args__ = (db.UniqueConstraint("workspace_id", "customer_phone", name="uq_jom_lifecycle_ws_phone"),)
 
 
+class JomSettings(db.Model):
+    """Per-workspace, owner-editable knobs that OVERRIDE the code defaults in config.py.
+    One row per workspace. NULL/absent columns fall back to the config defaults, so an
+    untouched workspace behaves exactly as the code does. The emotion/persona engine is
+    deliberately NOT here — it stays backend-only."""
+    __tablename__ = "jom_settings"
+    id = db.Column(db.Integer, primary_key=True)
+    workspace_id = db.Column(db.Integer, db.ForeignKey("workspaces2.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    ghosted_days = db.Column(JSONB, nullable=True)      # e.g. [7, 15]
+    dormant_days = db.Column(JSONB, nullable=True)      # e.g. [7, 14, 24, 31, 45]
+    qualify_max_turns = db.Column(db.Integer, nullable=True)
+    templates = db.Column(JSONB, nullable=True)         # {opening, continue, ghosted_checkin, ghosted_exit, dormant_checkin, close}
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+
+
 class JomBehaviorScore(db.Model):
     __tablename__ = "jom_behavior_score"
     id = db.Column(db.Integer, primary_key=True)

@@ -90,6 +90,18 @@ _STATEMENTS = [
         CONSTRAINT uq_jom_behavior_ws_phone UNIQUE (workspace_id, customer_phone)
     )""",
     "CREATE INDEX IF NOT EXISTS ix_jom_behavior_ws ON jom_behavior_score(workspace_id)",
+
+    # Per-workspace owner-editable settings (override config defaults) --------
+    """CREATE TABLE IF NOT EXISTS jom_settings (
+        id                SERIAL PRIMARY KEY,
+        workspace_id      INTEGER NOT NULL REFERENCES workspaces2(id) ON DELETE CASCADE,
+        ghosted_days      JSONB,
+        dormant_days      JSONB,
+        qualify_max_turns INTEGER,
+        templates         JSONB,
+        updated_at        TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_jom_settings_ws UNIQUE (workspace_id)
+    )""",
     # Per-episode customer message counter (reset on re-engage/reopen) — drives the
     # "do we know within 5-6 turns?" verdict. Lifetime total_inbound can't do that.
     "ALTER TABLE jom_behavior_score ADD COLUMN IF NOT EXISTS episode_inbound INTEGER NOT NULL DEFAULT 0",
