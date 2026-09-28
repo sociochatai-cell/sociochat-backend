@@ -391,14 +391,21 @@ def scenario_agent_scheduled_followup(env):
     resolved = Dsvc.resolve_agent_with_fallback(WS, p)
     s.ok("reply returns to the SAME (valid) agent", resolved == agents[0], agents[0], resolved)
 
-    # --- fallback: sticky agent gone → another agent in the department --- #
+    # --- fallback: sticky agent INACTIVE → another active agent in the dept --- #
+    from agent_auth.models import WorkspaceAgent
     pf = "919900000086"
-    _seed(pf, status=cfg.STATUS_ASSIGNED, agent_id=999999)   # non-existent agent
+    _seed(pf, status=cfg.STATUS_ASSIGNED, agent_id=agents[0])
     row3 = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=pf).first()
     row3.department_id = D.id
     db.session.commit()
+    gone = db.session.get(WorkspaceAgent, agents[0])
+    gone.is_active = False            # simulate the sticky agent no longer available
+    db.session.commit()
     resolved2 = Dsvc.resolve_agent_with_fallback(WS, pf)
-    s.ok("gone agent → falls back within the department", resolved2 in agents, f"in {agents}", resolved2)
+    gone.is_active = True             # restore for other scenarios
+    db.session.commit()
+    s.ok("inactive sticky agent → falls back to another active dept agent",
+         resolved2 == agents[1], agents[1], resolved2)
     return s
 
 
