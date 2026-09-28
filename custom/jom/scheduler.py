@@ -47,13 +47,13 @@ def _body_components(variables):
 
 def _template_vars(workspace_id, phone, status, stage):
     """Variables for a follow-up template: {{1}} name, {{2}} destination, {{3}} tip."""
-    from . import memory
+    from . import memory, settings
     card = memory.get_card(workspace_id, phone)
     variables = {
         "1": card.get("customer_name") or "there",
         "2": card.get("destination") or "your trip",
     }
-    _, uses_tip = cfg.followup_template(status, stage)
+    _, uses_tip = settings.template_for(workspace_id, status, stage)
     if uses_tip:
         try:
             variables["3"] = cfg.DORMANT_MESSAGES[int(stage)]
@@ -76,7 +76,8 @@ def _make_drip_send_fn(workspace_id, svc):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[jom] free-text follow-up failed %s: %s", phone, exc)
                 return
-        tpl_name, _uses_tip = cfg.followup_template(status, stage)
+        from . import settings
+        tpl_name, _uses_tip = settings.template_for(ws, status, stage)
         variables = _template_vars(ws, phone, status, stage)
         try:
             svc.send_template(

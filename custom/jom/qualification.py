@@ -163,7 +163,8 @@ def qualify_and_route(workspace_id, customer_phone, message_text, flow_completed
         # only as a soft flag once we pass the qualify window, so callers/UI can see
         # "5-6 turns, still no buyer signal" without cutting off an engaged customer.
         turns = episode_turns(workspace_id, customer_phone)
-        stalled = turns >= cfg.QUALIFY_MAX_TURNS
+        from . import settings
+        stalled = turns >= settings.qualify_max_turns(workspace_id)
         if stalled:
             logger.info("[jom] %s still unqualified after %s turns — AI keeps nurturing (soft stall)",
                         customer_phone, turns)

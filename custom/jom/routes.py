@@ -297,6 +297,150 @@ def set_lead_status(user, customer_phone):
 
 
 # --------------------------------------------------------------------------- #
+# Settings — owner-editable cadence / qualify threshold / template mapping.
+# GET returns the merged live view (defaults + overrides) plus the workspace's
+# Meta-approved templates so the UI can offer them in dropdowns. PATCH upserts.
+# --------------------------------------------------------------------------- #
+def _approved_templates(wsid):
+    """Best-effort list of the workspace's approved WhatsApp template names, for the
+    template-picker dropdowns. Fail-safe: returns [] if the account/table isn't there."""
+    try:
+        from whatsapp.models import WhatsAppAccount, WhatsAppTemplate  # type: ignore
+        acc = WhatsAppAccount.query.filter_by(workspace_id=str(wsid)).first()
+        if not acc:
+            return []
+        q = WhatsAppTemplate.query.filter_by(account_id=acc.id)
+        names = []
+        for t in q.all():
+            if getattr(t, "is_archived", False):
+                continue
+            status = (getattr(t, "meta_status", None) or getattr(t, "status", "") or "").upper()
+            if status in ("", "APPROVED"):
+                nm = getattr(t, "name", None)
+                if nm:
+                    names.append(nm)
+        return sorted(set(names))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[jom] approved-template lookup unavailable: %s", exc)
+        return []
+
+
+@jom_bp.get("/settings")
+@require_owner_user
+def get_settings_route(user):
+    err = _guard(user, _wsid())
+    if err:
+        return err
+    wsid = int(_wsid())
+    from . import settings as jom_settings
+    data = jom_settings.get_settings(wsid)
+    return jsonify({
+        "success": True,
+        "settings": data,
+        "template_keys": list(jom_settings.DEFAULT_TEMPLATES.keys()),
+        "approved_templates": _approved_templates(wsid),
+    })
+
+
+@jom_bp.patch("/settings")
+@require_owner_user
+def patch_settings_route(user):
+    body = request.get_json(silent=True) or {}
+    err = _guard(user, body.get("workspace_id"))
+    if err:
+        return err
+    wsid = int(body["workspace_id"])
+    from . import settings as jom_settings
+
+    def _days(val):
+        if val is None:
+            return None
+        if not isinstance(val, list) or not val:
+            raise ValueError("cadence must be a non-empty list of day offsets")
+        out = sorted({int(x) for x in val if int(x) >= 0})
+        if not out:
+            raise ValueError("cadence must contain at least one day offset")
+        return out
+
+    try:
+        ghosted = _days(body.get("ghosted_days"))
+        dormant = _days(body.get("dormant_days"))
+        qmt = body.get("qualify_max_turns")
+        if qmt is not None:
+            qmt = int(qmt)
+            if qmt < 1 or qmt > 50:
+                raise ValueError("qualify_max_turns must be between 1 and 50")
+        templates = body.get("templates")
+        if templates is not None and not isinstance(templates, dict):
+            raise ValueError("templates must be an object")
+    except (TypeError, ValueError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+    data = jom_settings.save(
+        wsid, ghosted_days=ghosted, dormant_days=dormant,
+        qualify_max_turns=qmt, templates=templates,
+    )
+    logger.info("[jom] settings updated for ws %s by user %s", wsid, getattr(user, "id", None))
+    return jsonify({"success": True, "settings": data})
+
+
+# --------------------------------------------------------------------------- #
+# Google Sheet lead intake — paste a share link, we poll it and import new leads
+# (firing the opening template). GET returns config + health; POST saves; the
+# /sync endpoint runs it on demand and returns the result immediately.
+# --------------------------------------------------------------------------- #
+@jom_bp.get("/sheet")
+@require_owner_user
+def get_sheet(user):
+    err = _guard(user, _wsid())
+    if err:
+        return err
+    from . import sheet as jom_sheet
+    return jsonify({"success": True, "config": jom_sheet.config_json(int(_wsid()))})
+
+
+@jom_bp.post("/sheet")
+@require_owner_user
+def save_sheet(user):
+    body = request.get_json(silent=True) or {}
+    err = _guard(user, body.get("workspace_id"))
+    if err:
+        return err
+    wsid = int(body["workspace_id"])
+    from . import sheet as jom_sheet
+    sheet_url = body.get("sheet_url")
+    if sheet_url:
+        # validate it looks like a Google Sheet before saving, so the health badge
+        # isn't the first place the owner learns the link is wrong.
+        if jom_sheet.csv_export_url(sheet_url) is None:
+            return jsonify({"success": False, "error": "Not a valid Google Sheets link."}), 400
+    cfg_json = jom_sheet.save_config(
+        wsid,
+        sheet_url=sheet_url,
+        enabled=body.get("enabled"),
+        header_map=body.get("header_map"),
+    )
+    logger.info("[jom] sheet config saved for ws %s by user %s", wsid, getattr(user, "id", None))
+    return jsonify({"success": True, "config": cfg_json})
+
+
+@jom_bp.post("/sheet/sync")
+@require_owner_user
+def sync_sheet(user):
+    body = request.get_json(silent=True) or {}
+    err = _guard(user, body.get("workspace_id"))
+    if err:
+        return err
+    wsid = int(body["workspace_id"])
+    from . import sheet as jom_sheet
+    # A manual sync can optionally skip messaging (dry preview of what would import).
+    send_opening = body.get("send_opening", True)
+    result = jom_sheet.sync_workspace(wsid, send_opening=bool(send_opening))
+    status = 200 if result.get("success") else 400
+    return jsonify({**result, "config": jom_sheet.config_json(wsid)}), status
+
+
+# --------------------------------------------------------------------------- #
 # Lead tracker (read-only) — lifecycle rows joined with department + agent names
 # --------------------------------------------------------------------------- #
 @jom_bp.get("/leads")

@@ -72,6 +72,15 @@ def scheduler_tick():
         logger.warning("JOM tick during scheduler sweep: %s", e)
         results["jom_error"] = str(e)
 
+    # 3a-ii. JOM Google Sheet lead intake (gated) — import new pre-collected leads
+    # and fire the opening template. Idempotent per phone.
+    try:
+        from custom.jom.sheet import run_jom_sheet_syncs
+        results["jom_sheet"] = run_jom_sheet_syncs()
+    except Exception as e:
+        logger.warning("JOM sheet sync during scheduler sweep: %s", e)
+        results["jom_sheet_error"] = str(e)
+
     # 3b. Usage/billing events (replaces always-on whatsapp-usage-consumer)
     try:
         from monolith_integration.usage_consumer import poll_usage_events_for_scheduler
