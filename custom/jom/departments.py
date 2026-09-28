@@ -143,9 +143,23 @@ def match_department(workspace_id, text):
 
 
 def pick_agent_round_robin(department):
-    """Return the next active agent_id in this department after last_agent_id (strict
-    rotation). Returns None if the department has no agents. Advances the pointer."""
-    agent_ids = sorted(list_agent_ids(department.id))
+    """Return the next ACTIVE agent_id in this department after last_agent_id (strict
+    rotation). Inactive/deleted agents are skipped so a lead never routes to someone
+    who can't answer. Returns None if the department has no active agents. Advances
+    the pointer."""
+    all_ids = list_agent_ids(department.id)
+    agent_ids = sorted(all_ids)
+    if agent_ids:
+        try:
+            from agent_auth.models import WorkspaceAgent
+            active = {
+                a.id for a in WorkspaceAgent.query.filter(
+                    WorkspaceAgent.id.in_(agent_ids), WorkspaceAgent.is_active.is_(True)
+                ).all()
+            }
+            agent_ids = [i for i in agent_ids if i in active]
+        except Exception:  # noqa: BLE001
+            pass
     if not agent_ids:
         return None
     last = department.last_agent_id
