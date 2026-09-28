@@ -81,6 +81,14 @@ def scheduler_tick():
         logger.warning("JOM sheet sync during scheduler sweep: %s", e)
         results["jom_sheet_error"] = str(e)
 
+    # 3a-iii. JOM agent-scheduled one-off follow-ups (gated) — fire any due, claim-once.
+    try:
+        from custom.jom.scheduled import run_jom_scheduled_sends
+        results["jom_scheduled"] = run_jom_scheduled_sends()
+    except Exception as e:
+        logger.warning("JOM scheduled sends during scheduler sweep: %s", e)
+        results["jom_scheduled_error"] = str(e)
+
     # 3b. Usage/billing events (replaces always-on whatsapp-usage-consumer)
     try:
         from monolith_integration.usage_consumer import poll_usage_events_for_scheduler

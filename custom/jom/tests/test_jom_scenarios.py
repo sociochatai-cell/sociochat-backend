@@ -346,6 +346,62 @@ def scenario_capi_feedback_loop(env):
     return s
 
 
+def scenario_agent_scheduled_followup(env):
+    """NEW feature — an agent schedules a one-off template for a future date/time;
+    the tick fires it once; a reply returns the lead to the SAME agent; cancel stops
+    a pending one; and if the sticky agent is gone the reply falls back within the
+    department."""
+    from custom.jom import scheduled, config as cfg, departments as Dsvc
+    from custom.jom.models import JomLifecycleState, JomScheduledMessage
+    from models import db
+    from datetime import timedelta
+    D, agents = env["dept"], env["agents"]
+    s = Step("Agent-scheduled follow-up — schedule → fire once → reply re-assigns → cancel → fallback")
+
+    # --- schedule + fire ------------------------------------------------- #
+    p = "919900000085"
+    _seed(p, status=cfg.STATUS_ASSIGNED, agent_id=agents[0])
+    row, err = scheduled.create(WS, p, cfg.TPL_OPENING, _now() + timedelta(days=40),
+                                variables={"1": "Asha", "2": "November Bali"},
+                                created_by_kind="agent", created_by_id=agents[0])
+    s.ok("schedule created (pending, agent snapshot)",
+         err is None and row and row["status"] == "pending" and row["assigned_agent_id"] == agents[0],
+         "pending", (err, row))
+    s.ok("past datetime is rejected",
+         scheduled.create(WS, p, cfg.TPL_OPENING, _now() - timedelta(days=1))[1] is not None,
+         "error", "")
+    fired = []
+    # not due yet
+    r0 = scheduled.run_due(WS, now=_now(), send_fn=lambda ph, tpl, v: fired.append((ph, tpl)))
+    s.ok("not fired before its time", r0["scheduled_sent"] == 0, "0", r0)
+    # due now
+    r1 = scheduled.run_due(WS, now=_now() + timedelta(days=41), send_fn=lambda ph, tpl, v: fired.append((ph, tpl)))
+    s.ok("fires exactly once when due", r1["scheduled_sent"] == 1 and len(fired) == 1, "1 send", (r1, fired))
+    again = scheduled.run_due(WS, now=_now() + timedelta(days=42), send_fn=lambda ph, tpl, v: fired.append((ph, tpl)))
+    s.ok("never double-sends (claim-once)", again["scheduled_sent"] == 0, "0", again)
+
+    # --- cancel a pending one -------------------------------------------- #
+    row2, _ = scheduled.create(WS, p, cfg.TPL_OPENING, _now() + timedelta(days=50))
+    _, cerr = scheduled.cancel(WS, row2["id"])
+    s.ok("pending schedule can be cancelled", cerr is None, "cancelled", cerr)
+    r2 = scheduled.run_due(WS, now=_now() + timedelta(days=51), send_fn=lambda ph, tpl, v: fired.append((ph, tpl)))
+    s.ok("cancelled schedule never fires", r2["scheduled_sent"] == 0, "0", r2)
+
+    # --- reply after send returns to the SAME agent ---------------------- #
+    resolved = Dsvc.resolve_agent_with_fallback(WS, p)
+    s.ok("reply returns to the SAME (valid) agent", resolved == agents[0], agents[0], resolved)
+
+    # --- fallback: sticky agent gone → another agent in the department --- #
+    pf = "919900000086"
+    _seed(pf, status=cfg.STATUS_ASSIGNED, agent_id=999999)   # non-existent agent
+    row3 = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=pf).first()
+    row3.department_id = D.id
+    db.session.commit()
+    resolved2 = Dsvc.resolve_agent_with_fallback(WS, pf)
+    s.ok("gone agent → falls back within the department", resolved2 in agents, f"in {agents}", resolved2)
+    return s
+
+
 def scenario_reopen_fresh(env):
     from custom.jom import extras, qualification, memory
     from custom.jom.models import JomLifecycleState
@@ -388,11 +444,14 @@ def run():
         from custom.jom import departments as Dsvc
         from custom.jom.models import JomLifecycleState, JomBehaviorScore, JomDepartment, JomDepartmentAgent
 
+        from custom.jom.models import JomScheduledMessage
+
         def cleanup():
             for p in ALL_PHONES:
                 JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).delete()
                 JomBehaviorScore.query.filter_by(workspace_id=WS, customer_phone=p).delete()
                 AgentNumberAssignment.query.filter_by(workspace_id=WS, customer_phone=p).delete()
+                JomScheduledMessage.query.filter_by(workspace_id=WS, customer_phone=p).delete()
             for d in JomDepartment.query.filter_by(workspace_id=WS).filter(JomDepartment.name.like("SIM_%")).all():
                 JomDepartmentAgent.query.filter_by(department_id=d.id).delete()
                 db.session.delete(d)
@@ -415,7 +474,7 @@ def run():
             scenario_reengage_after_close, scenario_destination_change,
             scenario_not_interested_immediately, scenario_qualify_soft_stall,
             scenario_window_continue, scenario_junk_filter, scenario_reopen_fresh,
-            scenario_capi_feedback_loop,
+            scenario_capi_feedback_loop, scenario_agent_scheduled_followup,
         ]
 
         print("\n" + "=" * 70)

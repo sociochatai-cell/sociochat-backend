@@ -100,7 +100,11 @@ def on_inbound_message(workspace_id, customer_phone, message_text, meta=None, fl
         if re.get("reengaged"):
             # Count the message + capture intent, but do NOT re-route: the agent is sticky.
             qualification.record_inbound(workspace_id, customer_phone)
-            return {"action": "reengaged", **re}
+            # Return to the SAME agent, with department/general fallback if they're gone.
+            # (Covers a reply landing after an agent-scheduled follow-up, too.)
+            from . import departments as _dept
+            resolved = _dept.resolve_agent_with_fallback(workspace_id, customer_phone)
+            return {"action": "reengaged", **re, "agent_id": resolved}
 
         # 2) otherwise qualify + route
         out = qualification.qualify_and_route(workspace_id, customer_phone, text, flow_completed)
