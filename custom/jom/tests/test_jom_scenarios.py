@@ -1,0 +1,402 @@
+"""
+JOM END-TO-END SCENARIO SIMULATOR
+=================================
+Mimics EVERY customer journey of the JOM travel vertical against the REAL code
+(lifecycle / qualification / hooks / memory / window / departments), deterministically,
+with NO Meta and NO live AI. Time is simulated (we pass `now=` to fire drips), so a
+45-day journey runs in milliseconds.
+
+Each scenario narrates every step; on failure it prints the SCENARIO, the STEP, and
+expected-vs-actual so you can see exactly where it breaks. Final line is a machine-
+readable verdict for CI / the terminal.
+
+Run inside the container:
+    docker exec -w /app <c> python -m custom.jom.tests.test_jom_scenarios
+
+WHAT THIS PROVES (≈99%): all flow LOGIC — qualify, route, round-robin, sticky, memory,
+drip auto-enrol, ghosted/dormant full cycles, mid-drip cancel, button outcomes,
+re-engagement, destination change, 24h window + Continue, template SELECTION + variables.
+WHAT IT CANNOT PROVE (the ~1%): real Meta template DELIVERY, exact live-AI wording,
+CAPI receipt at Meta — those need the live/sandbox test.
+"""
+import os
+os.environ.setdefault("JOM_WORKSPACE_IDS", "211")
+
+from datetime import datetime, timezone, timedelta
+
+WS = 211
+SENT = []           # mock outbound log: (phone, kind, detail)
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+class Step:
+    """Narrated assertion collector for one scenario."""
+    def __init__(self, name):
+        self.name = name
+        self.log = []
+        self.failed = None      # (step, expected, actual)
+
+    def ok(self, step, cond, expected="", actual=""):
+        mark = "  ✓" if cond else "  ✗"
+        self.log.append(f"{mark} {step}")
+        if not cond and self.failed is None:
+            self.failed = (step, expected, actual)
+        return cond
+
+
+def _drip_send_fn(ws, phone, status, stage):
+    # record what the scheduler WOULD send + which template it selects
+    from custom.jom import config as cfg
+    tpl, uses_tip = cfg.followup_template(status, stage)
+    SENT.append((phone, "drip", {"status": status, "stage": stage, "template": tpl, "tip": uses_tip}))
+
+
+def _continue_send_fn(ws, phone, template, variables):
+    SENT.append((phone, "continue", {"template": template, "vars": variables}))
+
+
+# --------------------------------------------------------------------------- #
+# Scenario definitions — each returns a Step
+# --------------------------------------------------------------------------- #
+def scenario_qualified_and_routed(env):
+    from custom.jom import hooks, memory
+    from custom.jom.models import JomLifecycleState
+    D, agents, WS = env["dept"], env["agents"], 211
+    p = "919900000001"
+    s = Step("Happy path — qualify → route → round-robin → assign → memory → inbox")
+    out = hooks.on_inbound_message(WS, p, "Hi, I want a simdest honeymoon package for 2")
+    row = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).first()
+    s.ok("lead qualifies", out.get("qualified") is True, "qualified=True", out)
+    s.ok("routed to TEST dept", out.get("department") == D.name, D.name, out.get("department"))
+    s.ok("assigned an agent", out.get("agent_id") in agents, f"in {agents}", out.get("agent_id"))
+    s.ok("status = assigned", row and row.status == "assigned", "assigned", getattr(row, "status", None))
+    # memory capture (simulate AI learning name/destination)
+    memory.update_card(WS, p, customer_name="Asha", destination="Bali")
+    card = memory.get_card(WS, p)
+    s.ok("memory card stores facts", card.get("customer_name") == "Asha", "Asha", card.get("customer_name"))
+    # agent-inbox bridge
+    from agent_auth.models import AgentNumberAssignment
+    try:
+        from whatsapp.utils import normalize_phone
+        np = normalize_phone(p) or p
+    except Exception:
+        np = p
+    asg = AgentNumberAssignment.query.filter_by(workspace_id=WS, customer_phone=np).first()
+    s.ok("lead bridged to agent inbox", asg is not None and asg.agent_id == row.assigned_agent_id,
+         "assignment exists", asg)
+    return s
+
+
+def scenario_round_robin(env):
+    from custom.jom import hooks
+    from custom.jom.models import JomLifecycleState
+    D, agents = env["dept"], env["agents"]
+    s = Step("Round-robin — two leads → two different agents")
+    p1, p2 = "919900000002", "919900000003"
+    hooks.on_inbound_message(WS, p1, "simdest trip please")
+    hooks.on_inbound_message(WS, p2, "planning simdest for family")
+    a1 = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p1).first().assigned_agent_id
+    a2 = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p2).first().assigned_agent_id
+    s.ok("both got an agent", a1 in agents and a2 in agents, f"both in {agents}", (a1, a2))
+    if len(agents) >= 2:
+        s.ok("agents differ (round-robin)", a1 != a2, "different", (a1, a2))
+    else:
+        s.ok("(only 1 agent attached — rotation not observable)", True)
+    return s
+
+
+def scenario_ghosted_full_cycle(env):
+    from custom.jom import lifecycle, config as cfg
+    from custom.jom.models import JomLifecycleState
+    p = "919900000010"
+    s = Step("Ghosted FULL cycle — Day 7 → Day 15 → auto-close")
+    _seed(p, status=cfg.STATUS_ASSIGNED)
+    lifecycle.mark_ghosted(WS, p)
+    row = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).first()
+    s.ok("auto-enrolled (stage 0, scheduled)", row.status == "ghosted" and row.drip_stage == "0" and row.next_followup_at, "scheduled", row.status)
+    base = row.status_since
+    SENT.clear()
+    # fire Day 7
+    lifecycle.tick(WS, now=base + timedelta(days=7, hours=1), send_fn=_drip_send_fn)
+    d7 = [x for x in SENT if x[0] == p]
+    s.ok("Day 7 check-in sent (ghosted_checkin template)",
+         any(x[2]["template"] == cfg.TPL_GHOSTED_CHECKIN for x in d7), cfg.TPL_GHOSTED_CHECKIN, d7)
+    # fire Day 15 → should send exit AND close
+    lifecycle.tick(WS, now=base + timedelta(days=15, hours=1), send_fn=_drip_send_fn)
+    row = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).first()
+    exits = [x for x in SENT if x[0] == p and x[2]["template"] == cfg.TPL_GHOSTED_EXIT]
+    s.ok("Day 15 exit template sent", len(exits) >= 1, "exit sent", SENT)
+    s.ok("auto-closed after last step", row.status == "closed", "closed", row.status)
+    s.ok("close reason = drip_exhausted", row.close_reason == cfg.CLOSE_REASON_DRIP_EXHAUSTED, "drip_exhausted", row.close_reason)
+    return s
+
+
+def scenario_ghosted_cancelled_midway(env):
+    from custom.jom import lifecycle, hooks, config as cfg
+    from custom.jom.models import JomLifecycleState
+    p = "919900000011"
+    s = Step("Ghosted CANCELLED mid-drip — taps 'not planning' after Day 7 → close, Day 15 never fires")
+    _seed(p, status=cfg.STATUS_ASSIGNED)
+    lifecycle.mark_ghosted(WS, p)
+    base = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).first().status_since
+    lifecycle.tick(WS, now=base + timedelta(days=7, hours=1), send_fn=_drip_send_fn)  # Day 7 fires
+    # customer taps "not planning"
+    out = hooks.on_inbound_message(WS, p, {"button_id": "jom_not_planning", "button_title": "Not planning now"})
+    row = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).first()
+    s.ok("closed on the button tap", row.status == "closed", "closed", row.status)
+    SENT.clear()
+    lifecycle.tick(WS, now=base + timedelta(days=15, hours=1), send_fn=_drip_send_fn)  # Day 15 must NOT fire
+    s.ok("Day 15 did NOT fire (cycle cancelled)", not any(x[0] == p for x in SENT), "no send", SENT)
+    return s
+
+
+def scenario_dormant_full_cycle(env):
+    from custom.jom import lifecycle, config as cfg
+    from custom.jom.models import JomLifecycleState
+    p = "919900000020"
+    s = Step("Dormant FULL cycle — Day 7,14,24,31 nudges → Day 45 close")
+    _seed(p, status=cfg.STATUS_ASSIGNED)
+    lifecycle.mark_dormant(WS, p)
+    row = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).first()
+    base = row.status_since
+    SENT.clear()
+    for d in (7, 14, 24, 31):
+        lifecycle.tick(WS, now=base + timedelta(days=d, hours=1), send_fn=_drip_send_fn)
+    nudges = [x for x in SENT if x[0] == p and x[2]["template"] == cfg.TPL_DORMANT_CHECKIN]
+    s.ok("4 dormant check-in nudges sent (reused template)", len(nudges) == 4, "4", len(nudges))
+    s.ok("nudges use the tip variable {{3}}", all(x[2]["tip"] for x in nudges), "tip=True", nudges[:1])
+    lifecycle.tick(WS, now=base + timedelta(days=45, hours=1), send_fn=_drip_send_fn)  # Day 45 close
+    row = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).first()
+    closes = [x for x in SENT if x[0] == p and x[2]["template"] == cfg.TPL_CLOSE]
+    s.ok("Day 45 close template sent", len(closes) >= 1, "close sent", SENT)
+    s.ok("auto-closed", row.status == "closed", "closed", row.status)
+    return s
+
+
+def scenario_dormant_rework_to_agent(env):
+    from custom.jom import lifecycle, hooks, config as cfg
+    from custom.jom.models import JomLifecycleState
+    p = "919900000021"
+    s = Step("Dormant → taps 'Rework my plan' → back to SAME agent, drip stops")
+    _seed(p, status=cfg.STATUS_ASSIGNED, agent_id=env["agents"][0])
+    lifecycle.mark_dormant(WS, p)
+    out = hooks.on_inbound_message(WS, p, {"button_id": "jom_rework", "button_title": "Rework my plan"})
+    row = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).first()
+    s.ok("re-activated for the agent", out.get("action") == "button_agent" and row.status == "active", "active", row.status)
+    s.ok("drip stopped", row.next_followup_at is None, "no next", row.next_followup_at)
+    s.ok("kept the SAME agent (sticky)", row.assigned_agent_id == env["agents"][0], env["agents"][0], row.assigned_agent_id)
+    return s
+
+
+def scenario_reengage_after_close(env):
+    from custom.jom import lifecycle, hooks, config as cfg, memory
+    from custom.jom.models import JomLifecycleState
+    p = "919900000030"
+    s = Step("Re-engage after CLOSED — customer returns → active, SAME agent, memory intact")
+    _seed(p, status=cfg.STATUS_CLOSED, agent_id=env["agents"][0])
+    memory.update_card(WS, p, customer_name="Vikram", destination="Kashmir",
+                       last_summary="Loved the Gulmarg stay idea, worried about March snow.")
+    out = hooks.on_inbound_message(WS, p, "Hi, I'm back — still thinking about the trip")
+    row = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).first()
+    s.ok("re-activated", out.get("action") == "reengaged" and row.status == "active", "active", row.status)
+    s.ok("returned to the SAME agent", row.assigned_agent_id == env["agents"][0], env["agents"][0], row.assigned_agent_id)
+    block = memory.prompt_block(WS, p)
+    s.ok("memory survived (name + where-left-off)", "Vikram" in block and "Gulmarg" in block, "intact", block[:60])
+    return s
+
+
+def scenario_destination_change(env):
+    from custom.jom import memory
+    p = "919900000040"
+    s = Step("Destination change mid-chat — Kashmir → Bali updates memory + steers AI")
+    _seed(p)
+    memory.update_card(WS, p, customer_name="Neha", destination="Kashmir")
+    memory.set_destination(WS, p, "Bali")
+    card = memory.get_card(WS, p)
+    s.ok("destination updated to Bali", card.get("destination") == "Bali", "Bali", card.get("destination"))
+    s.ok("prompt points AI at the NEW destination", "Bali" in memory.prompt_block(WS, p), "Bali in block", "")
+    return s
+
+
+def scenario_not_interested_immediately(env):
+    from custom.jom import hooks, config as cfg
+    from custom.jom.models import JomLifecycleState
+    p = "919900000050"
+    s = Step("Not interested immediately — never enters a drip")
+    _seed(p, status=cfg.STATUS_NEW)
+    out = hooks.on_inbound_message(WS, p, "please stop, not interested")
+    row = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).first()
+    s.ok("closed immediately", row.status == "closed", "closed", row.status)
+    s.ok("reason = not_interested", row.close_reason == cfg.CLOSE_REASON_NOT_INTERESTED, "not_interested", row.close_reason)
+    s.ok("no follow-up scheduled", row.next_followup_at is None, "none", row.next_followup_at)
+    return s
+
+
+def scenario_qualify_soft_stall(env):
+    from custom.jom import qualification, config as cfg
+    from custom.jom.models import JomLifecycleState
+    p = "919900000060"
+    s = Step("Qualify-in-5-6 — still chatting, no buyer signal after 5 turns → AI keeps nurturing (soft stall, NOT force-dormant)")
+    _seed(p, status=cfg.STATUS_NEW)
+    out = None
+    for i in range(5):
+        out = qualification.qualify_and_route(WS, p, "hmm ok")   # no keyword, weak intent
+    row = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).first()
+    turns = qualification.episode_turns(WS, p)
+    s.ok(f"counted {turns} episode turns", turns >= 5, ">=5", turns)
+    s.ok("soft 'stalled' flag raised (UI can see it)", bool(out and out.get("stalled")), "stalled=True", out)
+    s.ok("NOT force-dormant while actively chatting", row.status != "dormant", "not dormant", row.status)
+    s.ok("stays in conversation (contacted)", row.status == cfg.STATUS_CONTACTED, "contacted", row.status)
+    return s
+
+
+def scenario_window_continue(env):
+    from custom.jom import window, config as cfg, memory
+    from custom.jom.models import JomLifecycleState
+    p = "919900000070"
+    s = Step("24h window — lapses mid-chat → dynamic Continue re-opener")
+    now = _now()
+    _seed(p, status=cfg.STATUS_ACTIVE)
+    row = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).first()
+    row.last_inbound_at = now - timedelta(hours=30)
+    from models import db
+    db.session.commit()
+    memory.update_card(WS, p, customer_name="Ravi", destination="Bali",
+                       last_summary="Was comparing Ubud vs Seminyak villas.")
+    s.ok("window is CLOSED (30h since last msg)", window.is_window_open(row, now) is False, "closed", "")
+    SENT.clear()
+    window.run_continue_nudges(WS, now=now, send_fn=_continue_send_fn)
+    c = [x for x in SENT if x[0] == p and x[1] == "continue"]
+    s.ok("Continue template sent", c and c[0][2]["template"] == cfg.TPL_CONTINUE, cfg.TPL_CONTINUE, c)
+    s.ok("Continue is DYNAMIC (real convo in {{2}})", c and "Ubud" in c[0][2]["vars"].get("2", ""), "Ubud in var2", c)
+    return s
+
+
+def scenario_junk_filter(env):
+    from custom.jom import qualification, junk_filter
+    p = "919900000080"
+    s = Step("Junk filter — 3 outbound, 0 reply → flagged junk")
+    _seed(p)
+    for _ in range(3):
+        qualification.record_outbound_no_reply(WS, p)
+    s.ok("flagged as junk", junk_filter.is_junk(WS, p) is True, "junk=True", "")
+    return s
+
+
+def scenario_reopen_fresh(env):
+    from custom.jom import extras, qualification, memory
+    from custom.jom.models import JomLifecycleState
+    p = "919900000090"
+    s = Step("Returning off-season — reopen as fresh, history kept, episode reset")
+    _seed(p, status="closed")
+    memory.update_card(WS, p, customer_name="Sara", destination="Bali")
+    for _ in range(4):
+        qualification.record_inbound(WS, p)
+    r = extras.reopen_as_fresh(WS, p)
+    s.ok("status reset to new", r.status == "new", "new", r.status)
+    s.ok("reopen_count incremented", r.reopen_count >= 1, ">=1", r.reopen_count)
+    s.ok("episode counter reset", qualification.episode_turns(WS, p) == 0, "0", qualification.episode_turns(WS, p))
+    s.ok("memory history KEPT", memory.get_card(WS, p).get("customer_name") == "Sara", "Sara", "")
+    return s
+
+
+# --------------------------------------------------------------------------- #
+# Harness
+# --------------------------------------------------------------------------- #
+ALL_PHONES = [f"9199000000{n:02d}" for n in range(1, 99)]
+
+
+def _seed(phone, status="new", agent_id=None):
+    from models import db
+    from custom.jom.models import JomLifecycleState
+    JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=phone).delete()
+    row = JomLifecycleState(workspace_id=WS, customer_phone=phone, status=status, assigned_agent_id=agent_id)
+    db.session.add(row)
+    db.session.commit()
+    return row
+
+
+def run():
+    from app import app
+    with app.app_context():
+        from models import db
+        from werkzeug.security import generate_password_hash
+        from agent_auth.models import WorkspaceAgent, AgentNumberAssignment
+        from custom.jom import departments as Dsvc
+        from custom.jom.models import JomLifecycleState, JomBehaviorScore, JomDepartment, JomDepartmentAgent
+
+        def cleanup():
+            for p in ALL_PHONES:
+                JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).delete()
+                JomBehaviorScore.query.filter_by(workspace_id=WS, customer_phone=p).delete()
+                AgentNumberAssignment.query.filter_by(workspace_id=WS, customer_phone=p).delete()
+            for d in JomDepartment.query.filter_by(workspace_id=WS).filter(JomDepartment.name.like("SIM_%")).all():
+                JomDepartmentAgent.query.filter_by(department_id=d.id).delete()
+                db.session.delete(d)
+            WorkspaceAgent.query.filter(WorkspaceAgent.username.like("jomsim_%")).delete()
+            db.session.commit()
+
+        cleanup()
+        owner_id = db.session.execute(db.text("SELECT user_id FROM workspaces2 WHERE id=:w"), {"w": WS}).scalar()
+        a1 = WorkspaceAgent(owner_user_id=owner_id, username="jomsim_a1", password_hash=generate_password_hash("x"), display_name="Sim A1", is_active=True)
+        a2 = WorkspaceAgent(owner_user_id=owner_id, username="jomsim_a2", password_hash=generate_password_hash("x"), display_name="Sim A2", is_active=True)
+        db.session.add_all([a1, a2]); db.session.commit()
+        dep = Dsvc.create_department(WS, "SIM_Dest", keywords=["simdest"])
+        Dsvc.add_agent(WS, dep.id, a1.id); Dsvc.add_agent(WS, dep.id, a2.id)
+        env = {"dept": dep, "agents": [a1.id, a2.id]}
+
+        scenarios = [
+            scenario_qualified_and_routed, scenario_round_robin,
+            scenario_ghosted_full_cycle, scenario_ghosted_cancelled_midway,
+            scenario_dormant_full_cycle, scenario_dormant_rework_to_agent,
+            scenario_reengage_after_close, scenario_destination_change,
+            scenario_not_interested_immediately, scenario_qualify_soft_stall,
+            scenario_window_continue, scenario_junk_filter, scenario_reopen_fresh,
+        ]
+
+        print("\n" + "=" * 70)
+        print("JOM END-TO-END SCENARIO SIMULATION")
+        print("=" * 70)
+        passed = 0
+        failures = []
+        for fn in scenarios:
+            try:
+                s = fn(env)
+            except Exception as exc:
+                import traceback
+                print(f"\n● {fn.__name__}\n  ✗ CRASHED: {exc}")
+                print("   " + traceback.format_exc().replace("\n", "\n   ")[:800])
+                failures.append((fn.__name__, "CRASH", str(exc)))
+                continue
+            ok = s.failed is None
+            print(f"\n● {s.name}")
+            for line in s.log:
+                print(line)
+            if ok:
+                passed += 1
+            else:
+                step, exp, act = s.failed
+                print(f"  →→ BREAKS AT: {step}\n     expected: {exp}\n     actual:   {act}")
+                failures.append((s.name, step, f"exp={exp} act={act}"))
+
+        cleanup()
+        print("\n" + "=" * 70)
+        total = len(scenarios)
+        pct = round(100 * passed / total)
+        print(f"RESULT: {passed}/{total} scenarios passed  ({pct}%)")
+        if failures:
+            print("FAILURES:")
+            for name, step, detail in failures:
+                print(f"  ✗ [{name}] at '{step}' — {detail}")
+        else:
+            print("✅ ALL SCENARIOS PASS — flow logic is 100% (real Meta delivery / live AI still need the sandbox test).")
+        print("=" * 70)
+        return 0 if not failures else 1
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(run())

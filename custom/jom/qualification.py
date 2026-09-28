@@ -156,30 +156,25 @@ def qualify_and_route(workspace_id, customer_phone, message_text, flow_completed
 
     is_qualified, signals = evaluate(workspace_id, customer_phone, message_text, flow_completed)
     if not is_qualified:
-        # Engagement verdict: if we've had QUALIFY_MAX_TURNS customer messages in this
-        # episode with no buyer signal AND they're barely engaging, stop interrogating
-        # and let them cool off in the Dormant nurture track instead.
+        # NOT qualified YET, but the customer is actively replying — so we KEEP the warm
+        # AI conversation going (status = contacted/active). We do NOT force them into a
+        # Dormant drip while they're still chatting; Dormant/Ghosted come from SILENCE
+        # (no reply) and CLOSE comes from explicit disinterest. `stalled` is surfaced
+        # only as a soft flag once we pass the qualify window, so callers/UI can see
+        # "5-6 turns, still no buyer signal" without cutting off an engaged customer.
         turns = episode_turns(workspace_id, customer_phone)
-        score = 0
-        _s = JomBehaviorScore.query.filter_by(
-            workspace_id=int(workspace_id), customer_phone=str(customer_phone)).first()
-        if _s:
-            score = int(_s.engagement_score or 0)
-        if turns >= cfg.QUALIFY_MAX_TURNS and score <= cfg.STALL_ENGAGEMENT_MAX:
-            from . import lifecycle
-            lifecycle.mark_dormant(workspace_id, customer_phone)
-            logger.info("[jom] %s → dormant (no buyer signal after %s turns, engagement=%s)",
-                        customer_phone, turns, score)
-            return {"qualified": False, "stalled": True, "turns": turns,
-                    "signals": signals, "department": None, "agent_id": None}
-        # keep/refresh status as contacted (they replied) without assigning
+        stalled = turns >= cfg.QUALIFY_MAX_TURNS
+        if stalled:
+            logger.info("[jom] %s still unqualified after %s turns — AI keeps nurturing (soft stall)",
+                        customer_phone, turns)
         row = JomLifecycleState.query.filter_by(
             workspace_id=int(workspace_id), customer_phone=str(customer_phone)).first()
         if row and row.status == cfg.STATUS_NEW:
             row.status = cfg.STATUS_CONTACTED
             row.updated_at = _now()
             db.session.commit()
-        return {"qualified": False, "signals": signals, "department": None, "agent_id": None}
+        return {"qualified": False, "stalled": stalled, "turns": turns,
+                "signals": signals, "department": None, "agent_id": None}
 
     dep, agent_id = dept_svc.route_qualified_lead(workspace_id, customer_phone, message_text)
     return {
