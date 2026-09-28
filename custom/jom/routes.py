@@ -441,6 +441,99 @@ def sync_sheet(user):
 
 
 # --------------------------------------------------------------------------- #
+# Agent-scheduled one-off follow-ups. Unlike the admin endpoints above, these are
+# usable by the ASSIGNED AGENT as well as the owner (agents schedule from their
+# inbox). We therefore authenticate manually: an agent token assigned to this JOM
+# workspace, OR the workspace owner. Fired by the existing scheduler tick.
+# --------------------------------------------------------------------------- #
+def _schedule_actor(workspace_id):
+    """(kind, actor_id, None) for an allowed owner/agent, else (None, None, (resp, status))."""
+    try:
+        wsid = int(workspace_id)
+    except (TypeError, ValueError):
+        return None, None, (jsonify({"success": False, "error": "workspace_id (int) required"}), 400)
+    if not is_jom_workspace(wsid):
+        return None, None, (jsonify({"success": False, "error": "not_enabled_for_workspace"}), 403)
+    from auth_core import authenticated_agent_id
+    if authenticated_agent_id() is not None:
+        from agent_auth.security import get_current_agent
+        ag = get_current_agent()
+        if ag and ag.has_workspace(wsid):
+            return "agent", ag.id, None
+        return None, None, (jsonify({"success": False, "error": "forbidden"}), 403)
+    from tenant.context import get_current_user
+    user = get_current_user()
+    if not user:
+        return None, None, (jsonify({"success": False, "error": "authentication_required"}), 401)
+    try:
+        from agent_auth.routes import _owned_workspace_ids
+        if wsid in set(_owned_workspace_ids(user)):
+            return "owner", user.id, None
+    except Exception:  # noqa: BLE001
+        pass
+    return None, None, (jsonify({"success": False, "error": "forbidden"}), 403)
+
+
+@jom_bp.post("/leads/<path:customer_phone>/schedule")
+def create_schedule(customer_phone):
+    body = request.get_json(silent=True) or {}
+    kind, actor_id, err = _schedule_actor(body.get("workspace_id"))
+    if err:
+        return err
+    wsid = int(body["workspace_id"])
+    template_name = (body.get("template_name") or "").strip()
+    variables = body.get("variables") or {}
+    note = (body.get("note") or "").strip() or None
+    when = body.get("scheduled_at")   # ISO-8601 UTC string from the client
+    if not template_name:
+        return jsonify({"success": False, "error": "template_name required"}), 400
+    if template_name not in set(_approved_templates(wsid)) and _approved_templates(wsid):
+        return jsonify({"success": False, "error": "template not approved for this account"}), 400
+    if not when:
+        return jsonify({"success": False, "error": "scheduled_at required"}), 400
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(str(when).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "scheduled_at must be ISO-8601"}), 400
+
+    from . import scheduled as jom_sched
+    row, e = jom_sched.create(
+        wsid, customer_phone, template_name, dt,
+        variables=variables, note=note, created_by_kind=kind, created_by_id=actor_id,
+    )
+    if e:
+        return jsonify({"success": False, "error": e}), 400
+    logger.info("[jom] schedule created for %s by %s#%s", customer_phone, kind, actor_id)
+    return jsonify({"success": True, "schedule": row}), 201
+
+
+@jom_bp.get("/leads/<path:customer_phone>/schedules")
+def list_schedules(customer_phone):
+    kind, actor_id, err = _schedule_actor(_wsid())
+    if err:
+        return err
+    from . import scheduled as jom_sched
+    rows = jom_sched.list_for_lead(int(_wsid()), customer_phone)
+    return jsonify({"success": True, "schedules": rows})
+
+
+@jom_bp.post("/schedules/<int:schedule_id>/cancel")
+def cancel_schedule(schedule_id):
+    body = request.get_json(silent=True) or {}
+    kind, actor_id, err = _schedule_actor(body.get("workspace_id"))
+    if err:
+        return err
+    from . import scheduled as jom_sched
+    row, e = jom_sched.cancel(int(body["workspace_id"]), schedule_id)
+    if e:
+        return jsonify({"success": False, "error": e}), (404 if e == "not_found" else 400)
+    return jsonify({"success": True, "schedule": row})
+
+
+# --------------------------------------------------------------------------- #
 # Lead tracker (read-only) — lifecycle rows joined with department + agent names
 # --------------------------------------------------------------------------- #
 @jom_bp.get("/leads")

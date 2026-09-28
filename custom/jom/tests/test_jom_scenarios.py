@@ -286,6 +286,122 @@ def scenario_junk_filter(env):
     return s
 
 
+def scenario_capi_feedback_loop(env):
+    """Item 7 — the Conversion-Leads feedback loop. Proves the status→CAPI wiring:
+    a QualifiedLead event fires on qualify (with lead_id + email + phone attached),
+    a Converted event fires on won, and a lead that closes as 'not interested' sends
+    NO positive event (absence = the low-quality signal Meta learns from).
+    Meta itself is mocked (spy on send_capi_event) — we prove OUR side calls it right;
+    real receipt at Meta is the sandbox test."""
+    from custom.jom import hooks, capi_leads, config as cfg
+    import SocioviaCrm.capi_service as capi_service
+    from custom.jom.models import JomLifecycleState
+
+    s = Step("CAPI feedback loop — QualifiedLead + Converted fire with identity; junk sends nothing")
+    calls = []                       # spy log: (event_name, user_data, custom_data, workspace_id)
+
+    def _spy(event_name, user_data_dict=None, custom_data_dict=None, workspace_id=None, **kw):
+        calls.append((event_name, user_data_dict or {}, custom_data_dict or {}, workspace_id))
+        return {"success": True, "events_received": 1}
+
+    original = getattr(capi_service, "send_capi_event", None)
+    capi_service.send_capi_event = _spy
+    try:
+        # --- qualified lead with a captured Meta Lead ID + email ------------- #
+        pq = "919900000095"
+        _seed(pq, status=cfg.STATUS_NEW)
+        capi_leads.set_lead_identity(WS, pq, meta_lead_id="l_1234567890", email="asha@example.com")
+        row = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=pq).first()
+        s.ok("lead identity stored (lead_id + email)",
+             row.meta_lead_id == "l_1234567890" and row.email == "asha@example.com",
+             "stored", (row.meta_lead_id, row.email))
+
+        hooks.on_inbound_message(WS, pq, "I want a simdest honeymoon package")  # keyword → qualifies
+        qcalls = [c for c in calls if c[0] == "QualifiedLead" and c[1].get("phone") == pq]
+        s.ok("QualifiedLead event fired on qualify", len(qcalls) >= 1, ">=1 QualifiedLead", len(qcalls))
+        if qcalls:
+            ud = qcalls[0][1]
+            s.ok("event carries the Meta lead_id (ties to the ad)", ud.get("lead_id") == "l_1234567890", "l_1234567890", ud.get("lead_id"))
+            s.ok("event carries email + phone match keys", ud.get("email") == "asha@example.com" and ud.get("phone") == pq, "both present", ud)
+            s.ok("event scoped to this workspace", qcalls[0][3] == WS, WS, qcalls[0][3])
+
+        # --- converted / won → Converted event ------------------------------ #
+        pc = "919900000096"
+        _seed(pc, status=cfg.STATUS_ASSIGNED)
+        capi_leads.set_lead_identity(WS, pc, meta_lead_id="l_222", email="v@example.com")
+        hooks.on_lead_status_change(WS, pc, cfg.STATUS_ASSIGNED, "won")
+        conv = [c for c in calls if c[0] == "Converted" and c[1].get("phone") == pc]
+        s.ok("Converted event fired on 'won'", len(conv) >= 1, ">=1 Converted", len(conv))
+
+        # --- junk / not-interested → NO positive event ---------------------- #
+        pj = "919900000097"
+        _seed(pj, status=cfg.STATUS_NEW)
+        before = len(calls)
+        hooks.on_inbound_message(WS, pj, "not interested, please stop")
+        after = [c for c in calls[before:] if c[1].get("phone") == pj]
+        s.ok("closed-disinterest lead sends NO positive CAPI event", len(after) == 0, "0 events", after)
+    finally:
+        if original is not None:
+            capi_service.send_capi_event = original
+    return s
+
+
+def scenario_agent_scheduled_followup(env):
+    """NEW feature — an agent schedules a one-off template for a future date/time;
+    the tick fires it once; a reply returns the lead to the SAME agent; cancel stops
+    a pending one; and if the sticky agent is gone the reply falls back within the
+    department."""
+    from custom.jom import scheduled, config as cfg, departments as Dsvc
+    from custom.jom.models import JomLifecycleState, JomScheduledMessage
+    from models import db
+    from datetime import timedelta
+    D, agents = env["dept"], env["agents"]
+    s = Step("Agent-scheduled follow-up — schedule → fire once → reply re-assigns → cancel → fallback")
+
+    # --- schedule + fire ------------------------------------------------- #
+    p = "919900000085"
+    _seed(p, status=cfg.STATUS_ASSIGNED, agent_id=agents[0])
+    row, err = scheduled.create(WS, p, cfg.TPL_OPENING, _now() + timedelta(days=40),
+                                variables={"1": "Asha", "2": "November Bali"},
+                                created_by_kind="agent", created_by_id=agents[0])
+    s.ok("schedule created (pending, agent snapshot)",
+         err is None and row and row["status"] == "pending" and row["assigned_agent_id"] == agents[0],
+         "pending", (err, row))
+    s.ok("past datetime is rejected",
+         scheduled.create(WS, p, cfg.TPL_OPENING, _now() - timedelta(days=1))[1] is not None,
+         "error", "")
+    fired = []
+    # not due yet
+    r0 = scheduled.run_due(WS, now=_now(), send_fn=lambda ph, tpl, v: fired.append((ph, tpl)))
+    s.ok("not fired before its time", r0["scheduled_sent"] == 0, "0", r0)
+    # due now
+    r1 = scheduled.run_due(WS, now=_now() + timedelta(days=41), send_fn=lambda ph, tpl, v: fired.append((ph, tpl)))
+    s.ok("fires exactly once when due", r1["scheduled_sent"] == 1 and len(fired) == 1, "1 send", (r1, fired))
+    again = scheduled.run_due(WS, now=_now() + timedelta(days=42), send_fn=lambda ph, tpl, v: fired.append((ph, tpl)))
+    s.ok("never double-sends (claim-once)", again["scheduled_sent"] == 0, "0", again)
+
+    # --- cancel a pending one -------------------------------------------- #
+    row2, _ = scheduled.create(WS, p, cfg.TPL_OPENING, _now() + timedelta(days=50))
+    _, cerr = scheduled.cancel(WS, row2["id"])
+    s.ok("pending schedule can be cancelled", cerr is None, "cancelled", cerr)
+    r2 = scheduled.run_due(WS, now=_now() + timedelta(days=51), send_fn=lambda ph, tpl, v: fired.append((ph, tpl)))
+    s.ok("cancelled schedule never fires", r2["scheduled_sent"] == 0, "0", r2)
+
+    # --- reply after send returns to the SAME agent ---------------------- #
+    resolved = Dsvc.resolve_agent_with_fallback(WS, p)
+    s.ok("reply returns to the SAME (valid) agent", resolved == agents[0], agents[0], resolved)
+
+    # --- fallback: sticky agent gone → another agent in the department --- #
+    pf = "919900000086"
+    _seed(pf, status=cfg.STATUS_ASSIGNED, agent_id=999999)   # non-existent agent
+    row3 = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=pf).first()
+    row3.department_id = D.id
+    db.session.commit()
+    resolved2 = Dsvc.resolve_agent_with_fallback(WS, pf)
+    s.ok("gone agent → falls back within the department", resolved2 in agents, f"in {agents}", resolved2)
+    return s
+
+
 def scenario_reopen_fresh(env):
     from custom.jom import extras, qualification, memory
     from custom.jom.models import JomLifecycleState
@@ -328,11 +444,14 @@ def run():
         from custom.jom import departments as Dsvc
         from custom.jom.models import JomLifecycleState, JomBehaviorScore, JomDepartment, JomDepartmentAgent
 
+        from custom.jom.models import JomScheduledMessage
+
         def cleanup():
             for p in ALL_PHONES:
                 JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=p).delete()
                 JomBehaviorScore.query.filter_by(workspace_id=WS, customer_phone=p).delete()
                 AgentNumberAssignment.query.filter_by(workspace_id=WS, customer_phone=p).delete()
+                JomScheduledMessage.query.filter_by(workspace_id=WS, customer_phone=p).delete()
             for d in JomDepartment.query.filter_by(workspace_id=WS).filter(JomDepartment.name.like("SIM_%")).all():
                 JomDepartmentAgent.query.filter_by(department_id=d.id).delete()
                 db.session.delete(d)
@@ -355,6 +474,7 @@ def run():
             scenario_reengage_after_close, scenario_destination_change,
             scenario_not_interested_immediately, scenario_qualify_soft_stall,
             scenario_window_continue, scenario_junk_filter, scenario_reopen_fresh,
+            scenario_capi_feedback_loop, scenario_agent_scheduled_followup,
         ]
 
         print("\n" + "=" * 70)

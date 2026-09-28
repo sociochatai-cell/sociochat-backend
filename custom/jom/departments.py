@@ -194,6 +194,52 @@ def route_qualified_lead(workspace_id, customer_phone, text):
     return dep, agent_id
 
 
+def resolve_agent_with_fallback(workspace_id, customer_phone):
+    """Return the agent a returning lead should go to, honouring the client's rule:
+      1) the SAME agent they had — if that agent still exists AND is active,
+      2) else another ACTIVE agent in the SAME department (round-robin),
+      3) else None (general queue — owner picks up).
+    Re-points the inbox bridge to whoever is chosen. Fail-safe."""
+    try:
+        from agent_auth.models import WorkspaceAgent
+        row = _get_lifecycle(workspace_id, customer_phone)
+        if not row:
+            return None
+        # 1) sticky agent still valid?
+        aid = row.assigned_agent_id
+        if aid:
+            a = db.session.get(WorkspaceAgent, int(aid))
+            if a and a.is_active:
+                bridge_to_agent_inbox(workspace_id, customer_phone, aid)
+                return aid
+        # 2) same department, another active agent (round-robin)
+        if row.department_id:
+            dep = JomDepartment.query.filter_by(
+                id=row.department_id, workspace_id=int(workspace_id)).first()
+            if dep:
+                new_aid = pick_agent_round_robin(dep)
+                if new_aid:
+                    row.assigned_agent_id = new_aid
+                    row.updated_at = _now()
+                    db.session.commit()
+                    bridge_to_agent_inbox(workspace_id, customer_phone, new_aid)
+                    logger.info("[jom] %s sticky agent %s gone → reassigned to %s (dept %s)",
+                                customer_phone, aid, new_aid, dep.name)
+                    return new_aid
+        # 3) general queue
+        logger.info("[jom] %s → general queue (no valid agent/department)", customer_phone)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[jom] resolve_agent_with_fallback failed for %s: %s", customer_phone, exc)
+        db.session.rollback()
+        return None
+
+
+def _get_lifecycle(workspace_id, customer_phone):
+    return JomLifecycleState.query.filter_by(
+        workspace_id=int(workspace_id), customer_phone=str(customer_phone)).first()
+
+
 def bridge_to_agent_inbox(workspace_id, customer_phone, agent_id):
     """Mirror a JOM department assignment into the agent's own scoped inbox.
 

@@ -113,6 +113,31 @@ class JomSheetConfig(db.Model):
     updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
 
+class JomScheduledMessage(db.Model):
+    """An agent- (or owner-) scheduled one-off follow-up: send a chosen approved
+    template to one customer at a chosen future time. Fired by the EXISTING periodic
+    scheduler tick (no new loop). `variables` holds the template body params (the
+    customer name is auto-filled from the memory card). `assigned_agent_id` is a
+    snapshot of who owned the lead when scheduled, so a reply after the send returns
+    to the same agent (with department/general fallback if they're gone)."""
+    __tablename__ = "jom_scheduled_message"
+    id = db.Column(db.Integer, primary_key=True)
+    workspace_id = db.Column(db.Integer, db.ForeignKey("workspaces2.id", ondelete="CASCADE"), nullable=False, index=True)
+    customer_phone = db.Column(db.String(32), nullable=False)
+    template_name = db.Column(db.String(512), nullable=False)
+    variables = db.Column(JSONB, nullable=True)              # {"1": "Asha", "2": "Bali", ...}
+    scheduled_at = db.Column(db.DateTime(timezone=True), nullable=False, index=True)  # UTC
+    status = db.Column(db.String(16), nullable=False, default="pending")  # pending/sent/cancelled/failed
+    assigned_agent_id = db.Column(db.Integer, nullable=True)   # snapshot for reply re-assignment
+    created_by_kind = db.Column(db.String(8), nullable=True)   # 'agent' | 'owner'
+    created_by_id = db.Column(db.Integer, nullable=True)
+    note = db.Column(db.String(255), nullable=True)            # optional agent note (why)
+    sent_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    error = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=_now)
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+
+
 class JomBehaviorScore(db.Model):
     __tablename__ = "jom_behavior_score"
     id = db.Column(db.Integer, primary_key=True)

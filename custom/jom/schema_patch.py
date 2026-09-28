@@ -123,6 +123,28 @@ _STATEMENTS = [
         updated_at          TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
         CONSTRAINT uq_jom_sheet_ws UNIQUE (workspace_id)
     )""",
+
+    # Agent-scheduled one-off follow-ups (fired by the existing tick) -------
+    """CREATE TABLE IF NOT EXISTS jom_scheduled_message (
+        id                SERIAL PRIMARY KEY,
+        workspace_id      INTEGER NOT NULL REFERENCES workspaces2(id) ON DELETE CASCADE,
+        customer_phone    VARCHAR(32) NOT NULL,
+        template_name     VARCHAR(512) NOT NULL,
+        variables         JSONB,
+        scheduled_at      TIMESTAMP WITH TIME ZONE NOT NULL,
+        status            VARCHAR(16) NOT NULL DEFAULT 'pending',
+        assigned_agent_id INTEGER,
+        created_by_kind   VARCHAR(8),
+        created_by_id     INTEGER,
+        note              VARCHAR(255),
+        sent_at           TIMESTAMP WITH TIME ZONE,
+        error             TEXT,
+        created_at        TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at        TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_jom_sched_ws ON jom_scheduled_message(workspace_id)",
+    "CREATE INDEX IF NOT EXISTS ix_jom_sched_due ON jom_scheduled_message(status, scheduled_at)",
+    "CREATE INDEX IF NOT EXISTS ix_jom_sched_phone ON jom_scheduled_message(workspace_id, customer_phone)",
 ]
 
 
