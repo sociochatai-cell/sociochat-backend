@@ -59,6 +59,9 @@ _STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS ix_jom_lifecycle_next_followup ON jom_lifecycle_state(next_followup_at)",
     # Phase 4/5 columns (additive)
     "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS meta_lead_id VARCHAR(40)",
+    # Click-to-WhatsApp click id (Meta ad attribution) — sent to CAPI as ctwa_clid so
+    # QualifiedLead/Converted events tie back to the exact ad click.
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS ctwa_clid VARCHAR(255)",
     "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS email VARCHAR(160)",
     "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS reopen_count INTEGER NOT NULL DEFAULT 0",
     # Close reason (for CRM daily filtering: not_interested / booked_elsewhere / drip_exhausted)

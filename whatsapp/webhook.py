@@ -527,7 +527,9 @@ class WebhookProcessor:
                 from custom.jom.gate import is_jom_workspace
                 if is_jom_workspace(account.workspace_id):
                     from custom.jom.hooks import on_inbound_message
-                    on_inbound_message(int(account.workspace_id), from_phone, content)
+                    # Pass the Click-to-WhatsApp ad click id so JOM can attribute CAPI events.
+                    _jom_meta = {"ctwa_clid": getattr(conversation, "ctwa_clid", None)}
+                    on_inbound_message(int(account.workspace_id), from_phone, content, meta=_jom_meta)
         except Exception:
             logger.exception("JOM inbound hook failed (conversation %s)", conversation.id)
 
