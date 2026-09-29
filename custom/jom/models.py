@@ -46,6 +46,7 @@ class JomLifecycleState(db.Model):
     status = db.Column(db.String(24), nullable=False, default="new")
     assigned_agent_id = db.Column(db.Integer, db.ForeignKey("workspace_agents.id", ondelete="SET NULL"), nullable=True)
     meta_lead_id = db.Column(db.String(40), nullable=True)   # Meta Lead Ads 15-17 digit Lead ID (CAPI)
+    ctwa_clid = db.Column(db.String(255), nullable=True)     # Click-to-WhatsApp click id (CAPI ad attribution)
     email = db.Column(db.String(160), nullable=True)         # for CAPI match keys
     reopen_count = db.Column(db.Integer, nullable=False, default=0)  # returning-fresh-lead history
     drip_stage = db.Column(db.String(16), nullable=True)

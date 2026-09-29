@@ -77,6 +77,10 @@ def on_inbound_message(workspace_id, customer_phone, message_text, meta=None, fl
     try:
         from . import lifecycle, qualification, extras
 
+        # Piece A: capture the Click-to-WhatsApp ad click id (ctwa_clid) onto the lead
+        # BEFORE qualify fires, so the QualifiedLead/Converted CAPI events are ad-attributed.
+        _capture_ad_identity(workspace_id, customer_phone, meta)
+
         # 0) Follow-up button tap → direct lifecycle outcome (close / dormant / agent)
         bid, btxt = _extract_button(message_text)
         if bid or btxt:
@@ -116,6 +120,37 @@ def on_inbound_message(workspace_id, customer_phone, message_text, meta=None, fl
     except Exception as exc:  # noqa: BLE001
         logger.warning("[jom] on_inbound_message failed for %s: %s", customer_phone, exc)
         return False
+
+
+def _capture_ad_identity(workspace_id, customer_phone, meta):
+    """Store the Click-to-WhatsApp click id on the lead. Prefer the value the webhook
+    passes in `meta` (the conversation is in scope there); fall back to looking the
+    conversation up by phone. Fail-safe: never breaks inbound handling."""
+    try:
+        clid = None
+        email = None
+        if isinstance(meta, dict):
+            clid = meta.get("ctwa_clid")
+            email = meta.get("email")
+        if not clid:
+            # fallback: find the WhatsApp conversation for this workspace + phone
+            try:
+                from whatsapp.models import WhatsAppConversation, WhatsAppAccount
+                acc = WhatsAppAccount.query.filter_by(workspace_id=str(workspace_id)).first()
+                if acc:
+                    conv = WhatsAppConversation.query.filter_by(
+                        account_id=acc.id, user_phone=str(customer_phone)).first()
+                    if conv:
+                        clid = getattr(conv, "ctwa_clid", None)
+            except Exception:  # noqa: BLE001
+                pass
+        if clid or email:
+            from . import capi_leads
+            capi_leads.set_lead_identity(workspace_id, customer_phone, ctwa_clid=clid, email=email)
+            if clid:
+                logger.info("[jom] captured ctwa_clid for %s (ad-attributed)", customer_phone)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[jom] ad-identity capture noop/failed: %s", exc)
 
 
 def on_lead_status_change(workspace_id, customer_phone, old_status, new_status):

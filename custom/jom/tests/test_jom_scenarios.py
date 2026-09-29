@@ -316,12 +316,17 @@ def scenario_capi_feedback_loop(env):
              row.meta_lead_id == "l_1234567890" and row.email == "asha@example.com",
              "stored", (row.meta_lead_id, row.email))
 
-        hooks.on_inbound_message(WS, pq, "I want a simdest honeymoon package")  # keyword → qualifies
+        # Piece A: the inbound hook captures the Click-to-WhatsApp click id onto the lead
+        hooks.on_inbound_message(WS, pq, "I want a simdest honeymoon package",
+                                 meta={"ctwa_clid": "CTWA_ABC123"})  # keyword → qualifies
+        row = JomLifecycleState.query.filter_by(workspace_id=WS, customer_phone=pq).first()
+        s.ok("ctwa_clid captured onto lead from inbound", row.ctwa_clid == "CTWA_ABC123", "CTWA_ABC123", row.ctwa_clid)
         qcalls = [c for c in calls if c[0] == "QualifiedLead" and c[1].get("phone") == pq]
         s.ok("QualifiedLead event fired on qualify", len(qcalls) >= 1, ">=1 QualifiedLead", len(qcalls))
         if qcalls:
             ud = qcalls[0][1]
             s.ok("event carries the Meta lead_id (ties to the ad)", ud.get("lead_id") == "l_1234567890", "l_1234567890", ud.get("lead_id"))
+            s.ok("event carries ctwa_clid (Click-to-WhatsApp attribution)", ud.get("ctwa_clid") == "CTWA_ABC123", "CTWA_ABC123", ud.get("ctwa_clid"))
             s.ok("event carries email + phone match keys", ud.get("email") == "asha@example.com" and ud.get("phone") == pq, "both present", ud)
             s.ok("event scoped to this workspace", qcalls[0][3] == WS, WS, qcalls[0][3])
 

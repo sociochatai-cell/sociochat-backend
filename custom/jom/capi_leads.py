@@ -21,8 +21,10 @@ def _now():
     return datetime.now(timezone.utc)
 
 
-def set_lead_identity(workspace_id, customer_phone, meta_lead_id=None, email=None):
-    """Store the Meta Lead ID + email on the lifecycle row (captured at ingest)."""
+def set_lead_identity(workspace_id, customer_phone, meta_lead_id=None, email=None, ctwa_clid=None):
+    """Store the Meta ad-attribution identity on the lifecycle row (captured at ingest).
+    `ctwa_clid` = Click-to-WhatsApp click id (the JOM case); `meta_lead_id` = Lead Ads id.
+    Only overwrites a field when a new non-empty value is given (idempotent per message)."""
     row = JomLifecycleState.query.filter_by(
         workspace_id=int(workspace_id), customer_phone=str(customer_phone)).first()
     if not row:
@@ -30,6 +32,8 @@ def set_lead_identity(workspace_id, customer_phone, meta_lead_id=None, email=Non
         db.session.add(row)
     if meta_lead_id:
         row.meta_lead_id = str(meta_lead_id)[:40]
+    if ctwa_clid and not row.ctwa_clid:   # first click wins; don't clobber on later messages
+        row.ctwa_clid = str(ctwa_clid)[:255]
     if email:
         row.email = str(email)[:160]
     row.updated_at = _now()
@@ -45,8 +49,12 @@ def _send(workspace_id, customer_phone, event_name, value=None):
         user_data = {"phone": customer_phone}
         if row and row.email:
             user_data["email"] = row.email
+        # Click-to-WhatsApp attribution: ctwa_clid is Meta's key for messaging ads.
+        if row and getattr(row, "ctwa_clid", None):
+            user_data["ctwa_clid"] = row.ctwa_clid
+        # Lead-Ads attribution: lead_id (instant forms). Both can be present; send what we have.
         if row and row.meta_lead_id:
-            user_data["lead_id"] = row.meta_lead_id  # ties the event to the Meta lead/ad
+            user_data["lead_id"] = row.meta_lead_id
         custom = {"value": value, "currency": "INR"} if value is not None else None
         from SocioviaCrm.capi_service import send_capi_event
         res = send_capi_event(
