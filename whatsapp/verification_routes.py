@@ -165,10 +165,17 @@ def get_verification_status(account_id: int):
 
     maturity = "onboarding"
     if acc.get_access_token() and acc.webhook_health == "healthy":
-        if health_eval.blocks:
-            maturity = "restricted"
-        elif health_eval.in_warmup_window:
+        # Order matters: warmup-window sends "blocks" too (broadcast/drip throttling
+        # to build sending reputation), but that's OUR self-imposed limit, not a Meta
+        # restriction. Check warmup FIRST so those accounts render as "warming_up"
+        # (yellow "Account in Warmup Mode" banner) instead of "restricted" (red
+        # "Meta has placed restrictions on your account" banner). True Meta
+        # restrictions only trigger the "restricted" state when health_eval.blocks
+        # is set OUTSIDE the warmup window.
+        if health_eval.in_warmup_window:
             maturity = "warming_up"
+        elif health_eval.blocks:
+            maturity = "restricted"
         else:
             maturity = "trusted" if acc.quality_score == "GREEN" else "mature"
 
