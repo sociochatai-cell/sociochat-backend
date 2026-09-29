@@ -71,9 +71,26 @@ def _send(workspace_id, customer_phone, event_name, value=None):
         return {"success": False, "error": str(exc)}
 
 
+def _record(workspace_id, customer_phone, field_at, field_ok, res):
+    """Persist the CAPI send outcome on the lead so the dashboard can show it."""
+    try:
+        row = JomLifecycleState.query.filter_by(
+            workspace_id=int(workspace_id), customer_phone=str(customer_phone)).first()
+        if row:
+            setattr(row, field_at, _now())
+            setattr(row, field_ok, bool(res and res.get("success")))
+            db.session.commit()
+    except Exception:  # noqa: BLE001
+        db.session.rollback()
+
+
 def on_qualified(workspace_id, customer_phone):
-    return _send(workspace_id, customer_phone, "QualifiedLead")
+    res = _send(workspace_id, customer_phone, "QualifiedLead")
+    _record(workspace_id, customer_phone, "capi_qualified_at", "capi_qualified_ok", res)
+    return res
 
 
 def on_converted(workspace_id, customer_phone, value=None):
-    return _send(workspace_id, customer_phone, "Converted", value=value)
+    res = _send(workspace_id, customer_phone, "Converted", value=value)
+    _record(workspace_id, customer_phone, "capi_converted_at", "capi_converted_ok", res)
+    return res

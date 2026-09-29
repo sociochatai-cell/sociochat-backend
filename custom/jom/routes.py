@@ -586,7 +586,13 @@ def list_leads(user):
             "travel_dates": getattr(r, "travel_dates", None),
             "party_size": getattr(r, "party_size", None),
             "meta_lead_id": r.meta_lead_id,
+            "ctwa_clid": getattr(r, "ctwa_clid", None),
             "email": r.email,
+            # Meta CAPI indicator: ad id captured? signal fired + accepted?
+            "capi_qualified_at": r.capi_qualified_at.isoformat() if getattr(r, "capi_qualified_at", None) else None,
+            "capi_qualified_ok": getattr(r, "capi_qualified_ok", None),
+            "capi_converted_at": r.capi_converted_at.isoformat() if getattr(r, "capi_converted_at", None) else None,
+            "capi_converted_ok": getattr(r, "capi_converted_ok", None),
             "total_inbound": getattr(b, "total_inbound", None),
             "total_outbound": getattr(b, "total_outbound", None),
             "consecutive_no_reply": getattr(b, "consecutive_no_reply", None),

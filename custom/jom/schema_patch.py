@@ -62,6 +62,12 @@ _STATEMENTS = [
     # Click-to-WhatsApp click id (Meta ad attribution) — sent to CAPI as ctwa_clid so
     # QualifiedLead/Converted events tie back to the exact ad click.
     "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS ctwa_clid VARCHAR(255)",
+    # CAPI send tracking (drives the dashboard "Meta" indicator: was the signal fired,
+    # and did Meta accept it). ok=false means attempted but rejected (e.g. pixel not connected).
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS capi_qualified_at TIMESTAMP WITH TIME ZONE",
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS capi_qualified_ok BOOLEAN",
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS capi_converted_at TIMESTAMP WITH TIME ZONE",
+    "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS capi_converted_ok BOOLEAN",
     "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS email VARCHAR(160)",
     "ALTER TABLE jom_lifecycle_state ADD COLUMN IF NOT EXISTS reopen_count INTEGER NOT NULL DEFAULT 0",
     # Close reason (for CRM daily filtering: not_interested / booked_elsewhere / drip_exhausted)
