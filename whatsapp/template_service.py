@@ -654,6 +654,7 @@ class WhatsAppTemplateService:
             if template.category == 'AUTHENTICATION':
                 logger.info(f"Transforming payload for AUTHENTICATION template: {template.name}")
                 transformed_components = []
+                has_otp_button = False
                 for comp in template.components:
                     new_comp = comp.copy()
                     if new_comp.get('type') == 'BODY':
@@ -664,7 +665,47 @@ class WhatsAppTemplateService:
                         if 'text' in new_comp:
                             logger.info(f"Skipping invalid FOOTER 'text' for AUTHENTICATION template: {template.name}")
                             continue
+                    elif new_comp.get('type') == 'BUTTONS':
+                        # Meta expects authentication buttons in the form
+                        # {"type": "OTP", "otp_type": "COPY_CODE"|"ONE_TAP"|"ZERO_TAP", "text": "..."}.
+                        # Any older payload that sent {"type": "COPY_CODE", ...} would be
+                        # rejected with code 10 "does not have permission to create message template".
+                        fixed_buttons = []
+                        for btn in (new_comp.get('buttons') or []):
+                            b = dict(btn)
+                            bt = str(b.get('type', '')).upper()
+                            if bt in ('COPY_CODE', 'ONE_TAP', 'ZERO_TAP'):
+                                # legacy shape → normalize
+                                b = {'type': 'OTP', 'otp_type': bt, 'text': b.get('text') or 'Copy Code'}
+                            elif bt == 'OTP':
+                                # already correct
+                                b.setdefault('otp_type', 'COPY_CODE')
+                                b.setdefault('text', 'Copy Code')
+                            else:
+                                # Non-OTP buttons are not allowed on authentication templates.
+                                logger.warning(
+                                    "Dropping non-OTP button of type %s from AUTHENTICATION template %s",
+                                    bt, template.name,
+                                )
+                                continue
+                            fixed_buttons.append(b)
+                            has_otp_button = True
+                        if not fixed_buttons:
+                            continue  # skip empty BUTTONS component
+                        new_comp['buttons'] = fixed_buttons
                     transformed_components.append(new_comp)
+                # Meta requires an OTP button on every authentication template. Auto-add
+                # a Copy Code button as a safety net so we never send an
+                # authentication template without one (which would 400 with code 10).
+                if not has_otp_button:
+                    logger.info(
+                        "AUTHENTICATION template %s had no OTP button — auto-adding Copy Code button",
+                        template.name,
+                    )
+                    transformed_components.append({
+                        'type': 'BUTTONS',
+                        'buttons': [{'type': 'OTP', 'otp_type': 'COPY_CODE', 'text': 'Copy Code'}],
+                    })
                 payload['components'] = transformed_components
 
             print(f"\n{'='*60}")
