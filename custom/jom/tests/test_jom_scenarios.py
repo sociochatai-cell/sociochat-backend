@@ -414,6 +414,28 @@ def scenario_agent_scheduled_followup(env):
     return s
 
 
+def scenario_ad_lead_seeding(env):
+    """Click-to-WhatsApp ad lead has NO sheet columns → seed name (WA profile) +
+    destination (from the AD text) even when the first message has no keyword."""
+    from custom.jom import hooks, memory
+    D = env["dept"]
+    p = "919900000088"
+    s = Step("CTA ad lead — seed name (WA profile) + destination (from the ad) into memory")
+    _seed(p, status="new")
+    # message itself has NO destination keyword; the ad text carries it
+    hooks.on_inbound_message(WS, p, "hi", meta={
+        "ctwa_clid": "CTWA_SEED1", "user_name": "Ravi Kumar",
+        "ad_text": "simdest holiday packages — book now",
+    })
+    card = memory.get_card(WS, p)
+    s.ok("name seeded from WhatsApp profile", card.get("customer_name") == "Ravi Kumar", "Ravi Kumar", card.get("customer_name"))
+    s.ok("destination seeded from the AD (not the message)", card.get("destination") == D.name, D.name, card.get("destination"))
+    # and it does NOT override a name we already know
+    hooks.on_inbound_message(WS, p, "actually call me RK", meta={"user_name": "Someone Else"})
+    s.ok("existing name is NOT overwritten by later inbound", memory.get_card(WS, p).get("customer_name") == "Ravi Kumar", "Ravi Kumar", memory.get_card(WS, p).get("customer_name"))
+    return s
+
+
 def scenario_reopen_fresh(env):
     from custom.jom import extras, qualification, memory
     from custom.jom.models import JomLifecycleState
@@ -487,6 +509,7 @@ def run():
             scenario_not_interested_immediately, scenario_qualify_soft_stall,
             scenario_window_continue, scenario_junk_filter, scenario_reopen_fresh,
             scenario_capi_feedback_loop, scenario_agent_scheduled_followup,
+            scenario_ad_lead_seeding,
         ]
 
         print("\n" + "=" * 70)
