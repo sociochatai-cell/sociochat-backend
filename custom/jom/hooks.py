@@ -80,6 +80,9 @@ def on_inbound_message(workspace_id, customer_phone, message_text, meta=None, fl
         # Piece A: capture the Click-to-WhatsApp ad click id (ctwa_clid) onto the lead
         # BEFORE qualify fires, so the QualifiedLead/Converted CAPI events are ad-attributed.
         _capture_ad_identity(workspace_id, customer_phone, meta)
+        # Ad leads have NO sheet columns — seed name (WhatsApp profile) + destination
+        # (inferred from the ad they clicked) so they arrive partly "known", like a sheet lead.
+        _seed_ad_memory(workspace_id, customer_phone, meta, message_text)
 
         # 0) Follow-up button tap → direct lifecycle outcome (close / dormant / agent)
         bid, btxt = _extract_button(message_text)
@@ -151,6 +154,41 @@ def _capture_ad_identity(workspace_id, customer_phone, meta):
                 logger.info("[jom] captured ctwa_clid for %s (ad-attributed)", customer_phone)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[jom] ad-identity capture noop/failed: %s", exc)
+
+
+def _seed_ad_memory(workspace_id, customer_phone, meta, message_text):
+    """For a Click-to-WhatsApp ad lead (no sheet columns), pre-fill the memory card:
+      - customer_name  <- their WhatsApp profile name
+      - destination    <- inferred by matching the JOM department keywords against the
+                          ad's own text (headline/body/campaign) + their first message.
+    Only fills a field that's still EMPTY (never overrides what we already know or what
+    the AI later learns). Fail-safe."""
+    try:
+        if not isinstance(meta, dict):
+            return
+        user_name = (meta.get("user_name") or "").strip()
+        ad_text = (meta.get("ad_text") or "").strip()
+        # Nothing to seed from, and not clearly an ad lead → skip.
+        if not user_name and not ad_text and not meta.get("ctwa_clid"):
+            return
+        from . import memory
+        card = memory.get_card(workspace_id, customer_phone) or {}
+
+        # 1) name from WhatsApp profile (only if we don't have one yet)
+        if user_name and not card.get("customer_name"):
+            memory.update_card(workspace_id, customer_phone, customer_name=user_name[:120])
+
+        # 2) destination from the AD they clicked (+ their first message), if unknown
+        if not card.get("destination"):
+            from . import departments as dept_svc
+            hay = " ".join(x for x in (ad_text, _as_text(message_text)) if x)
+            dep = dept_svc.match_department(workspace_id, hay)
+            if dep:
+                memory.set_destination(workspace_id, customer_phone, dep.name)
+                logger.info("[jom] seeded ad lead %s → destination=%s (from ad/message)",
+                            customer_phone, dep.name)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[jom] ad-memory seed noop/failed: %s", exc)
 
 
 def on_lead_status_change(workspace_id, customer_phone, old_status, new_status):
