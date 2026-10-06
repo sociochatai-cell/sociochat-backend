@@ -791,6 +791,77 @@ def clone_flow(flow_id: int):
 
 
 # ============================================================
+# POST /api/whatsapp/flows/{id}/duplicate - Duplicate as new draft
+# ============================================================
+
+@flow_bp.route("/<int:flow_id>/duplicate", methods=["POST"])
+@require_flow_access
+def duplicate_flow(flow_id: int):
+    """
+    Duplicate a flow as an independent new DRAFT.
+    Unlike /clone, this never deprecates or alters the source flow —
+    it just makes an editable copy. Works on DRAFT, PUBLISHED, or
+    DEPRECATED sources.
+    """
+    source = WhatsAppFlow.query.get(flow_id)
+    if not source:
+        return jsonify({"success": False, "error": "Flow not found"}), 404
+
+    from tenant.context import resolve_owned_account
+    account, err = resolve_owned_account(source.account_id)
+    if err:
+        return err
+
+    workspace_id = getattr(account, "workspace_id", None)
+    if workspace_id:
+        try:
+            wid = int(workspace_id)
+            workspace = Workspace.query.get(wid)
+            if workspace:
+                user = User.query.get(workspace.user_id)
+                if user:
+                    allowed, current, limit = check_flow_limit(user, wid)
+                    if not allowed:
+                        return jsonify({
+                            "success": False,
+                            "error": "flow_limit_exceeded",
+                            "limit": limit,
+                            "current": current,
+                            "plan": user.plan,
+                            "message": "Limit reached. Please upgrade your plan."
+                        }), 403
+        except Exception:
+            pass
+
+    data = request.get_json(silent=True) or {}
+    new_name = (data.get("name") or "").strip() or f"Copy of {source.name}"
+
+    new_flow = WhatsAppFlow(
+        account_id=source.account_id,
+        name=new_name,
+        category=source.category,
+        flow_version=1,
+        parent_flow_id=None,
+        flow_json=source.flow_json.copy() if source.flow_json else {},
+        schema_version=source.schema_version,
+        entry_screen_id=source.entry_screen_id,
+        status="DRAFT",
+    )
+    new_flow.flow_json = normalize_flow_submission_payloads(new_flow.flow_json)
+    new_flow.schema_version = str((new_flow.flow_json or {}).get("version") or new_flow.schema_version)
+
+    db.session.add(new_flow)
+    db.session.commit()
+
+    return jsonify({
+        "success": True,
+        "flow": new_flow.to_dict(),
+        "message": f"Duplicated as '{new_flow.name}'",
+        "source_flow_id": flow_id
+    })
+
+
+# ============================================================
 # POST /api/whatsapp/flows/validate - Validate Flow JSON
 # ============================================================
 
