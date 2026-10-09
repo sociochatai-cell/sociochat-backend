@@ -166,6 +166,99 @@ class DeleteDripCampaignAction(BaseAction):
         return {"status": "success", "message": f"🗑️ Campaign **{name}** has been deleted."}
 
 
+@action_registry.register(domain="drip", action="add_step")
+class AddDripStepAction(BaseAction):
+    name = "add_drip_step"
+    description = "Add a step to a drip campaign (template + delay)"
+    required_params = ["campaign_id", "template_name"]
+    optional_params = ["delay_minutes", "step_order", "language"]
+
+    def get_missing_params_prompt(self, missing: List[str]) -> str:
+        prompts = {
+            "campaign_id": "Which drip campaign should I add a step to? (provide campaign ID)",
+            "template_name": "Which template should this step send? (provide template name)",
+        }
+        first = missing[0]
+        return prompts.get(first, f"Please provide **{first}**.")
+
+    def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        from whatsapp.drip_models import WhatsAppDripCampaign, WhatsAppDripStep
+        from models import db
+
+        workspace_id = context.get("workspace_id")
+        campaign = WhatsAppDripCampaign.query.filter_by(
+            id=params["campaign_id"], workspace_id=workspace_id
+        ).first()
+        if not campaign:
+            return {"status": "error", "message": "Campaign not found."}
+
+        delay_minutes = int(params.get("delay_minutes", 0))
+        step_order = int(params.get("step_order", len(campaign.steps) + 1))
+        language = params.get("language", "en_US")
+
+        step = WhatsAppDripStep(
+            campaign_id=campaign.id,
+            step_order=step_order,
+            delay_seconds=delay_minutes * 60,
+            template_name=params["template_name"],
+            language=language,
+        )
+        db.session.add(step)
+        db.session.commit()
+
+        delay_label = f"{delay_minutes} min" if delay_minutes < 60 else f"{delay_minutes // 60}h {delay_minutes % 60}m"
+        if delay_minutes == 0:
+            delay_label = "immediately"
+
+        return {
+            "status": "success",
+            "message": (
+                f"✅ Step #{step_order} added to **{campaign.name}**!\n"
+                f"• Template: {params['template_name']}\n"
+                f"• Delay: {delay_label}\n"
+                f"• Total steps: {len(campaign.steps)}"
+            ),
+            "data": {"step_id": step.id, "campaign_id": campaign.id},
+        }
+
+
+@action_registry.register(domain="drip", action="activate")
+class ActivateDripAction(BaseAction):
+    name = "activate_drip"
+    description = "Activate a drip campaign (start sending)"
+    required_params = ["campaign_id"]
+
+    def get_missing_params_prompt(self, missing: List[str]) -> str:
+        return "Which campaign should I activate? (provide campaign ID)"
+
+    def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        from whatsapp.drip_models import WhatsAppDripCampaign
+        from models import db
+
+        session = context.get("session")
+        if not (session and getattr(session, "_confirmed", False)):
+            return {"status": "confirmation_required",
+                    "message": f"Activate campaign #{params['campaign_id']}? It will start sending to enrolled contacts."}
+
+        workspace_id = context.get("workspace_id")
+        campaign = WhatsAppDripCampaign.query.filter_by(
+            id=params["campaign_id"], workspace_id=workspace_id
+        ).first()
+        if not campaign:
+            return {"status": "error", "message": "Campaign not found."}
+
+        if not campaign.steps:
+            return {"status": "error", "message": f"Campaign **{campaign.name}** has no steps. Add at least one step first."}
+
+        campaign.status = "active"
+        db.session.commit()
+
+        return {
+            "status": "success",
+            "message": f"🟢 Campaign **{campaign.name}** is now **active** with {len(campaign.steps)} steps!",
+        }
+
+
 @action_registry.register(domain="drip", action="enroll")
 class EnrollDripAction(BaseAction):
     name = "enroll_drip"
