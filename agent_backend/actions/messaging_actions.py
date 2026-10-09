@@ -38,8 +38,9 @@ class SendTextAction(BaseAction):
 
         try:
             from whatsapp.services import WhatsAppService
-            svc = WhatsAppService(workspace_id=workspace_id)
-            result = svc.send_text_message(to=to, text=text)
+            account_id = context.get("account_id")
+            svc = WhatsAppService(workspace_id=workspace_id, account_id=account_id)
+            result = svc.send_text(to, text)
             if result.get("success") or result.get("messages"):
                 return {
                     "status": "success",
