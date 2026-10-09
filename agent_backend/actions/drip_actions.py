@@ -322,3 +322,84 @@ class EnrollDripAction(BaseAction):
         if skipped:
             msg += f" ({skipped} already enrolled, skipped)"
         return {"status": "success", "message": msg, "data": {"enrolled": enrolled, "skipped": skipped}}
+
+
+@action_registry.register(domain="drip", action="enroll_dataset")
+class EnrollDatasetDripAction(BaseAction):
+    name = "enroll_dataset_drip"
+    description = "Enroll all contacts from a dataset into a drip campaign"
+    required_params = ["campaign_id", "dataset_id"]
+
+    def get_missing_params_prompt(self, missing: List[str]) -> str:
+        prompts = {
+            "campaign_id": "Which campaign should I enroll them in? (provide campaign ID)",
+            "dataset_id": "Which dataset should I pull contacts from? (provide dataset ID)",
+        }
+        first = missing[0]
+        return prompts.get(first, f"Please provide **{first}**.")
+
+    def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        from whatsapp.drip_models import WhatsAppDripCampaign, WhatsAppDripEnrollment
+        from models import db
+        from sqlalchemy import text
+
+        workspace_id = context.get("workspace_id")
+        account_id = context.get("account_id")
+
+        if not account_id:
+            return {"status": "error", "message": "No WhatsApp account connected."}
+
+        campaign = WhatsAppDripCampaign.query.filter_by(
+            id=params["campaign_id"], workspace_id=workspace_id
+        ).first()
+        if not campaign:
+            return {"status": "error", "message": "Campaign not found."}
+
+        if campaign.status != "active":
+            return {"status": "error", "message": f"Campaign **{campaign.name}** is {campaign.status} — activate it first."}
+
+        try:
+            rows = db.session.execute(text(
+                "SELECT data FROM whatsapp_dataset_rows WHERE dataset_id = :did"
+            ), {"did": int(params["dataset_id"])}).fetchall()
+        except Exception as exc:
+            return {"status": "error", "message": f"Could not read dataset: {exc}"}
+
+        if not rows:
+            return {"status": "error", "message": "Dataset is empty — no contacts to enroll."}
+
+        enrolled = 0
+        skipped = 0
+        no_phone = 0
+        for row in rows:
+            data = row[0] if isinstance(row[0], dict) else {}
+            phone = data.get("Phone") or data.get("phone") or data.get("PHONE") or data.get("mobile") or data.get("Mobile")
+            if not phone:
+                no_phone += 1
+                continue
+
+            phone = str(phone).strip()
+            existing = WhatsAppDripEnrollment.query.filter_by(
+                campaign_id=campaign.id, phone_number=phone
+            ).first()
+            if existing:
+                skipped += 1
+                continue
+
+            enrollment = WhatsAppDripEnrollment(
+                campaign_id=campaign.id,
+                account_id=account_id,
+                phone_number=phone,
+                status="active",
+                current_step=0,
+            )
+            db.session.add(enrollment)
+            enrolled += 1
+
+        db.session.commit()
+        msg = f"✅ Enrolled **{enrolled}** contacts from dataset into **{campaign.name}**."
+        if skipped:
+            msg += f"\n• {skipped} already enrolled (skipped)"
+        if no_phone:
+            msg += f"\n• {no_phone} rows had no phone number (skipped)"
+        return {"status": "success", "message": msg, "data": {"enrolled": enrolled, "skipped": skipped, "no_phone": no_phone}}
