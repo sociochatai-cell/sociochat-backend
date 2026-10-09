@@ -19,33 +19,30 @@ class ListKnowledgeSourcesAction(BaseAction):
     def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         from whatsapp.faq_models import WhatsAppFAQ
         account_id = context.get("account_id")
-        workspace_id = context.get("workspace_id")
 
         if not account_id:
             return {"status": "error", "message": "No WhatsApp account connected."}
 
         faq_count = WhatsAppFAQ.query.filter_by(account_id=account_id, is_active=True).count()
 
-        # Check for AI config / training data
         try:
             from whatsapp.models import WhatsAppAccount
             acct = WhatsAppAccount.query.get(account_id)
-            ai_config = (acct.ai_config or {}) if acct else {}
         except Exception:
-            ai_config = {}
+            acct = None
 
-        website_url = ai_config.get("website_url", "")
-        custom_instructions = ai_config.get("custom_instructions", "")
+        prompt_override = getattr(acct, "prompt_override", None) or ""
+        knowledge_base_id = getattr(acct, "knowledge_base_id", None) or ""
 
-        lines = [f"**AI Training Sources:**"]
+        lines = ["**AI Training Sources:**"]
         lines.append(f"• FAQs: **{faq_count}** active entries")
-        if website_url:
-            lines.append(f"• Website: {website_url}")
-        if custom_instructions:
-            preview = custom_instructions[:80] + ("..." if len(custom_instructions) > 80 else "")
+        if knowledge_base_id:
+            lines.append(f"• Knowledge base: {knowledge_base_id}")
+        if prompt_override:
+            preview = prompt_override[:80] + ("..." if len(prompt_override) > 80 else "")
             lines.append(f"• Custom instructions: \"{preview}\"")
-        if not website_url and not custom_instructions and faq_count == 0:
-            lines.append("\n⚠️ No training data configured. Go to **Settings → AI** to add a website, FAQs, or custom instructions.")
+        if not knowledge_base_id and not prompt_override and faq_count == 0:
+            lines.append("\n⚠️ No training data configured. Go to **Settings → AI** to add FAQs or custom instructions.")
 
         return {"status": "success", "message": "\n".join(lines)}
 
@@ -67,22 +64,32 @@ class GetAIConfigAction(BaseAction):
             acct = WhatsAppAccount.query.get(account_id)
             if not acct:
                 return {"status": "error", "message": "Account not found."}
-            ai_config = acct.ai_config or {}
         except Exception as exc:
             return {"status": "error", "message": f"Could not load AI config: {exc}"}
 
-        enabled = ai_config.get("enabled", False)
-        model = ai_config.get("model", "not set")
-        tone = ai_config.get("tone", "professional")
-        website = ai_config.get("website_url", "none")
-        instructions = ai_config.get("custom_instructions", "")
+        ai_enabled = getattr(acct, "ai_enabled", False) or False
+        ai_model = getattr(acct, "ai_model", None) or "default"
+        temperature = getattr(acct, "temperature", None)
+        prompt_override = getattr(acct, "prompt_override", None) or ""
+        knowledge_base_id = getattr(acct, "knowledge_base_id", None) or ""
+        ai_agent_mode = getattr(acct, "ai_agent_mode", False) or False
+
+        data = {
+            "ai_enabled": ai_enabled,
+            "ai_model": ai_model,
+            "temperature": temperature,
+            "ai_agent_mode": ai_agent_mode,
+            "knowledge_base_id": knowledge_base_id,
+            "has_custom_instructions": bool(prompt_override),
+        }
 
         msg = (
             f"🤖 **AI Chatbot Config**\n"
-            f"• Status: {'🟢 Enabled' if enabled else '🔴 Disabled'}\n"
-            f"• Model: {model}\n"
-            f"• Tone: {tone}\n"
-            f"• Website: {website}\n"
-            f"• Custom instructions: {'set (' + str(len(instructions)) + ' chars)' if instructions else 'none'}"
+            f"• Status: {'🟢 Enabled' if ai_enabled else '🔴 Disabled'}\n"
+            f"• Agent mode: {'🟢 On' if ai_agent_mode else '⚪ Off'}\n"
+            f"• Model: {ai_model}\n"
+            f"• Temperature: {temperature if temperature is not None else 'default'}\n"
+            f"• Knowledge base: {knowledge_base_id or 'none'}\n"
+            f"• Custom instructions: {'set (' + str(len(prompt_override)) + ' chars)' if prompt_override else 'none'}"
         )
-        return {"status": "success", "message": msg, "data": ai_config, "ui_action": "show_card"}
+        return {"status": "success", "message": msg, "data": data, "ui_action": "show_card"}
