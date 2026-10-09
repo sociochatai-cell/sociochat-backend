@@ -70,6 +70,7 @@ class AgentSession:
         self.collected_params = {}
         self.missing_params = []
         self.awaiting_confirmation = False
+        self._confirmed = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {

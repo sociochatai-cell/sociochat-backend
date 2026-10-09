@@ -207,7 +207,10 @@ class ToggleAutomationAction(BaseAction):
         from whatsapp.automation_models import WhatsAppAutomationRule
         from models import db
 
-        rule = WhatsAppAutomationRule.query.get(params["rule_id"])
+        workspace_id = context.get("workspace_id")
+        rule = WhatsAppAutomationRule.query.filter_by(
+            id=params["rule_id"], workspace_id=workspace_id
+        ).first()
         if not rule:
             return {"status": "error", "message": "Automation rule not found."}
 

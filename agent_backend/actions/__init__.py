@@ -15,6 +15,11 @@ from . import (
     messaging_actions,
     analytics_actions,
     navigation_actions,
+    crm_actions,
+    dataset_actions,
+    booking_actions,
+    faq_actions,
+    knowledge_actions,
 )
 
 __all__ = [
@@ -26,4 +31,9 @@ __all__ = [
     "messaging_actions",
     "analytics_actions",
     "navigation_actions",
+    "crm_actions",
+    "dataset_actions",
+    "booking_actions",
+    "faq_actions",
+    "knowledge_actions",
 ]

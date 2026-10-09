@@ -158,6 +158,14 @@ class ActionExecutor:
             session.add_message("agent", reply)
             return _build_response("cancelled", reply, session_id=session.session_id)
 
+        # Check if the user changed topic — re-classify and compare
+        schema = action_registry.get_schema_for_intent_parser()
+        probe = intent_parser.parse(message, action_schema=schema, conversation_history=session.history)
+        if (probe.domain and probe.action and probe.confidence >= 0.5
+                and (probe.domain != session.current_domain or probe.action != session.current_action)):
+            session.clear_action_state()
+            return self._route(message, session, workspace_id, account_id, user_id)
+
         # Assign the value to the first missing param
         param_name = session.missing_params[0]
         session.collected_params[param_name] = message.strip()
@@ -184,6 +192,7 @@ class ActionExecutor:
         lower = message.strip().lower()
         if lower in ("yes", "y", "confirm", "ok", "sure", "do it", "go ahead", "proceed"):
             session.awaiting_confirmation = False
+            session._confirmed = True
             handler = action_registry.get(session.current_domain, session.current_action)
             if handler:
                 return self._execute_action(handler, session, workspace_id, account_id, user_id)

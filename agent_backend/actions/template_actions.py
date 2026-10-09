@@ -211,12 +211,25 @@ class SyncTemplatesAction(BaseAction):
     optional_params = ["account_id"]
 
     def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "status": "success",
-            "message": "🔄 To sync templates, go to **Templates** page and click **Sync from Meta**.",
-            "navigate_to": "/dashboard/templates",
-            "ui_action": "navigate",
-        }
+        workspace_id = context.get("workspace_id")
+        account_id = context.get("account_id")
+
+        if not account_id:
+            return {"status": "error", "message": "No WhatsApp account connected."}
+
+        try:
+            from whatsapp.template_service import TemplateService
+            svc = TemplateService(account_id=account_id)
+            result = svc.sync_templates()
+            synced = result.get("synced", 0) if isinstance(result, dict) else 0
+            return {
+                "status": "success",
+                "message": f"🔄 Templates synced from Meta! {synced} templates updated.",
+                "navigate_to": "/dashboard/templates",
+            }
+        except Exception as exc:
+            logger.warning("Template sync failed: %s", exc)
+            return {"status": "error", "message": f"Sync failed: {exc}"}
 
 
 @action_registry.register(domain="template", action="delete")
@@ -249,7 +262,8 @@ class DeleteTemplateAction(BaseAction):
             else:
                 return {"status": "error", "message": f"Template '{params['template_id']}' not found."}
 
-        template = WhatsAppTemplate.query.get(template_id)
+        account_id = context.get("account_id")
+        template = WhatsAppTemplate.query.filter_by(id=template_id, account_id=account_id).first()
         if not template:
             return {"status": "error", "message": "Template not found."}
 

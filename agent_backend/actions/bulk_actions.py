@@ -50,12 +50,12 @@ class ListBulkCampaignsAction(BaseAction):
             msg = f"**Bulk Campaigns ({len(items)}):**\n" + "\n".join(lines)
             return {"status": "success", "message": msg, "data": items, "ui_action": "show_list"}
 
-        except Exception:
+        except Exception as exc:
+            logger.warning("bulk/list query failed: %s", exc)
             return {
-                "status": "success",
-                "message": "📨 To view bulk campaigns, go to the **Datasets** page.",
+                "status": "error",
+                "message": "⚠️ Could not load bulk campaigns. Go to the **Datasets** page to view them directly.",
                 "navigate_to": "/dashboard/datasets",
-                "ui_action": "navigate",
             }
 
 
@@ -74,14 +74,30 @@ class CreateBulkCampaignAction(BaseAction):
         return prompts.get(first, f"Please provide **{first}**.")
 
     def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        from whatsapp.drip_models import WhatsAppDripCampaign
+        from models import db
+
+        workspace_id = context.get("workspace_id")
+        account_id = context.get("account_id")
+
+        if not account_id:
+            return {"status": "error", "message": "No WhatsApp account connected."}
+
+        campaign = WhatsAppDripCampaign(
+            account_id=account_id,
+            workspace_id=str(workspace_id),
+            name=params["name"],
+            trigger_type="manual",
+            status="draft",
+        )
+        db.session.add(campaign)
+        db.session.commit()
+
         return {
             "status": "success",
-            "message": (
-                f"📨 To create a bulk campaign named **{params['name']}**, "
-                "I'll take you to the Datasets page where you can set it up with full options."
-            ),
+            "message": f"✅ Bulk campaign **{params['name']}** created! Go to **Datasets** to add recipients and a template, then launch.",
+            "data": {"campaign_id": campaign.id, "name": campaign.name},
             "navigate_to": "/dashboard/datasets",
-            "ui_action": "navigate",
         }
 
 
@@ -95,12 +111,26 @@ class SendBulkCampaignAction(BaseAction):
         return "Which campaign should I send? Provide the campaign ID."
 
     def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-        msg = f"⚠️ Sending bulk campaign #{params['campaign_id']}. Please confirm this on the Datasets page."
+        from whatsapp.drip_models import WhatsAppDripCampaign
+        workspace_id = context.get("workspace_id")
+
+        campaign = WhatsAppDripCampaign.query.filter_by(
+            id=params["campaign_id"], workspace_id=str(workspace_id)
+        ).first()
+        if not campaign:
+            return {"status": "error", "message": "Campaign not found."}
+
+        if campaign.status == "active":
+            return {"status": "error", "message": f"Campaign **{campaign.name}** is already active/sending."}
+
         return {
             "status": "success",
-            "message": msg,
+            "message": (
+                f"📨 Campaign **{campaign.name}** is ready.\n"
+                f"⚠️ Bulk sends require final confirmation on the **Datasets** page — "
+                f"this ensures you've reviewed the audience and template before sending to real users."
+            ),
             "navigate_to": "/dashboard/datasets",
-            "ui_action": "navigate",
         }
 
 
@@ -119,9 +149,20 @@ class ScheduleBulkCampaignAction(BaseAction):
         return prompts.get(first, f"Please provide **{first}**.")
 
     def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        from whatsapp.drip_models import WhatsAppDripCampaign
+        workspace_id = context.get("workspace_id")
+
+        campaign = WhatsAppDripCampaign.query.filter_by(
+            id=params["campaign_id"], workspace_id=str(workspace_id)
+        ).first()
+        if not campaign:
+            return {"status": "error", "message": "Campaign not found."}
+
         return {
             "status": "success",
-            "message": f"📅 To schedule campaign #{params['campaign_id']}, use the scheduling feature on the Datasets page.",
+            "message": (
+                f"📅 Campaign **{campaign.name}** — scheduling requires the full wizard on the Datasets page "
+                f"(audience review + time picker). Taking you there now."
+            ),
             "navigate_to": "/dashboard/datasets",
-            "ui_action": "navigate",
         }

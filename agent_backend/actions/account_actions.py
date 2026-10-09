@@ -23,7 +23,7 @@ class GetAccountInfoAction(BaseAction):
         account_id = params.get("account_id") or context.get("account_id")
 
         if account_id:
-            acct = WhatsAppAccount.query.get(account_id)
+            acct = WhatsAppAccount.query.filter_by(id=account_id, workspace_id=workspace_id).first()
         else:
             acct = WhatsAppAccount.query.filter_by(
                 workspace_id=workspace_id, is_active=True

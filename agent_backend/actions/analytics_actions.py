@@ -68,10 +68,9 @@ class AnalyticsSummaryAction(BaseAction):
         except Exception as exc:
             logger.warning("Analytics query failed: %s", exc)
             return {
-                "status": "success",
-                "message": f"📊 View detailed analytics on the **Tracking** page.",
+                "status": "error",
+                "message": "⚠️ Could not load analytics. View them on the **Tracking** page.",
                 "navigate_to": "/dashboard/tracking",
-                "ui_action": "navigate",
             }
 
 
@@ -83,12 +82,43 @@ class AnalyticsTrendsAction(BaseAction):
     optional_params = ["days"]
 
     def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "status": "success",
-            "message": "📈 View message trends on the **Tracking** page for detailed charts and breakdowns.",
-            "navigate_to": "/dashboard/tracking",
-            "ui_action": "navigate",
-        }
+        from whatsapp.models import WhatsAppMessage
+        from sqlalchemy import func, cast, Date
+        from datetime import datetime, timezone, timedelta
+        from models import db
+
+        account_id = context.get("account_id")
+        if not account_id:
+            return {"status": "error", "message": "No WhatsApp account connected."}
+
+        days = int(params.get("days", 7))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        try:
+            rows = db.session.query(
+                cast(WhatsAppMessage.created_at, Date).label("day"),
+                func.count().label("total"),
+            ).filter(
+                WhatsAppMessage.account_id == account_id,
+                WhatsAppMessage.created_at >= cutoff,
+            ).group_by("day").order_by("day").all()
+
+            if not rows:
+                return {"status": "success", "message": f"No messages in the last {days} days.", "data": []}
+
+            lines = []
+            data = []
+            for day, total in rows:
+                d = {"date": str(day), "count": total}
+                data.append(d)
+                bar = "█" * min(total, 30)
+                lines.append(f"  {day}  {bar} {total}")
+
+            msg = f"📈 **Message Trends (Last {days} days)**\n" + "\n".join(lines)
+            return {"status": "success", "message": msg, "data": data}
+        except Exception as exc:
+            logger.warning("Trends query failed: %s", exc)
+            return {"status": "error", "message": f"⚠️ Could not load trends: {exc}"}
 
 
 @action_registry.register(domain="analytics", action="export")
@@ -99,9 +129,53 @@ class AnalyticsExportAction(BaseAction):
     optional_params = ["format", "date_range"]
 
     def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "status": "success",
-            "message": "📥 To export analytics, go to the **Tracking** page and use the export button.",
-            "navigate_to": "/dashboard/tracking",
-            "ui_action": "navigate",
-        }
+        from whatsapp.models import WhatsAppMessage
+        from sqlalchemy import func, cast, Date
+        from datetime import datetime, timezone, timedelta
+        from models import db
+
+        account_id = context.get("account_id")
+        if not account_id:
+            return {"status": "error", "message": "No WhatsApp account connected."}
+
+        days = 30
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        try:
+            rows = db.session.query(
+                cast(WhatsAppMessage.created_at, Date).label("day"),
+                WhatsAppMessage.direction,
+                func.count().label("cnt"),
+            ).filter(
+                WhatsAppMessage.account_id == account_id,
+                WhatsAppMessage.created_at >= cutoff,
+            ).group_by("day", WhatsAppMessage.direction).order_by("day").all()
+
+            if not rows:
+                return {"status": "success", "message": "No data to export in the last 30 days."}
+
+            data = {}
+            for day, direction, cnt in rows:
+                d = str(day)
+                if d not in data:
+                    data[d] = {"date": d, "sent": 0, "received": 0}
+                if direction == "outgoing":
+                    data[d]["sent"] = cnt
+                else:
+                    data[d]["received"] = cnt
+
+            export = list(data.values())
+            total_sent = sum(r["sent"] for r in export)
+            total_recv = sum(r["received"] for r in export)
+
+            msg = (
+                f"📥 **Analytics Export (Last 30 days)**\n"
+                f"• Total Sent: **{total_sent}**\n"
+                f"• Total Received: **{total_recv}**\n"
+                f"• Days with data: **{len(export)}**\n\n"
+                f"For a full CSV export, use the **Export** button on the Tracking page."
+            )
+            return {"status": "success", "message": msg, "data": export, "navigate_to": "/dashboard/tracking"}
+        except Exception as exc:
+            logger.warning("Analytics export failed: %s", exc)
+            return {"status": "error", "message": f"⚠️ Could not export analytics: {exc}"}

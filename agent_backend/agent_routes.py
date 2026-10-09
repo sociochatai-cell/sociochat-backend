@@ -118,8 +118,19 @@ def agent_capabilities():
 
 @agent_bp.route("/session/<session_id>", methods=["DELETE"])
 def agent_clear_session(session_id: str):
-    """Clear a session."""
-    deleted = session_manager.delete(session_id)
-    if deleted:
-        return jsonify({"status": "success", "message": "Session cleared."}), 200
-    return jsonify({"status": "error", "message": "Session not found."}), 404
+    """Clear a session (requires auth + ownership check)."""
+    user = get_current_user()
+    if not user:
+        return jsonify({"status": "error", "message": "authentication_required"}), 401
+
+    session = session_manager.get(session_id)
+    if not session:
+        return jsonify({"status": "error", "message": "Session not found."}), 404
+
+    from tenant.context import resolve_owned_workspace
+    ws, err = resolve_owned_workspace(user, session.workspace_id)
+    if err:
+        return jsonify({"status": "error", "message": "Not your session."}), 403
+
+    session_manager.delete(session_id)
+    return jsonify({"status": "success", "message": "Session cleared."}), 200
