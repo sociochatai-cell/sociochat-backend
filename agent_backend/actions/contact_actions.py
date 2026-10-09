@@ -1,5 +1,5 @@
 """
-Contact Actions — list and search WhatsApp contacts.
+Contact Actions — list and search contacts.
 """
 
 import logging
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 @action_registry.register(domain="contact", action="list")
 class ListContactsAction(BaseAction):
     name = "list_contacts"
-    description = "List WhatsApp contacts"
+    description = "List contacts"
     required_params: List[str] = []
     optional_params = ["status", "limit"]
 
@@ -21,16 +21,14 @@ class ListContactsAction(BaseAction):
         from models import db
         from sqlalchemy import text
 
-        account_id = context.get("account_id")
-        if not account_id:
-            return {"status": "error", "message": "No WhatsApp account connected."}
+        workspace_id = context.get("workspace_id")
 
         limit = min(int(params.get("limit", 20)), 50)
         try:
-            sql = ("SELECT id, phone_normalized, name, email, status, last_message_at "
-                   "FROM whatsapp_contacts WHERE account_id = :aid "
-                   "ORDER BY last_message_at DESC NULLS LAST LIMIT :lim")
-            rows = db.session.execute(text(sql), {"aid": account_id, "lim": limit}).fetchall()
+            sql = ("SELECT id, phone, name, email, company, status, last_contacted "
+                   "FROM contacts WHERE workspace_id = :wid "
+                   "ORDER BY last_contacted DESC NULLS LAST LIMIT :lim")
+            rows = db.session.execute(text(sql), {"wid": int(workspace_id), "lim": limit}).fetchall()
         except Exception as exc:
             logger.warning("Contact list failed: %s", exc)
             return {"status": "error", "message": f"Could not load contacts: {exc}"}
@@ -41,10 +39,11 @@ class ListContactsAction(BaseAction):
         items = []
         lines = []
         for i, r in enumerate(rows, 1):
-            item = {"id": r[0], "phone": r[1], "name": r[2], "email": r[3], "status": r[4]}
+            item = {"id": r[0], "phone": r[1], "name": r[2], "email": r[3], "company": r[4], "status": r[5]}
             items.append(item)
             name = r[2] or r[1] or "Unknown"
-            lines.append(f"{i}. **{name}** — {r[1] or 'no phone'}")
+            extra = f" · {r[4]}" if r[4] else ""
+            lines.append(f"{i}. **{name}** — {r[1] or 'no phone'}{extra}")
 
         msg = f"**Contacts ({len(items)}):**\n" + "\n".join(lines)
         return {"status": "success", "message": msg, "data": items, "ui_action": "show_list"}
@@ -53,7 +52,7 @@ class ListContactsAction(BaseAction):
 @action_registry.register(domain="contact", action="search")
 class SearchContactsAction(BaseAction):
     name = "search_contacts"
-    description = "Search contacts by name or phone number"
+    description = "Search contacts by name, phone, or email"
     required_params = ["query"]
     optional_params: List[str] = []
 
@@ -64,17 +63,15 @@ class SearchContactsAction(BaseAction):
         from models import db
         from sqlalchemy import text
 
-        account_id = context.get("account_id")
-        if not account_id:
-            return {"status": "error", "message": "No WhatsApp account connected."}
+        workspace_id = context.get("workspace_id")
 
         q = f"%{params['query'].strip()}%"
         try:
-            sql = ("SELECT id, phone_normalized, name, email, status "
-                   "FROM whatsapp_contacts WHERE account_id = :aid "
-                   "AND (name ILIKE :q OR phone_normalized ILIKE :q OR email ILIKE :q) "
-                   "ORDER BY last_message_at DESC NULLS LAST LIMIT 20")
-            rows = db.session.execute(text(sql), {"aid": account_id, "q": q}).fetchall()
+            sql = ("SELECT id, phone, name, email, company, status "
+                   "FROM contacts WHERE workspace_id = :wid "
+                   "AND (name ILIKE :q OR phone ILIKE :q OR email ILIKE :q) "
+                   "ORDER BY last_contacted DESC NULLS LAST LIMIT 20")
+            rows = db.session.execute(text(sql), {"wid": int(workspace_id), "q": q}).fetchall()
         except Exception as exc:
             logger.warning("Contact search failed: %s", exc)
             return {"status": "error", "message": f"Search failed: {exc}"}
@@ -85,7 +82,7 @@ class SearchContactsAction(BaseAction):
         items = []
         lines = []
         for i, r in enumerate(rows, 1):
-            item = {"id": r[0], "phone": r[1], "name": r[2], "email": r[3], "status": r[4]}
+            item = {"id": r[0], "phone": r[1], "name": r[2], "email": r[3], "company": r[4], "status": r[5]}
             items.append(item)
             name = r[2] or r[1] or "Unknown"
             lines.append(f"{i}. **{name}** — {r[1] or 'no phone'}")
