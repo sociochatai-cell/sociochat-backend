@@ -10,6 +10,18 @@ from agent_backend.action_registry import BaseAction, action_registry
 logger = logging.getLogger(__name__)
 
 
+def _message_query_base(db, account_id, cutoff):
+    """Build base query joining messages through conversations for account scoping."""
+    from whatsapp.models import WhatsAppMessage, WhatsAppConversation
+    return db.session.query(WhatsAppMessage).join(
+        WhatsAppConversation,
+        WhatsAppMessage.conversation_id == WhatsAppConversation.id,
+    ).filter(
+        WhatsAppConversation.account_id == account_id,
+        WhatsAppMessage.created_at >= cutoff,
+    )
+
+
 @action_registry.register(domain="analytics", action="summary")
 class AnalyticsSummaryAction(BaseAction):
     name = "analytics_summary"
@@ -18,12 +30,11 @@ class AnalyticsSummaryAction(BaseAction):
     optional_params = ["days", "account_id"]
 
     def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-        from whatsapp.models import WhatsAppMessage, WhatsAppAccount
+        from whatsapp.models import WhatsAppMessage, WhatsAppConversation
         from sqlalchemy import func
         from datetime import datetime, timezone, timedelta
         from models import db
 
-        workspace_id = context.get("workspace_id")
         account_id = context.get("account_id")
         days = int(params.get("days", 7))
 
@@ -33,22 +44,10 @@ class AnalyticsSummaryAction(BaseAction):
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
         try:
-            total = WhatsAppMessage.query.filter(
-                WhatsAppMessage.account_id == account_id,
-                WhatsAppMessage.created_at >= cutoff,
-            ).count()
-
-            sent = WhatsAppMessage.query.filter(
-                WhatsAppMessage.account_id == account_id,
-                WhatsAppMessage.direction == "outgoing",
-                WhatsAppMessage.created_at >= cutoff,
-            ).count()
-
-            received = WhatsAppMessage.query.filter(
-                WhatsAppMessage.account_id == account_id,
-                WhatsAppMessage.direction == "incoming",
-                WhatsAppMessage.created_at >= cutoff,
-            ).count()
+            base = _message_query_base(db, account_id, cutoff)
+            total = base.count()
+            sent = base.filter(WhatsAppMessage.direction == "outgoing").count()
+            received = base.filter(WhatsAppMessage.direction == "incoming").count()
 
             data = {
                 "period_days": days,
@@ -82,7 +81,7 @@ class AnalyticsTrendsAction(BaseAction):
     optional_params = ["days"]
 
     def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-        from whatsapp.models import WhatsAppMessage
+        from whatsapp.models import WhatsAppMessage, WhatsAppConversation
         from sqlalchemy import func, cast, Date
         from datetime import datetime, timezone, timedelta
         from models import db
@@ -98,8 +97,11 @@ class AnalyticsTrendsAction(BaseAction):
             rows = db.session.query(
                 cast(WhatsAppMessage.created_at, Date).label("day"),
                 func.count().label("total"),
+            ).join(
+                WhatsAppConversation,
+                WhatsAppMessage.conversation_id == WhatsAppConversation.id,
             ).filter(
-                WhatsAppMessage.account_id == account_id,
+                WhatsAppConversation.account_id == account_id,
                 WhatsAppMessage.created_at >= cutoff,
             ).group_by("day").order_by("day").all()
 
@@ -129,7 +131,7 @@ class AnalyticsExportAction(BaseAction):
     optional_params = ["format", "date_range"]
 
     def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-        from whatsapp.models import WhatsAppMessage
+        from whatsapp.models import WhatsAppMessage, WhatsAppConversation
         from sqlalchemy import func, cast, Date
         from datetime import datetime, timezone, timedelta
         from models import db
@@ -146,8 +148,11 @@ class AnalyticsExportAction(BaseAction):
                 cast(WhatsAppMessage.created_at, Date).label("day"),
                 WhatsAppMessage.direction,
                 func.count().label("cnt"),
+            ).join(
+                WhatsAppConversation,
+                WhatsAppMessage.conversation_id == WhatsAppConversation.id,
             ).filter(
-                WhatsAppMessage.account_id == account_id,
+                WhatsAppConversation.account_id == account_id,
                 WhatsAppMessage.created_at >= cutoff,
             ).group_by("day", WhatsAppMessage.direction).order_by("day").all()
 
