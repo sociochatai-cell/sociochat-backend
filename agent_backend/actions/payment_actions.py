@@ -26,8 +26,28 @@ class SendPaymentLinkAction(BaseAction):
         first = missing[0]
         return prompts.get(first, f"Please provide **{first}**.")
 
+    def _clean_phone(self, raw: str) -> str:
+        import re
+        digits = re.sub(r'\D', '', str(raw))
+        if len(digits) == 10:
+            digits = "91" + digits
+        return digits
+
+    def _clean_amount(self, raw) -> float:
+        import re
+        digits = re.findall(r'[\d.]+', str(raw))
+        if not digits:
+            raise ValueError(f"Could not extract amount from: {raw}")
+        return float(digits[0])
+
     def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         from models import db
+
+        phone = self._clean_phone(params["phone"])
+        try:
+            amount = self._clean_amount(params["amount"])
+        except ValueError as e:
+            return {"status": "error", "message": str(e)}
 
         session = context.get("session")
         if not (session and getattr(session, "_confirmed", False)):
@@ -35,8 +55,8 @@ class SendPaymentLinkAction(BaseAction):
                 "status": "confirmation_required",
                 "message": (
                     f"💳 Ready to send payment link:\n"
-                    f"• To: {params['phone']}\n"
-                    f"• Amount: ₹{params['amount']}\n"
+                    f"• To: {phone}\n"
+                    f"• Amount: ₹{amount:,.0f}\n"
                     f"• For: {params['product']}\n"
                     f"Proceed?"
                 ),
@@ -70,8 +90,8 @@ class SendPaymentLinkAction(BaseAction):
             order, link, sent = create_order_and_send(
                 workspace_id=int(workspace_id),
                 cfg_row=config,
-                phone=params["phone"],
-                amount=float(params["amount"]),
+                phone=phone,
+                amount=amount,
                 productinfo=params["product"][:160],
                 customer_name=params.get("customer_name", ""),
                 customer_email=params.get("customer_email", ""),

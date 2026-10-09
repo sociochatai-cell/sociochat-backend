@@ -26,8 +26,11 @@ class SendTextAction(BaseAction):
         return prompts.get(first, f"Please provide **{first}**.")
 
     def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        import re
         workspace_id = context.get("workspace_id")
-        to = params["to"].strip()
+        to = re.sub(r'\D', '', str(params["to"]).strip())
+        if len(to) == 10:
+            to = "91" + to
         text = params["text"]
 
         # Require confirmation
