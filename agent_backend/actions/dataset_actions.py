@@ -96,3 +96,41 @@ class DeleteDatasetAction(BaseAction):
         db.session.delete(ds)
         db.session.commit()
         return {"status": "success", "message": f"🗑️ Dataset **{name}** deleted."}
+
+
+@action_registry.register(domain="dataset", action="create")
+class CreateDatasetAction(BaseAction):
+    name = "create_dataset"
+    description = "Create a new dataset for bulk messaging"
+    required_params = ["name"]
+    optional_params: List[str] = []
+
+    def get_missing_params_prompt(self, missing: List[str]) -> str:
+        return "What should the dataset be called?"
+
+    def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        from whatsapp.drip_models import WhatsAppDataset
+        from models import db
+
+        workspace_id = context.get("workspace_id")
+        account_id = context.get("account_id")
+
+        if not account_id:
+            return {"status": "error", "message": "No WhatsApp account connected."}
+
+        ds = WhatsAppDataset(
+            account_id=account_id,
+            workspace_id=str(workspace_id),
+            name=params["name"],
+            source="manual",
+            contact_count=0,
+        )
+        db.session.add(ds)
+        db.session.commit()
+
+        return {
+            "status": "success",
+            "message": f"✅ Dataset **{params['name']}** created! Go to **Datasets** to add contacts.",
+            "data": {"dataset_id": ds.id, "name": ds.name},
+            "navigate_to": "/dashboard/datasets",
+        }

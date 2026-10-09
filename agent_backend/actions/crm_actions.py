@@ -198,3 +198,107 @@ class CreateDealAction(BaseAction):
             "data": {"deal_id": deal_id, "name": params["name"]},
             "navigate_to": "/dashboard/crm/deals",
         }
+
+
+@action_registry.register(domain="crm", action="update_deal")
+class UpdateDealAction(BaseAction):
+    name = "update_crm_deal"
+    description = "Update a CRM deal's stage, value, or details"
+    required_params = ["deal_id"]
+    optional_params = ["name", "value", "stage", "status", "company"]
+
+    def get_missing_params_prompt(self, missing: List[str]) -> str:
+        return "Which deal would you like to update? Provide the deal ID."
+
+    def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        from models import db
+        from sqlalchemy import text
+        workspace_id = context.get("workspace_id")
+
+        updates = []
+        bind = {"did": params["deal_id"], "wid": int(workspace_id)}
+        for field in ("name", "value", "stage", "status", "company"):
+            if field in params and params[field] is not None:
+                updates.append(f"{field} = :{field}")
+                bind[field] = params[field]
+
+        if not updates:
+            return {"status": "error", "message": "Nothing to update — provide name, value, stage, status, or company."}
+
+        updates.append("updated_at = NOW()")
+        try:
+            result = db.session.execute(text(
+                f"UPDATE deals SET {', '.join(updates)} WHERE id = :did AND workspace_id = :wid"
+            ), bind)
+            db.session.commit()
+            if result.rowcount == 0:
+                return {"status": "error", "message": "Deal not found."}
+        except Exception as exc:
+            db.session.rollback()
+            logger.warning("Deal update failed: %s", exc)
+            return {"status": "error", "message": f"Could not update deal: {exc}"}
+
+        return {"status": "success", "message": f"✅ Deal updated."}
+
+
+@action_registry.register(domain="crm", action="delete_lead")
+class DeleteLeadAction(BaseAction):
+    name = "delete_crm_lead"
+    description = "Delete a CRM lead"
+    required_params = ["lead_id"]
+
+    def get_missing_params_prompt(self, missing: List[str]) -> str:
+        return "Which lead would you like to delete? Provide the lead ID."
+
+    def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        from whatsapp.crm_lead_models import CrmLead
+        from models import db
+
+        session = context.get("session")
+        if not (session and getattr(session, "_confirmed", False)):
+            return {"status": "confirmation_required",
+                    "message": f"Are you sure you want to delete lead #{params['lead_id']}? This cannot be undone."}
+
+        workspace_id = context.get("workspace_id")
+        lead = CrmLead.query.filter_by(id=params["lead_id"], workspace_id=int(workspace_id)).first()
+        if not lead:
+            return {"status": "error", "message": "Lead not found."}
+
+        name = lead.name
+        db.session.delete(lead)
+        db.session.commit()
+        return {"status": "success", "message": f"🗑️ Lead **{name}** deleted."}
+
+
+@action_registry.register(domain="crm", action="delete_deal")
+class DeleteDealAction(BaseAction):
+    name = "delete_crm_deal"
+    description = "Delete a CRM deal"
+    required_params = ["deal_id"]
+
+    def get_missing_params_prompt(self, missing: List[str]) -> str:
+        return "Which deal would you like to delete? Provide the deal ID."
+
+    def execute(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        from models import db
+        from sqlalchemy import text
+
+        session = context.get("session")
+        if not (session and getattr(session, "_confirmed", False)):
+            return {"status": "confirmation_required",
+                    "message": f"Are you sure you want to delete deal #{params['deal_id']}? This cannot be undone."}
+
+        workspace_id = context.get("workspace_id")
+        try:
+            result = db.session.execute(text(
+                "DELETE FROM deals WHERE id = :did AND workspace_id = :wid"
+            ), {"did": params["deal_id"], "wid": int(workspace_id)})
+            db.session.commit()
+            if result.rowcount == 0:
+                return {"status": "error", "message": "Deal not found."}
+        except Exception as exc:
+            db.session.rollback()
+            logger.warning("Deal delete failed: %s", exc)
+            return {"status": "error", "message": f"Could not delete deal: {exc}"}
+
+        return {"status": "success", "message": f"🗑️ Deal deleted."}

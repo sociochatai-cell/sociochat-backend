@@ -20,6 +20,9 @@ from . import (
     booking_actions,
     faq_actions,
     knowledge_actions,
+    contact_actions,
+    order_actions,
+    flow_actions,
 )
 
 __all__ = [
@@ -36,4 +39,7 @@ __all__ = [
     "booking_actions",
     "faq_actions",
     "knowledge_actions",
+    "contact_actions",
+    "order_actions",
+    "flow_actions",
 ]
