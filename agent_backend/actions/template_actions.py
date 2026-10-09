@@ -185,8 +185,9 @@ class SendTemplateAction(BaseAction):
 
         try:
             from whatsapp.services import WhatsAppService
-            svc = WhatsAppService(workspace_id=workspace_id)
-            result = svc.send_template_message(
+            account_id = context.get("account_id")
+            svc = WhatsAppService(workspace_id=workspace_id, account_id=account_id)
+            result = svc.send_template(
                 to=to,
                 template_name=template_name,
                 language_code=language,
