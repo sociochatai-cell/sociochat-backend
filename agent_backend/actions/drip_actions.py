@@ -99,7 +99,7 @@ class CreateDripCampaignAction(BaseAction):
 
         return {
             "status": "success",
-            "message": f"✅ Drip campaign **{params['name']}** created! You can now add steps and enroll contacts.",
+            "message": f"✅ Drip campaign **{params['name']}** created (ID: {campaign.id}). You can now add steps and enroll contacts.",
             "data": {"campaign_id": campaign.id, "name": campaign.name},
             "navigate_to": "/dashboard/drip",
         }

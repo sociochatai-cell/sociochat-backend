@@ -130,7 +130,7 @@ class CreateDatasetAction(BaseAction):
 
         return {
             "status": "success",
-            "message": f"✅ Dataset **{params['name']}** created! Go to **Datasets** to add contacts.",
+            "message": f"✅ Dataset **{params['name']}** created (ID: {ds.id})! Go to **Datasets** to add contacts.",
             "data": {"dataset_id": ds.id, "name": ds.name},
             "navigate_to": "/dashboard/datasets",
         }

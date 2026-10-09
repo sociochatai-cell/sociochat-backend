@@ -95,7 +95,7 @@ class CreateBulkCampaignAction(BaseAction):
 
         return {
             "status": "success",
-            "message": f"✅ Bulk campaign **{params['name']}** created! Go to **Datasets** to add recipients and a template, then launch.",
+            "message": f"✅ Bulk campaign **{params['name']}** created (ID: {campaign.id})! Go to **Datasets** to add recipients and a template, then launch.",
             "data": {"campaign_id": campaign.id, "name": campaign.name},
             "navigate_to": "/dashboard/datasets",
         }

@@ -71,7 +71,7 @@ class CreateLeadAction(BaseAction):
         db.session.add(lead)
         db.session.commit()
 
-        msg = f"✅ Lead **{params['name']}** created!"
+        msg = f"✅ Lead **{params['name']}** created (ID: {lead.id})!"
         if params.get("phone"):
             msg += f"\n• Phone: {params['phone']}"
         if params.get("email"):
@@ -194,7 +194,7 @@ class CreateDealAction(BaseAction):
 
         return {
             "status": "success",
-            "message": f"✅ Deal **{params['name']}** created (stage: {stage}).",
+            "message": f"✅ Deal **{params['name']}** created (ID: {deal_id}, stage: {stage}).",
             "data": {"deal_id": deal_id, "name": params["name"]},
             "navigate_to": "/dashboard/crm/deals",
         }

@@ -142,7 +142,7 @@ class CreateTemplateAction(BaseAction):
         db.session.commit()
 
         msg = (
-            f"✅ Template **{name}** created!\n"
+            f"✅ Template **{name}** created (ID: {template.id})!\n"
             f"• Category: {category}\n"
             f"• Language: {language}\n"
             f"• Variables: {variable_count}\n"
