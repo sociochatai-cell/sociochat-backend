@@ -534,6 +534,7 @@ with app.app_context():
     from whatsapp import flow_os_models  # noqa: F401
     from whatsapp import conversation_insights_models  # noqa: F401
     from agent_backend import session_models  # noqa: F401  (register agent_sessions table)
+    from agent_backend import audit_log  # noqa: F401  (register agent_audit_logs table)
     import agent_auth.models  # noqa: F401  (register workspace_agents + agent_workspaces tables)
     import whatsapp.commerce_pay.models  # noqa: F401  (register workspace_payment_configs)
     import ctwa.models  # noqa: F401  (register ctwa_campaigns table)

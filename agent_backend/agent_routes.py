@@ -11,6 +11,7 @@ Endpoints:
 import logging
 from flask import Blueprint, request, jsonify
 
+from models import db
 from auth_routes import get_current_user
 from .action_executor import action_executor
 from .action_registry import action_registry
@@ -110,6 +111,92 @@ def agent_capabilities():
     domain = request.args.get("domain")
     actions = action_registry.list_actions(domain=domain)
     return jsonify({"actions": actions, "domains": action_registry.list_domains()}), 200
+
+
+# ============================================================
+# DELETE /api/agent/session/<id>
+# ============================================================
+
+# ============================================================
+# GET /api/agent/logs
+# ============================================================
+
+@agent_bp.route("/logs", methods=["GET"])
+def agent_logs():
+    """
+    Search agent audit logs for a workspace.
+
+    Query params:
+        workspace_id  – (required) filter by workspace
+        limit         – max results (default 50, max 200)
+        offset        – pagination offset
+        search        – search in user_message or agent_response
+        date_from     – ISO date (e.g. 2026-10-01)
+        date_to       – ISO date
+        domain        – filter by intent domain
+        user_id       – filter by user
+    """
+    user = get_current_user()
+    if not user:
+        return jsonify({"status": "error", "message": "authentication_required"}), 401
+
+    from tenant.context import resolve_owned_workspace
+    ws_id = request.args.get("workspace_id") or request.headers.get("X-Workspace-ID")
+    ws, err = resolve_owned_workspace(user, ws_id)
+    if err:
+        return err
+    workspace_id = str(ws.id)
+
+    from .audit_log import AgentAuditLog
+    query = AgentAuditLog.query.filter_by(workspace_id=workspace_id)
+
+    search = request.args.get("search")
+    if search:
+        like = f"%{search}%"
+        query = query.filter(
+            db.or_(
+                AgentAuditLog.user_message.ilike(like),
+                AgentAuditLog.agent_response.ilike(like),
+            )
+        )
+
+    domain = request.args.get("domain")
+    if domain:
+        query = query.filter(AgentAuditLog.intent_domain == domain)
+
+    uid = request.args.get("user_id")
+    if uid:
+        query = query.filter(AgentAuditLog.user_id == uid)
+
+    date_from = request.args.get("date_from")
+    if date_from:
+        from datetime import datetime
+        try:
+            query = query.filter(AgentAuditLog.created_at >= datetime.fromisoformat(date_from))
+        except ValueError:
+            pass
+
+    date_to = request.args.get("date_to")
+    if date_to:
+        from datetime import datetime
+        try:
+            query = query.filter(AgentAuditLog.created_at <= datetime.fromisoformat(date_to + "T23:59:59"))
+        except ValueError:
+            pass
+
+    limit = min(int(request.args.get("limit", 50)), 200)
+    offset = int(request.args.get("offset", 0))
+
+    total = query.count()
+    logs = query.order_by(AgentAuditLog.created_at.desc()).offset(offset).limit(limit).all()
+
+    return jsonify({
+        "status": "success",
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "logs": [log.to_dict() for log in logs],
+    }), 200
 
 
 # ============================================================

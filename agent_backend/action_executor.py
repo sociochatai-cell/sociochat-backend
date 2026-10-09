@@ -17,6 +17,7 @@ from typing import Dict, Any, Optional
 from .intent_parser import AgentIntent, intent_parser
 from .action_registry import action_registry, BaseAction
 from .session_manager import session_manager, AgentSession
+from .audit_log import log_interaction
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,31 @@ class ActionExecutor:
         # the DB so the next turn — which may be served by a different gunicorn
         # worker — resumes the multi-turn flow instead of starting over.
         try:
-            return self._route(message, session, workspace_id, account_id, user_id)
+            result = self._route(message, session, workspace_id, account_id, user_id)
+            log_interaction(
+                workspace_id=workspace_id,
+                user_message=message,
+                agent_response=result.get("message"),
+                intent_domain=session.current_domain,
+                intent_action=session.current_action,
+                params=session.collected_params if session.collected_params else None,
+                result_status=result.get("status"),
+                account_id=account_id,
+                user_id=user_id,
+                session_id=session.session_id,
+            )
+            return result
+        except Exception as exc:
+            log_interaction(
+                workspace_id=workspace_id,
+                user_message=message,
+                result_status="exception",
+                error_message=str(exc),
+                account_id=account_id,
+                user_id=user_id,
+                session_id=session.session_id,
+            )
+            raise
         finally:
             session_manager.persist(session)
 
