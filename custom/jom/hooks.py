@@ -139,7 +139,8 @@ def _capture_ad_identity(workspace_id, customer_phone, meta):
             # fallback: find the WhatsApp conversation for this workspace + phone
             try:
                 from whatsapp.models import WhatsAppConversation, WhatsAppAccount
-                acc = WhatsAppAccount.query.filter_by(workspace_id=str(workspace_id)).first()
+                acc = (WhatsAppAccount.query.filter_by(workspace_id=str(workspace_id), is_active=True).first()
+                       or WhatsAppAccount.query.filter_by(workspace_id=str(workspace_id)).first())
                 if acc:
                     conv = WhatsAppConversation.query.filter_by(
                         account_id=acc.id, user_phone=str(customer_phone)).first()

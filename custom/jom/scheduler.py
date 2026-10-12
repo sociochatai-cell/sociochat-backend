@@ -28,7 +28,10 @@ def _service_for(workspace_id):
     except Exception as exc:  # noqa: BLE001
         logger.warning("[jom] sender imports unavailable: %s", exc)
         return None
-    acc = WhatsAppAccount.query.filter_by(workspace_id=str(workspace_id)).first()
+    # Prefer the ACTIVE account — a workspace can have old/deactivated accounts (e.g. after a
+    # number migration), and .first() would otherwise grab a dead one with no token.
+    acc = (WhatsAppAccount.query.filter_by(workspace_id=str(workspace_id), is_active=True).first()
+           or WhatsAppAccount.query.filter_by(workspace_id=str(workspace_id)).first())
     if not acc:
         logger.warning("[jom] no WhatsApp account for workspace %s — cannot send", workspace_id)
         return None

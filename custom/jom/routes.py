@@ -306,7 +306,8 @@ def _approved_templates(wsid):
     template-picker dropdowns. Fail-safe: returns [] if the account/table isn't there."""
     try:
         from whatsapp.models import WhatsAppAccount, WhatsAppTemplate  # type: ignore
-        acc = WhatsAppAccount.query.filter_by(workspace_id=str(wsid)).first()
+        acc = (WhatsAppAccount.query.filter_by(workspace_id=str(wsid), is_active=True).first()
+               or WhatsAppAccount.query.filter_by(workspace_id=str(wsid)).first())
         if not acc:
             return []
         q = WhatsAppTemplate.query.filter_by(account_id=acc.id)
