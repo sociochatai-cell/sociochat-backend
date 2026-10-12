@@ -6301,7 +6301,8 @@ def delete_account(account_id: int):
         ContactAutomationOverride,
     )
     from .visual_automation_models import WhatsAppVisualAutomation, WhatsAppAutomationNode
-    
+    from .flow_os_models import WhatsAppFormBooking
+
     account, _own_err = _require_owned_account(account_id)
     if _own_err:
         _body, _code = _own_err
@@ -6373,7 +6374,7 @@ def delete_account(account_id: int):
         # Delete related conversations and messages
         conversations = WhatsAppConversation.query.filter_by(account_id=account_id).all()
         for conv in conversations:
-            # Delete messages in this conversation
+            WhatsAppFormBooking.query.filter_by(conversation_id=conv.id).delete(synchronize_session=False)
             WhatsAppMessage.query.filter_by(conversation_id=conv.id).delete()
             get_db().delete(conv)
         
