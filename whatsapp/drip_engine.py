@@ -613,11 +613,15 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
         })
     else:
         # Auto-lookup header_handle from template when no media provided
+        _header_required_fmt = None
+        _header_attached = False
         try:
             if template_record and template_record.components:
                 for _comp in (template_record.components if isinstance(template_record.components, list) else []):
                     if isinstance(_comp, dict) and (_comp.get("type") or "").upper() == "HEADER":
                         _fmt = (_comp.get("format") or "").upper()
+                        if _fmt in ("IMAGE", "VIDEO", "DOCUMENT"):
+                            _header_required_fmt = _fmt
                         _handles = (_comp.get("example") or {}).get("header_handle")
                         if _handles and isinstance(_handles, list) and _handles[0] and _fmt in ("IMAGE", "VIDEO", "DOCUMENT"):
                             _handle_url = _handles[0]
@@ -629,10 +633,34 @@ def process_single_enrollment(enrollment: WhatsAppDripEnrollment):
                                     "type": "header",
                                     "parameters": [{"type": _media_type, _media_type: {"id": _media_id}}]
                                 })
+                                _header_attached = True
                                 logger.info("[drip header_handle] Uploaded %s, media_id=%s", _fmt, _media_id)
                         break
         except Exception:
-            logger.debug("[drip header_handle] fallback failed (non-fatal)", exc_info=True)
+            logger.warning("[drip header_handle] fallback failed for template %s", step.template_name, exc_info=True)
+
+        if _header_required_fmt and not _header_attached:
+            logger.error(
+                "[drip] Template '%s' requires %s header but no media could be attached. "
+                "Blocking send to prevent 132012 error. Enrollment %s",
+                step.template_name, _header_required_fmt, enrollment.id,
+            )
+            enrollment.failed = True
+            enrollment.status = "blocked_missing_data"
+            enrollment.status_reason = (
+                f"Template requires {_header_required_fmt} header but no media was provided "
+                f"and auto-lookup failed. Add header_{_header_required_fmt.lower()}_url to campaign variables."
+            )
+            if campaign.trigger_type not in _ONGOING_TRIGGER_TYPES:
+                total = WhatsAppDripEnrollment.query.filter_by(campaign_id=campaign.id).count()
+                finished = WhatsAppDripEnrollment.query.filter(
+                    WhatsAppDripEnrollment.campaign_id == campaign.id,
+                    WhatsAppDripEnrollment.status.in_(["completed", "failed", "blocked_missing_data"])
+                ).count()
+                if finished >= total and total > 0:
+                    campaign.status = "completed"
+            db.session.commit()
+            return
 
     if is_named_template and template_record:
         # NAMED PARAMETERS LOGIC
